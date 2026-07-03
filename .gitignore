@@ -1,0 +1,69 @@
+# ── Secrets / 本地配置 ─────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+secrets/
+
+# ── Claude Code 本地覆盖 / 运行缓存 ───────────────
+# 注意: .claude/ 下的 rules/skills/commands/hooks/agents 是 harness 资产, 必须提交,
+#       只忽略个人本地覆盖与运行缓存。
+.claude/settings.local.json
+.claude/.cache/
+
+# ── Python ────────────────────────────────────────
+# 注意: uv.lock 应当提交(锁定依赖), 不要在此忽略。
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ipynb_checkpoints/
+
+# ── Node / TypeScript ─────────────────────────────
+node_modules/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+coverage/
+
+# ── 数据 / 本地服务 ────────────────────────────────
+*.sqlite
+*.db
+pgdata/
+neo4j_data/
+redis_data/
+*.dump
+
+# ── 日志 / 临时 ────────────────────────────────────
+logs/
+*.log
+*.tmp
+
+# ── 编辑器 / 系统 ──────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~

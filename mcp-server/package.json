@@ -1,0 +1,21 @@
+{
+  "name": "zero-mcp-server",
+  "version": "0.0.0",
+  "description": "Zero_MCP 的 MCP 服务层（TS）—— 经 @modelcontextprotocol/sdk 暴露/转发新 Agent 能力。骨架占位：版本在首次 npm install 时锁定。",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "*",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "typescript": "*",
+    "@types/node": "*"
+  }
+}

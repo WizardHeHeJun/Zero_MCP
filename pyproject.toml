@@ -1,0 +1,34 @@
+# Zero_MCP · Python 侧依赖与工具配置（骨架）
+# conda 管解释器与环境（environment.yml，环境名 ai-harness）；Python 包用 uv 管理本文件。
+# 运行依赖随 src/ 实现补充（当前多数注释占位）；构建/打包待代码落地后定。
+
+[project]
+name = "zero-mcp"
+version = "0.0.0"
+description = "Zero_MCP —— 经 MCP 给 AI 数字人 Zero 加新 Agent 能力模块（Python 主 + TS MCP 层）"
+requires-python = ">=3.12"
+dependencies = [
+    # 随实现补版本约束：
+    # "langgraph",        # 编排层 StateGraph
+    # "pydantic",         # 结构化 state / 跨语言契约校验
+    # "mcp",              # 官方 python-sdk：连 Zero 的 MCP client
+]
+
+[project.optional-dependencies]
+dev = [
+    # "pytest",
+    # "ruff",
+    # "mypy",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]

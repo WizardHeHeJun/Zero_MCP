@@ -1,0 +1,26 @@
+# ── 本项目复用的 conda 环境（与原项目 D:\Zero 共用）──────────────────────
+# Zero_MCP 与 D:\Zero 共用同一个 conda 环境：affective-expression（Python 3.12）。
+# 该环境的**完整依赖规格以 D:\Zero 的 environment.yml 为准**（唯一真相在那边）；
+# 本文件只声明环境名 + harness 基础工具链，用于 SessionStart 钩子检测环境是否就绪。
+#
+# 本机 conda：E:\anaconda（不在 PATH）；路径已缓存到 .claude/.cache/conda-path（gitignore）。
+#
+# ⚠ 切勿对本文件跑 `--prune`：affective-expression 装着 D:\Zero 的全部依赖，
+#   `conda env update -f environment.yml --prune` 会把不在本文件里的包（langgraph/torch/…）删掉！
+# 安全用法：
+#   激活：           conda activate affective-expression
+#   不 activate 跑：  & "E:\anaconda\Scripts\conda.exe" run -n affective-expression --no-capture-output <cmd>
+#   （可选）补工具：  conda env update -f environment.yml   # 不带 --prune，仅确保下列工具存在
+#   Zero_MCP 专属 Python 依赖 → 用 uv 装进该环境（pyproject.toml），conda 只管解释器与环境本身。
+name: affective-expression
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  # ── harness 基础工具链（lint/test，D:\Zero 环境通常已含；此处仅保证存在）──
+  - ruff
+  - mypy
+  - pytest
+  - pip:
+      - uv
