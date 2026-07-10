@@ -1,0 +1,64 @@
+## 当前任务
+
+**任务描述**：{{ task_description }}
+
+---
+
+## 能力状态
+
+{% if uia_hollow %}
+> **[注意] 当前窗口无 UIA 内容树（UIA 空洞）**：目标窗口（如微信、自绘 UI 应用）的
+> UIA 控件树为空，无法通过元素句柄定位控件。**操控只能使用坐标点击**（由 OCR / 视觉
+> 检测给出坐标），下发控制指令时请明确说明坐标来源，不要引用 element_id。
+{% endif %}
+
+{% if capability_flags %}
+**已启用能力**：
+{% for flag, enabled in capability_flags.items() %}
+- `{{ flag }}`: {{ "启用" if enabled else "禁用" }}
+{% endfor %}
+{% else %}
+**能力标志**：（未协商，使用默认配置）
+{% endif %}
+
+---
+
+## 当前执行状态
+
+**停滞计数**：{{ stall_count }}{% if stall_count > 0 %} ⚠ 已检测到连续停滞，请调整策略{% endif %}
+
+{% if errors.perception_error %}
+**感知错误**：{{ errors.perception_error }}
+{% endif %}
+{% if errors.control_error %}
+**控制错误**：{{ errors.control_error }}
+{% endif %}
+
+---
+
+## 最新屏幕感知摘要
+
+{% if perception_summary %}
+{{ perception_summary }}
+{% else %}
+（暂无感知数据，建议先路由 `perceive` 获取屏幕状态）
+{% endif %}
+
+---
+
+## 执行历史（最近 {{ step_history_window | length }} 步）
+
+{% if step_history_window %}
+{% for step in step_history_window %}
+**[步骤 {{ step.step_index }}]** Worker=`{{ step.agent }}` 状态=`{{ step.task_status }}`
+指令：{{ step.instruction }}
+{% if step.perception_error %}感知错误：{{ step.perception_error }}{% endif %}
+{% if step.control_error %}控制错误：{{ step.control_error }}{% endif %}
+{% endfor %}
+{% else %}
+（无历史步骤，这是任务的第一步）
+{% endif %}
+
+---
+
+请根据以上信息，输出下一步决策（严格 JSON，不加任何解释）：

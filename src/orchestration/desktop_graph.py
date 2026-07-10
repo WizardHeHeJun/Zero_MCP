@@ -1,0 +1,693 @@
+"""桌面任务执行图（Task 10BC）。
+
+图连线（R3 决策，per 蓝图主研批注）：
+    START → supervisor
+    supervisor →route_after_supervisor→ perceive | control | playwright
+                                        | memory_flush | error_report
+    perceive → stall_detect            ← R3：感知失败也经统一停滞节点
+    control →route_after_control→ stall_detect | supervisor
+    stall_detect →route_after_stall→ supervisor | error_report
+    error_report → memory_flush
+    memory_flush → END
+
+节点：
+    supervisor_node  — 调 DesktopSupervisorAgent.plan，无业务路由判断。
+    perceive_node    — 调 ScreenPerceptionAgent.perceive，返回感知增量。
+    control_node     — 调 DesktopControlAgent.execute，含 interrupt/resume 分区。
+    stall_detect_node— 三信号停滞检测（phash 不变 / 步骤重复 / 错误连续）。
+    error_report_node— 记录错误 + incident_reporter 打桩，设 FAILED。
+    memory_flush_node— 唯一记忆写入点，scope=session 显式，经 MemoryAPI Protocol。
+
+Protocols（在 src/orchestration/protocols.py）：
+    MemoryAPI / SnapshotStore / IncidentReporter
+
+工厂：
+    get_graph(checkpointer=None) → 编译好的 StateGraph（默认 InMemorySaver）。
+
+设计约束（红线）：
+    - 三层单向依赖：orchestration → agents → mcp client；不反向 import 记忆/存储层。
+    - 记忆写入只在 memory_flush_node（唯一写入点，scope=session 显式）。
+    - Agent 节点不直连图谱/向量库（MemoryAPI Protocol 打桩）。
+    - 大对象不进 state（snapshot_ref: str，ScreenSnapshot 本体经 SnapshotStore 外存）。
+    - 模型 ID 走 os.environ，不硬编码（DesktopSupervisorAgent 内处理）。
+    - 节点签名 (state) -> dict，只返回增量。
+    - Supervisor 无业务路由判断（is_browser_task 等在条件边函数）。
+    - 条件边函数带 -> Literal[...] 注解。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from src.agents.desktop_control_agent import DesktopControlAgent, make_control_node
+from src.agents.screen_perception_agent import ScreenPerceptionAgent, make_perceive_node
+from src.mcp.desktop_mcp_client import DesktopMCPClient
+from src.orchestration.desktop_supervisor import DesktopSupervisorAgent, make_supervisor_node
+from src.orchestration.phash import average_hash_from_bytes as _compute_average_hash
+from src.orchestration.phash import hamming_bits as _hamming_distance
+from src.orchestration.protocols import (
+    IncidentReporter,
+    MemoryAPI,
+    NoopIncidentReporter,
+    NoopMemoryAPI,
+    SnapshotStore,
+)
+from src.orchestration.safety.action_guard import ActionGuard
+from src.orchestration.state import DesktopTaskState, StepArchive, TaskStatus
+
+logger = logging.getLogger(__name__)
+
+# ── 环境配置（工程假设，Task 12 标定） ────────────────────────────────────────
+
+STALL_MAX_STEPS: int = int(os.environ.get("STALL_MAX_STEPS", "5"))
+"""连续同 Worker 步骤超过此数触发停滞信号（步骤重复信号）。"""
+
+STALL_THRESHOLD: int = int(os.environ.get("STALL_THRESHOLD", "3"))
+"""stall_count 达到此阈值时路由至 error_report（触发停滞处理）。"""
+
+PHASH_UNCHANGED_THRESHOLD: int = int(os.environ.get("PHASH_UNCHANGED_THRESHOLD", "10"))
+"""画面 phash 汉明距离小于此值视为「画面未变」（phash 不变信号）。
+工程假设：取 8x8 = 64 bits，阈值 10 ≈ 15.6% 不同位。"""
+
+STALL_CONSECUTIVE_ERROR_WINDOW: int = 2
+"""连续错误（perception_error | control_error）次数达此值触发停滞信号。
+工程假设：2 次连续错误即视为连续错误停滞。"""
+
+
+# ── 辅助函数：感知哈希 ────────────────────────────────────────────────────────
+# phash 计算（average hash）已统一至 src.orchestration.phash（消除双实现技术债）。
+# 本模块通过别名 import 保留 _compute_average_hash / _hamming_distance 名字，
+# 供 stall_detect_node 信号 A 调用与既有测试引用，底层实现单一。
+
+
+# ── 辅助函数：is_browser_task（条件边路由辅助，纯函数） ──────────────────────
+
+
+def is_browser_task(instruction: str) -> bool:
+    """判断指令是否为浏览器任务（独立纯函数，路由归此，不在 Supervisor 内）。
+
+    工程假设：通过关键词匹配判断（http/https/浏览器/browser/chrome/firefox/edge）。
+    Task 12 可替换为 LLM 二次分类。
+
+    Args:
+        instruction: Supervisor 下发的当前指令文本。
+
+    Returns:
+        True 表示浏览器任务，应路由至 playwright 节点。
+    """
+    lower = instruction.lower()
+    browser_patterns = [
+        r"\bhttps?://",
+        r"\bbrowser\b",
+        r"\bchrome\b",
+        r"\bfirefox\b",
+        r"\bedge\b",
+        r"\bplaywri",
+        r"浏览器",
+        r"打开网页",
+        r"访问网址",
+    ]
+    return any(re.search(p, lower) for p in browser_patterns)
+
+
+# ── 条件边路由函数（全部带 -> Literal[...] 注解，独立可单测） ─────────────────
+
+
+def route_after_supervisor(
+    state: DesktopTaskState,
+) -> Literal["perceive", "control", "playwright", "memory_flush", "error_report"]:
+    """Supervisor 节点后的路由函数。
+
+    优先级（从高到低）：
+      1. task_status in (DONE, FAILED) → memory_flush（任务结束，写记忆）
+      2. stall_count >= STALL_THRESHOLD → error_report（停滞超阈值）
+      3. next_agent == "perceive" → perceive
+      4. next_agent == "control" → control
+      5. is_browser_task(current_instruction) → playwright
+      6. 默认 → error_report（未识别的 next_agent）
+
+    注意：感知失败停滞路径（perception_error 非 None）由 stall_detect_node 累加
+    stall_count，再由此函数的规则 2 路由至 error_report（R3 决策）。
+
+    Args:
+        state: 当前 DesktopTaskState。
+
+    Returns:
+        目标节点名（Literal 类型）。
+    """
+    task_status = state.task_status
+    stall_count = state.stall_count
+    next_agent = state.next_agent
+    instruction = state.current_instruction
+
+    # 规则 1：任务终态 → memory_flush
+    if task_status in (TaskStatus.DONE, TaskStatus.FAILED):
+        logger.debug(
+            "route_after_supervisor: task_status=%r → memory_flush",
+            task_status,
+        )
+        return "memory_flush"
+
+    # 规则 2：停滞超阈值 → error_report
+    if stall_count >= STALL_THRESHOLD:
+        logger.debug(
+            "route_after_supervisor: stall_count=%d >= STALL_THRESHOLD=%d → error_report",
+            stall_count,
+            STALL_THRESHOLD,
+        )
+        return "error_report"
+
+    # 规则 3-4：按 next_agent 路由
+    if next_agent == "perceive":
+        return "perceive"
+    if next_agent == "control":
+        return "control"
+
+    # 规则 5：浏览器任务 → playwright
+    if is_browser_task(instruction):
+        logger.debug("route_after_supervisor: is_browser_task=True → playwright")
+        return "playwright"
+
+    # 默认：未识别 → error_report
+    logger.warning(
+        "route_after_supervisor: 未识别 next_agent=%r → error_report",
+        next_agent,
+    )
+    return "error_report"
+
+
+def route_after_control(
+    state: DesktopTaskState,
+) -> Literal["stall_detect", "supervisor"]:
+    """control_node 后的路由函数。
+
+    - control_error 非 None 或 task_status=FAILED → stall_detect（累加停滞计数）
+    - 正常（control_error=None）→ supervisor
+
+    Args:
+        state: 当前 DesktopTaskState。
+
+    Returns:
+        目标节点名（Literal 类型）。
+    """
+    if state.control_error is not None or state.task_status == TaskStatus.FAILED:
+        logger.debug(
+            "route_after_control: control_error=%r task_status=%r → stall_detect",
+            state.control_error,
+            state.task_status,
+        )
+        return "stall_detect"
+    return "supervisor"
+
+
+def route_after_stall(
+    state: DesktopTaskState,
+) -> Literal["supervisor", "error_report"]:
+    """stall_detect_node 后的路由函数。
+
+    - stall_count >= STALL_THRESHOLD → error_report
+    - 否则 → supervisor
+
+    Args:
+        state: 当前 DesktopTaskState。
+
+    Returns:
+        目标节点名（Literal 类型）。
+    """
+    if state.stall_count >= STALL_THRESHOLD:
+        logger.debug(
+            "route_after_stall: stall_count=%d >= STALL_THRESHOLD=%d → error_report",
+            state.stall_count,
+            STALL_THRESHOLD,
+        )
+        return "error_report"
+    return "supervisor"
+
+
+# ── stall_detect_node（三信号停滞检测）────────────────────────────────────────
+
+
+def make_stall_detect_node(
+    snapshot_store: SnapshotStore | None = None,
+) -> Any:
+    """生成 stall_detect_node 节点函数。
+
+    三停滞信号（任一触发则 stall_count += 1）：
+      信号 A — 画面 phash 不变：当前 snapshot_ref 对应图像与 last_screen_hash 汉明距离
+               < PHASH_UNCHANGED_THRESHOLD，视为画面未变化。
+               注：snapshot_ref 只存 ID，需通过 snapshot_store 加载图像；
+               snapshot_store=None 时跳过此信号（测试/无存储环境）。
+      信号 B — 步骤重复：len(step_history) > STALL_MAX_STEPS 且最近 N 步均为同一 Worker。
+      信号 C — 连续错误：perception_error 与 control_error 在最近步骤连续出现。
+
+    返回增量：{"stall_count": new_stall_count, "last_screen_hash": hash_str}
+    （只更新这两个字段，LastValue 覆写）。
+
+    Args:
+        snapshot_store: 快照存取接口（用于信号 A phash 比对）；None 时跳过 A 信号。
+
+    Returns:
+        符合 LangGraph 节点签名 `(state) -> dict` 的异步函数。
+    """
+
+    async def stall_detect_node(state: DesktopTaskState) -> dict[str, Any]:
+        """停滞检测节点：三信号任一触发则 stall_count += 1。
+
+        Args:
+            state: 当前 DesktopTaskState。
+
+        Returns:
+            state 增量字典，含 stall_count / last_screen_hash。
+        """
+        stall_increment = 0
+        new_hash: str | None = state.last_screen_hash
+
+        # 信号 A：画面 phash 不变（需要 snapshot_store 加载图像）
+        if snapshot_store is not None and state.snapshot_ref is not None:
+            try:
+                snapshot = await snapshot_store.load(state.snapshot_ref)
+                current_hash: str | None = None
+
+                # 从 screenshot_path 读取图像字节计算 phash
+                # 文件 I/O 走 asyncio.to_thread，不阻塞事件循环（python-code.md）
+                if snapshot.screenshot_path is not None:
+                    try:
+                        img_bytes = await asyncio.to_thread(
+                            Path(snapshot.screenshot_path).read_bytes
+                        )
+                        current_hash = _compute_average_hash(img_bytes)
+                    except OSError as exc:
+                        logger.debug(
+                            "stall_detect_node: 无法读取截图文件 %s: %s",
+                            snapshot.screenshot_path,
+                            exc,
+                        )
+
+                if current_hash is not None:
+                    if state.last_screen_hash is not None:
+                        dist = _hamming_distance(current_hash, state.last_screen_hash)
+                        if dist < PHASH_UNCHANGED_THRESHOLD:
+                            logger.info(
+                                "stall_detect_node: 信号A 画面未变化 hamming_dist=%d < %d",
+                                dist,
+                                PHASH_UNCHANGED_THRESHOLD,
+                            )
+                            stall_increment += 1
+                    new_hash = current_hash
+            except Exception as exc:
+                logger.debug("stall_detect_node: 信号A 计算失败（%s），跳过", exc)
+
+        # 信号 B：步骤重复（最近 STALL_MAX_STEPS+1 步都是同一 Worker）
+        history = state.step_history
+        if len(history) > STALL_MAX_STEPS:
+            recent = history[-(STALL_MAX_STEPS + 1) :]
+            agents_in_recent = {step.agent for step in recent}
+            if len(agents_in_recent) == 1:
+                repeated_agent = next(iter(agents_in_recent))
+                logger.info(
+                    "stall_detect_node: 信号B 步骤重复 最近 %d 步均为 agent=%r",
+                    len(recent),
+                    repeated_agent,
+                )
+                stall_increment += 1
+
+        # 信号 C：连续错误（perception_error 或 control_error 在最近步骤连续出现）
+        if len(history) >= STALL_CONSECUTIVE_ERROR_WINDOW:
+            recent_errors = history[-STALL_CONSECUTIVE_ERROR_WINDOW:]
+            all_have_errors = all(
+                step.perception_error is not None or step.control_error is not None
+                for step in recent_errors
+            )
+            if all_have_errors:
+                logger.info(
+                    "stall_detect_node: 信号C 连续错误 最近 %d 步均有错误",
+                    STALL_CONSECUTIVE_ERROR_WINDOW,
+                )
+                stall_increment += 1
+        # 也检查当前 state 层（直接字段，不依赖 step_history 写入完整性）
+        elif state.perception_error is not None or state.control_error is not None:
+            # 单步错误但 step_history 不足时，也算一次连续错误信号
+            stall_increment += 1
+
+        new_stall_count = state.stall_count + stall_increment
+
+        logger.info(
+            "stall_detect_node: stall_increment=%d new_stall_count=%d "
+            "(threshold=%d) signals triggered=%d",
+            stall_increment,
+            new_stall_count,
+            STALL_THRESHOLD,
+            stall_increment,
+        )
+
+        return {
+            "stall_count": new_stall_count,
+            "last_screen_hash": new_hash,
+        }
+
+    return stall_detect_node
+
+
+# ── error_report_node ─────────────────────────────────────────────────────────
+
+
+def make_error_report_node(
+    incident_reporter: IncidentReporter | None = None,
+) -> Any:
+    """生成 error_report_node 节点函数。
+
+    职责：
+      - log error（task_id / stall_count / errors / snapshot_ref）。
+      - 调 incident_reporter.report 打桩（上报告警/监控系统）。
+      - 设 task_status=FAILED，返回增量。
+
+    Args:
+        incident_reporter: 事件上报接口；None 时使用 NoopIncidentReporter 打桩。
+
+    Returns:
+        符合 LangGraph 节点签名 `(state) -> dict` 的异步函数。
+    """
+    reporter: IncidentReporter = incident_reporter or NoopIncidentReporter()
+
+    async def error_report_node(state: DesktopTaskState) -> dict[str, Any]:
+        """错误上报节点：记录错误信息 + incident_reporter 打桩 + 设 FAILED。
+
+        Args:
+            state: 当前 DesktopTaskState。
+
+        Returns:
+            state 增量字典，含 task_status="FAILED"。
+        """
+        errors: dict[str, str | None] = {
+            "perception_error": state.perception_error,
+            "control_error": state.control_error,
+        }
+
+        logger.error(
+            "error_report_node: task_id=%r stall_count=%d "
+            "perception_error=%r control_error=%r snapshot_ref=%r",
+            state.task_id,
+            state.stall_count,
+            state.perception_error,
+            state.control_error,
+            state.snapshot_ref,
+        )
+
+        try:
+            await reporter.report(
+                task_id=state.task_id,
+                stall_count=state.stall_count,
+                errors=errors,
+                snapshot_ref=state.snapshot_ref,
+                metadata={
+                    "task_description": state.task_description,
+                    "task_status": state.task_status,
+                    "step_count": len(state.step_history),
+                },
+            )
+        except Exception as exc:
+            logger.warning("error_report_node: incident_reporter.report 失败（%s）", exc)
+
+        return {"task_status": TaskStatus.FAILED}
+
+    return error_report_node
+
+
+# ── memory_flush_node（唯一记忆写入点）────────────────────────────────────────
+
+
+def make_memory_flush_node(
+    memory_api: MemoryAPI | None = None,
+    step_archive: StepArchive | None = None,
+) -> Any:
+    """生成 memory_flush_node 节点函数。
+
+    唯一记忆写入点（memory-rules.md）：
+      - 调 memory_api.write_session_summary(scope="session"，显式不默认 user）。
+      - 调 step_archive.archive 全量归档当前 step_history。
+      - 不直连 Neo4j/向量库/图谱（经 MemoryAPI Protocol 打桩）。
+
+    Args:
+        memory_api: 记忆写入接口；None 时使用 NoopMemoryAPI 打桩。
+        step_archive: 步骤归档接口；None 时使用 StepArchive 打桩（无操作）。
+
+    Returns:
+        符合 LangGraph 节点签名 `(state) -> dict` 的异步函数。
+    """
+    mem_api: MemoryAPI = memory_api or NoopMemoryAPI()
+    archive: StepArchive = step_archive or StepArchive()
+
+    async def memory_flush_node(state: DesktopTaskState) -> dict[str, Any]:
+        """记忆写入节点：任务完成后唯一写记忆点，scope=session 显式。
+
+        执行流程：
+          1. 组装任务摘要（task_id / task_status / 步骤数 / 最终感知摘要）。
+          2. 调 memory_api.write_session_summary（scope="session"，显式）。
+          3. 调 step_archive.archive 全量归档 step_history。
+
+        Args:
+            state: 当前 DesktopTaskState。
+
+        Returns:
+            state 增量字典（返回 task_status 以确认终态，不改变状态）。
+        """
+        # 组装摘要
+        summary_lines = [
+            f"任务ID: {state.task_id}",
+            f"任务描述: {state.task_description}",
+            f"最终状态: {state.task_status}",
+            f"执行步骤数: {len(state.step_history)}",
+            f"停滞计数: {state.stall_count}",
+        ]
+        if state.perception_summary:
+            summary_lines.append(f"最终感知摘要: {state.perception_summary[:500]}")
+        if state.perception_error:
+            summary_lines.append(f"最终感知错误: {state.perception_error}")
+        if state.control_error:
+            summary_lines.append(f"最终控制错误: {state.control_error}")
+        summary = "\n".join(summary_lines)
+
+        metadata: dict[str, Any] = {
+            "step_count": len(state.step_history),
+            "stall_count": state.stall_count,
+            "task_status": state.task_status,
+        }
+
+        # 写入记忆（scope="session"，显式不默认 user）
+        try:
+            await mem_api.write_session_summary(
+                task_id=state.task_id,
+                scope="session",  # 显式指定，禁止默认 user（memory-rules.md）
+                summary=summary,
+                metadata=metadata,
+            )
+            logger.info(
+                "memory_flush_node: 记忆写入完成 task_id=%r scope=session step_count=%d",
+                state.task_id,
+                len(state.step_history),
+            )
+        except Exception as exc:
+            logger.warning("memory_flush_node: memory_api.write_session_summary 失败（%s）", exc)
+
+        # 全量归档 step_history
+        try:
+            await archive.archive(task_id=state.task_id, steps=state.step_history)
+            logger.info(
+                "memory_flush_node: step_history 归档完成 task_id=%r steps=%d",
+                state.task_id,
+                len(state.step_history),
+            )
+        except Exception as exc:
+            logger.warning("memory_flush_node: step_archive.archive 失败（%s）", exc)
+
+        # 返回 task_status 增量（保持终态，不改变）
+        return {"task_status": state.task_status}
+
+    return memory_flush_node
+
+
+# ── playwright 占位节点（Task 10BC 不实现，仅占位防图编译报错）────────────────
+
+
+async def _playwright_placeholder_node(state: DesktopTaskState) -> dict[str, Any]:
+    """Playwright 浏览器任务占位节点（Task 10BC 范围外，仅防图编译报错）。
+
+    工程假设：浏览器任务由独立 PlaywrightAgent 处理（eng-team 未来接线）。
+    当前实现直接返回 error_report（未实现提示），不崩溃。
+
+    Args:
+        state: 当前 DesktopTaskState。
+
+    Returns:
+        state 增量，路由到 error_report 处理。
+    """
+    logger.warning(
+        "_playwright_placeholder_node: Playwright Agent 未实现，task_id=%r → error_report",
+        state.task_id,
+    )
+    return {
+        "control_error": "Playwright Agent 尚未实现（占位节点）",
+        "task_status": TaskStatus.FAILED,
+    }
+
+
+# ── get_graph 工厂 ─────────────────────────────────────────────────────────────
+
+
+def get_graph(
+    client: DesktopMCPClient | None = None,
+    supervisor_agent: DesktopSupervisorAgent | None = None,
+    perception_agent: ScreenPerceptionAgent | None = None,
+    control_agent: DesktopControlAgent | None = None,
+    memory_api: MemoryAPI | None = None,
+    incident_reporter: IncidentReporter | None = None,
+    snapshot_store: SnapshotStore | None = None,
+    step_archive: StepArchive | None = None,
+    checkpointer: Any = None,
+) -> Any:
+    """构建并编译桌面任务执行图（工厂函数）。
+
+    默认使用 InMemorySaver（测试用，免装 Postgres）。
+    生产环境由 eng-team 注入 AsyncPostgresSaver（独立包，首用需 .setup()）。
+
+    图连线（R3 决策）：
+        START → supervisor
+        supervisor → perceive | control | playwright | memory_flush | error_report
+        perceive → stall_detect
+        control → stall_detect | supervisor
+        stall_detect → supervisor | error_report
+        error_report → memory_flush
+        memory_flush → END
+
+    playwright 节点当前为占位，直接返回 FAILED（eng-team 未来实现后替换）。
+
+    Args:
+        client: DesktopMCPClient 实例（async with 块内注入）。
+                None 时各 Agent 节点需已通过 *_agent 参数注入，否则图运行时失败。
+        supervisor_agent: DesktopSupervisorAgent 实例；None 时创建默认实例（缺 key 优雅回退）。
+        perception_agent: ScreenPerceptionAgent 实例；None 且 client 非 None 时自动创建。
+        control_agent: DesktopControlAgent 实例；None 且 client 非 None 时自动创建。
+        memory_api: MemoryAPI 实现；None 时使用 NoopMemoryAPI 打桩。
+        incident_reporter: IncidentReporter 实现；None 时使用 NoopIncidentReporter 打桩。
+        snapshot_store: SnapshotStore 实现；None 时跳过 phash 信号 A。
+        step_archive: StepArchive 实现；None 时使用无操作打桩。
+        checkpointer: LangGraph Checkpointer；None 时使用 InMemorySaver（测试默认）。
+
+    Returns:
+        编译好的 CompiledGraph（可调用 .invoke / .astream_events / .get_state 等）。
+    """
+    # 默认 Checkpointer（InMemorySaver，测试用）
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
+
+    # 默认 Supervisor（缺 key 优雅回退）
+    if supervisor_agent is None:
+        supervisor_agent = DesktopSupervisorAgent(
+            llm_client=None,
+            step_archive=step_archive or StepArchive(),
+        )
+
+    # 自动创建 PerceptionAgent（需要 client）
+    if perception_agent is None and client is not None:
+        perception_agent = ScreenPerceptionAgent(
+            client=client,
+            snapshot_store=None,  # 使用内存打桩
+        )
+
+    # 自动创建 ControlAgent（需要 client）
+    if control_agent is None and client is not None:
+        guard = ActionGuard(client=client)
+        control_agent = DesktopControlAgent(client=client, guard=guard)
+
+    # 构造节点函数
+    sup_node = make_supervisor_node(supervisor_agent)
+
+    if perception_agent is not None:
+        perceive_node = make_perceive_node(perception_agent)
+    else:
+
+        async def perceive_node(state: DesktopTaskState) -> dict[str, Any]:
+            """感知节点占位（无 PerceptionAgent 注入）。"""
+            logger.warning("perceive_node: PerceptionAgent 未注入")
+            return {"perception_error": "PerceptionAgent 未注入"}
+
+    if control_agent is not None:
+        ctrl_node = make_control_node(control_agent)
+    else:
+
+        async def ctrl_node(state: DesktopTaskState) -> dict[str, Any]:
+            """控制节点占位（无 ControlAgent 注入）。"""
+            logger.warning("control_node: ControlAgent 未注入")
+            return {"control_error": "ControlAgent 未注入"}
+
+    stall_node = make_stall_detect_node(snapshot_store=snapshot_store)
+    err_node = make_error_report_node(incident_reporter=incident_reporter)
+    mem_node = make_memory_flush_node(
+        memory_api=memory_api,
+        step_archive=step_archive,
+    )
+
+    # 构建图
+    builder = StateGraph(DesktopTaskState)
+
+    # 注册节点
+    builder.add_node("supervisor", sup_node)
+    builder.add_node("perceive", perceive_node)
+    builder.add_node("control", ctrl_node)
+    builder.add_node("stall_detect", stall_node)
+    builder.add_node("error_report", err_node)
+    builder.add_node("memory_flush", mem_node)
+    builder.add_node("playwright", _playwright_placeholder_node)
+
+    # 图连线（R3 决策）
+    builder.add_edge(START, "supervisor")
+
+    builder.add_conditional_edges(
+        "supervisor",
+        route_after_supervisor,
+        {
+            "perceive": "perceive",
+            "control": "control",
+            "playwright": "playwright",
+            "memory_flush": "memory_flush",
+            "error_report": "error_report",
+        },
+    )
+
+    # perceive → stall_detect（R3：感知失败也经统一停滞节点）
+    builder.add_edge("perceive", "stall_detect")
+
+    builder.add_conditional_edges(
+        "control",
+        route_after_control,
+        {
+            "stall_detect": "stall_detect",
+            "supervisor": "supervisor",
+        },
+    )
+
+    builder.add_conditional_edges(
+        "stall_detect",
+        route_after_stall,
+        {
+            "supervisor": "supervisor",
+            "error_report": "error_report",
+        },
+    )
+
+    # error_report → memory_flush → END
+    builder.add_edge("error_report", "memory_flush")
+    builder.add_edge("memory_flush", END)
+
+    # playwright 占位 → error_report
+    builder.add_edge("playwright", "error_report")
+
+    return builder.compile(checkpointer=checkpointer)

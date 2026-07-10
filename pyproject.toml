@@ -8,17 +8,45 @@ version = "0.0.0"
 description = "Zero_MCP —— 经 MCP 给 AI 数字人 Zero 加新 Agent 能力模块（Python 主 + TS MCP 层）"
 requires-python = ">=3.12"
 dependencies = [
-    # 随实现补版本约束：
-    # "langgraph",        # 编排层 StateGraph
-    # "pydantic",         # 结构化 state / 跨语言契约校验
-    # "mcp",              # 官方 python-sdk：连 Zero 的 MCP client
+    "langgraph>=0.4",     # 编排层 StateGraph / interrupt / Checkpointer（Task 10 起用）
+    "jinja2>=3.1",        # prompt 模板（Task 11，模板与代码分离）
+    "pydantic>=2.0",      # 结构化 state / 感知契约校验（Task 2 起用）
+    # —— 屏幕能力 MCP 层（Task 3-6，CPU 全功能兜底=硬前提 3）——
+    "mcp>=1.0,<2.0",              # 官方 python-sdk（FastMCP + ClientSession + stdio）
+    "python-dotenv>=1.0",         # .env 读取
+    "mss>=9.0",                   # 截图
+    "pillow>=10.0",               # 图像管道 / OCR 预处理
+    "rapidocr-onnxruntime>=1.3",  # CPU OCR（自动拉 onnxruntime CPU 版）
+    "pywinauto>=0.6.8",           # UIA 操控
+    "uiautomation>=2.0",          # UIA COM 遍历（自 poc extras 升 base）
+    "pyautogui>=0.9.54",          # 坐标点击 / 快捷键
+    "pyperclip>=1.8",             # 剪贴板中文输入
+    "pywin32>=306",               # Win32 API
 ]
 
 [project.optional-dependencies]
 dev = [
-    # "pytest",
-    # "ruff",
-    # "mypy",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "types-pywin32",
+]
+poc = [
+    # 蓝图 §10 Task 1：UIA 覆盖率 PoC（tests/poc/）；已随 Task 3-6 升 base，保留兼容
+    "uiautomation>=2.0",
+    "pywinauto>=0.6.8",
+]
+# GPU 为可选加速（硬前提 3）：EP 自适应 CUDA>DirectML>CPU
+gpu-cuda = [
+    "onnxruntime-gpu>=1.18",
+    "pynvml>=11.0",
+]
+gpu-dml = [
+    "onnxruntime-directml>=1.18",
+]
+omniparser = [
+    "torch>=2.0",  # OmniParser 推理依赖；模型走 .env OMNIPARSER_MODEL_DIR 本地目录
 ]
 
 [tool.ruff]
@@ -32,3 +60,26 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 files = ["src"]
+
+# Task 4/5 中延迟 import 的第三方库（uiautomation、rapidocr_onnxruntime、mss、
+# numpy）无 py.typed / stubs，ignore_missing_imports 消除 [import-untyped]。
+# ignore_errors 不用——只豁免真正无 stubs 的库，代码自身类型错误仍须修正。
+[[tool.mypy.overrides]]
+module = [
+    "uiautomation",
+    "rapidocr_onnxruntime",
+    "mss",
+    "numpy",
+    "PIL",
+    "PIL.Image",
+    "pyautogui",
+    "pyperclip",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "realenv: 需要真实桌面环境（实机手动运行，CI 跳过）",
+]

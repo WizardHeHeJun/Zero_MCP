@@ -67,3 +67,6 @@ desktop.ini
 !.vscode/extensions.json
 *.swp
 *~
+
+# ── PoC 测量产物（原始 JSON，结论见 notes/） ──
+tests/poc/output/
