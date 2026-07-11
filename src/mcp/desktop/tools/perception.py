@@ -22,6 +22,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -113,6 +114,14 @@ def _get_active_window_info() -> tuple[int | None, str | None]:
     buf = ctypes.create_unicode_buffer(512)
     user32.GetWindowTextW(hwnd, buf, 512)
     return hwnd, buf.value or None
+
+
+def _get_window_title(hwnd: int) -> str | None:
+    """返回指定窗口标题。空标题/失败返回 None。"""
+    user32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value or None
 
 
 def _get_screen_size() -> tuple[int, int]:
@@ -314,13 +323,114 @@ def _take_screenshot_sync(
     return str(out_path)
 
 
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+def _capture_window_sync(
+    window_handle: int,
+    snapshot_id: str,
+    screenshot_tmp_dir: str,
+) -> str | None:
+    """PrintWindow(PW_RENDERFULLCONTENT) 捕获指定窗口自身的 DWM 渲染面（阻塞）。
+
+    与屏幕截图的本质区别：取的是窗口自己的合成表面——**被其他窗口遮挡、
+    无焦点、被压 z 序底部都能拿到真实像素**（Task 12 实测：真实多窗口桌面上
+    目标窗口几乎总被遮挡，屏幕截图裁剪会拍到覆盖者的像素）。
+    仅要求窗口非最小化。失败（最小化/DWM 未渲染出全黑/GDI 失败）返回 None，
+    调用方回退全屏截图。
+    """
+    from PIL import Image
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    rect = _get_window_rect(window_handle)
+    if rect is None:
+        return None
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0 or left <= -32000:
+        return None  # 最小化哨兵 rect 或空窗口
+
+    hwnd_dc = user32.GetWindowDC(window_handle)
+    if not hwnd_dc:
+        return None
+    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+    bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+    try:
+        gdi32.SelectObject(mem_dc, bmp)
+        PW_RENDERFULLCONTENT = 0x00000002
+        if not user32.PrintWindow(window_handle, mem_dc, PW_RENDERFULLCONTENT):
+            logger.warning("PrintWindow 失败（hwnd=%#x），回退屏幕截图", window_handle)
+            return None
+        bmi = _BITMAPINFOHEADER(
+            ctypes.sizeof(_BITMAPINFOHEADER), width, -height, 1, 32, 0, 0, 0, 0, 0, 0
+        )
+        buf = ctypes.create_string_buffer(width * height * 4)
+        if gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bmi), 0) != height:
+            logger.warning("GetDIBits 失败（hwnd=%#x），回退屏幕截图", window_handle)
+            return None
+        img = Image.frombuffer("RGB", (width, height), buf.raw, "raw", "BGRX", 0, 1)
+        if img.convert("L").getextrema() == (0, 0):
+            logger.warning("PrintWindow 返回全黑（hwnd=%#x 未渲染），回退屏幕截图", window_handle)
+            return None
+
+        if screenshot_tmp_dir:
+            out_dir = Path(screenshot_tmp_dir)
+        else:
+            import tempfile
+
+            out_dir = Path(tempfile.gettempdir()) / "zero_mcp_screenshots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"snapwin_{snapshot_id}.png"
+        img.save(str(out_path), "PNG")
+        logger.debug("窗口捕获已保存：%s（hwnd=%#x）", out_path, window_handle)
+        return str(out_path)
+    finally:
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(window_handle, hwnd_dc)
+
+
 # ── OCR（RapidOCR） ────────────────────────────────────────────────────────────
+
+# RapidOCR 引擎模块级懒加载单例：构造时加载 ONNX 模型（秒级），每快照重建会把
+# 单次感知延迟推高一个量级（Task 12 实测 14.5s/快照，主因即此）。to_thread 下
+# 可能并发首建，加锁保证只初始化一次。
+_OCR_ENGINE: Any = None
+_OCR_ENGINE_LOCK = threading.Lock()
+
+
+def _get_ocr_engine() -> Any:
+    """返回进程级 RapidOCR 单例（首次调用时加载模型，阻塞）。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        with _OCR_ENGINE_LOCK:
+            if _OCR_ENGINE is None:
+                from rapidocr_onnxruntime import RapidOCR
+
+                _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
 
 
 def _run_ocr_on_file_sync(
     screenshot_path: str,
     bbox: dict[str, int] | None,
     snapshot_id: str,
+    origin: tuple[int, int] = (0, 0),
 ) -> list[TextBlock]:
     """对截图文件（或其裁剪区域）执行 RapidOCR，返回 TextBlock 列表（阻塞）。
 
@@ -328,19 +438,20 @@ def _run_ocr_on_file_sync(
         screenshot_path: PNG 文件路径。
         bbox: 可选裁剪区域 {x,y,width,height}（物理像素）；None=全图。
         snapshot_id: 用于生成 block_id 前缀。
+        origin: 图像坐标系原点在屏幕绝对坐标中的位置。全屏截图为 (0,0)；
+            PrintWindow 窗口图传窗口左上角，保证 TextBlock.bbox 恒为屏幕绝对坐标。
     """
     from PIL import Image
-    from rapidocr_onnxruntime import RapidOCR
 
     img = Image.open(screenshot_path).convert("RGB")
     if bbox is not None:
         x, y, w, h = bbox["x"], bbox["y"], bbox["width"], bbox["height"]
         img = img.crop((x, y, x + w, y + h))
-        offset_x, offset_y = x, y
+        offset_x, offset_y = x + origin[0], y + origin[1]
     else:
-        offset_x, offset_y = 0, 0
+        offset_x, offset_y = origin
 
-    engine = RapidOCR()
+    engine = _get_ocr_engine()
     # RapidOCR 接受 PIL Image / numpy array / 文件路径
     import numpy as np
 
@@ -395,6 +506,7 @@ async def do_screen_snapshot(
     capture_screenshot: bool,
     caps: CapabilityFlags,
     screenshot_tmp_dir: str,
+    window_handle: int | None = None,
 ) -> ScreenSnapshot:
     """获取完整屏幕感知快照（三层降级逻辑）。
 
@@ -403,6 +515,9 @@ async def do_screen_snapshot(
         capture_screenshot: 是否截图落磁盘。
         caps: 能力探测结果（来自 capability_probe）。
         screenshot_tmp_dir: 截图输出目录（空串时用系统临时目录）。
+        window_handle: 目标窗口 HWND；None = 前台窗口。指定时 UIA 树与
+            OCR 裁剪均以该窗口为准（Task 12 实测：前台可被第三方窗口/
+            自家子进程控制台抢占，前台耦合使感知在多窗口桌面不可靠）。
 
     Returns:
         ScreenSnapshot 实例（符合 src/agents/models/screen_snapshot.py 契约）。
@@ -415,8 +530,12 @@ async def do_screen_snapshot(
     timestamp_ms = int(time.time() * 1000)
     screen_width, screen_height = _get_screen_size()
 
-    # ── L1：窗口级定位（始终执行） ────────────────────────────────────────────
-    active_hwnd, active_title = _get_active_window_info()
+    # ── L1：窗口级定位（始终执行；指定 window_handle 时解除前台耦合） ─────────
+    if window_handle is not None:
+        active_hwnd: int | None = window_handle
+        active_title = _get_window_title(window_handle)
+    else:
+        active_hwnd, active_title = _get_active_window_info()
 
     # 空洞探测（L1 附属步骤，阻塞 COM，走 to_thread）
     uia_hollow = False
@@ -447,32 +566,79 @@ async def do_screen_snapshot(
         uia_hollow,
     )
 
-    # ── 截图（mss，阻塞） ──────────────────────────────────────────────────────
+    # ── 截图 ──────────────────────────────────────────────────────────────────
+    # 指定 window_handle 时优先 PrintWindow 捕获窗口自身渲染面（被遮挡/无焦点/
+    # 压 z 序底都能取到真实像素，Task 12 实测真实桌面上目标窗口几乎总被遮挡）；
+    # 失败（最小化/未渲染）回退 mss 全屏截图 + 窗口 rect 裁剪。
     screenshot_path: str | None = None
+    window_captured = False
+    capture_origin: tuple[int, int] = (0, 0)
     # mode=uia_ocr/full 或 capture_screenshot=True 时截图
     need_screenshot = capture_screenshot or effective_mode in {"uia_ocr", "full"}
-    if need_screenshot and caps.mss_available:
+    if need_screenshot and window_handle is not None:
         try:
             screenshot_path = await asyncio.to_thread(
-                _take_screenshot_sync,
+                _capture_window_sync,
+                window_handle,
                 snapshot_id,
                 screenshot_tmp_dir,
             )
         except Exception as exc:
-            logger.error("截图失败（非致命，继续感知）：%s", exc, exc_info=True)
-    elif need_screenshot and not caps.mss_available:
-        logger.warning("mss 不可用，跳过截图（caps.mss_available=False）")
+            logger.error("窗口捕获异常（非致命，回退屏幕截图）：%s", exc, exc_info=True)
+            screenshot_path = None
+        if screenshot_path is not None:
+            window_captured = True
+            wc_rect = _get_window_rect(window_handle)
+            if wc_rect is not None:
+                capture_origin = (wc_rect[0], wc_rect[1])
+    if need_screenshot and screenshot_path is None:
+        if caps.mss_available:
+            try:
+                screenshot_path = await asyncio.to_thread(
+                    _take_screenshot_sync,
+                    snapshot_id,
+                    screenshot_tmp_dir,
+                )
+            except Exception as exc:
+                logger.error("截图失败（非致命，继续感知）：%s", exc, exc_info=True)
+        else:
+            logger.warning("mss 不可用，跳过截图（caps.mss_available=False）")
 
     # ── L2：OCR（uia_ocr / full，需截图文件） ─────────────────────────────────
     text_blocks: list[TextBlock] = []
     if effective_mode in {"uia_ocr", "full"} and screenshot_path is not None:
         if caps.ocr:
+            # OCR 与 L1 UIA 同口径：PrintWindow 窗口图直接全图 OCR（origin 补偿回
+            # 屏幕绝对坐标）；mss 全屏截图则裁剪到目标窗口 rect。Task 12 实测
+            # （2026-07-10）：全图 OCR 会把其他应用的文本混入 perception_summary——
+            # 既误导编排层，也构成跨窗口注入面。
+            # mss 路径窗口 rect 需 clamp 到主屏内，完全在副屏时裁剪无效 →
+            # 回退全图并告警（已知局限：mss 截图仅覆盖主屏）。
+            ocr_bbox: dict[str, int] | None = None
+            if not window_captured and active_hwnd is not None:
+                win_rect = _get_window_rect(active_hwnd)
+                if win_rect is not None:
+                    clamp_x0, clamp_y0 = max(0, win_rect[0]), max(0, win_rect[1])
+                    clamp_x1 = min(screen_width, win_rect[2])
+                    clamp_y1 = min(screen_height, win_rect[3])
+                    if clamp_x1 > clamp_x0 and clamp_y1 > clamp_y0:
+                        ocr_bbox = {
+                            "x": clamp_x0,
+                            "y": clamp_y0,
+                            "width": clamp_x1 - clamp_x0,
+                            "height": clamp_y1 - clamp_y0,
+                        }
+                    else:
+                        logger.warning(
+                            "前台窗口 rect=%s 不在主屏截图范围内，OCR 回退全图", win_rect
+                        )
             try:
                 text_blocks = await asyncio.to_thread(
                     _run_ocr_on_file_sync,
                     screenshot_path,
-                    None,  # 全图 OCR
+                    ocr_bbox,
                     snapshot_id,
+                    capture_origin,
                 )
             except Exception as exc:
                 logger.error("OCR 失败（非致命）：%s", exc, exc_info=True)

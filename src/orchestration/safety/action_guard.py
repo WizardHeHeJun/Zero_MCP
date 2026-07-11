@@ -26,7 +26,13 @@ from src.orchestration.phash import hamming_ratio as _hamming_distance_ratio
 
 logger = logging.getLogger(__name__)
 
-# ── 环境配置（工程假设，Task 12 标定） ────────────────────────────────────────
+# ── 环境配置 ──────────────────────────────────────────────────────────────────
+# Task 12 已标定（notes/e2e-desktop-task-results.md §四.2/§五）：
+#   TOCTOU_WAIT_MS=200 相对单快照 ~1.2s 延迟为安全下限，保留。
+#   TOCTOU_HASH_THRESHOLD=0.1 —— 全窗口 phash 对有动画的现代应用无静止基线
+#   （钉钉无人操作时 delta 在 0/0.47 间跳），此阈值只在 hash 裁剪到「目标元素
+#   局部 bbox」口径下才成立。toctou_verify 当前取全屏 hash 属已知口径局限，
+#   改元素级裁剪是 algo-team 框架待办（不擅改比对语义）。
 
 TOCTOU_WAIT_MS: int = int(os.environ.get("TOCTOU_WAIT_MS", "200"))
 TOCTOU_HASH_THRESHOLD: float = float(os.environ.get("TOCTOU_HASH_THRESHOLD", "0.1"))

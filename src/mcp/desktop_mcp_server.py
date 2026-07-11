@@ -86,12 +86,15 @@ def _dump_model(obj: Any) -> str:
 async def screen_snapshot(
     mode: str = "uia_ocr",
     capture_screenshot: bool = False,
+    window_handle: int | None = None,
 ) -> str:
     """感知当前屏幕状态。
 
     Args:
         mode: 感知模式，"uia_only" | "uia_ocr" | "full"（默认 uia_ocr）。
         capture_screenshot: 是否同时截图落磁盘（默认 False）。
+        window_handle: 目标窗口 HWND（None = 前台窗口）。指定时 UIA 树
+            与 OCR 裁剪均以该窗口为准，感知不再依赖前台归属。
 
     Returns:
         ScreenSnapshot 序列化 JSON。
@@ -107,6 +110,7 @@ async def screen_snapshot(
             capture_screenshot=capture_screenshot,
             caps=flags,
             screenshot_tmp_dir=screenshot_tmp_dir,
+            window_handle=window_handle,
         )
         return _dump_model(snapshot)
     except ToolError:

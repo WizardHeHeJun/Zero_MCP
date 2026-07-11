@@ -26,6 +26,14 @@ from src.mcp.desktop.capability_probe import CapabilityFlags
 # ── fixture helpers ───────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def reset_ocr_engine_singleton() -> Any:
+    """RapidOCR 进程级单例在测试间重置，避免 fake engine 跨用例泄漏。"""
+    perception_mod._OCR_ENGINE = None
+    yield
+    perception_mod._OCR_ENGINE = None
+
+
 def _make_caps(
     ocr: bool = True,
     mss_available: bool = True,
@@ -175,6 +183,181 @@ async def test_not_hollow_uia_only_stays(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert snapshot.uia_hollow is False
     assert snapshot.perception_mode == "uia_only"
+
+
+# ── OCR 裁剪口径：前台窗口 rect（与 L1 UIA 对齐，Task 12 实测修正） ────────────
+
+
+async def test_screen_snapshot_crops_ocr_to_active_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """do_screen_snapshot 把前台窗口 rect（clamp 到主屏）作为 OCR 裁剪 bbox 传入。
+
+    Task 12 e2e 实测：全图 OCR 会把其他应用文本混入 perception_summary
+    （跨窗口注入面），故 L2 OCR 必须与 L1 UIA 同口径裁剪到前台窗口。
+    """
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x2222, "钉钉"))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: True)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+    )
+    # 窗口右/下缘越出主屏 → 期望 clamp 到 (100,50)-(1920,1080)
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (100, 50, 2000, 1200))
+
+    seen_bbox: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_bbox.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert snapshot.perception_mode == "uia_ocr"
+    assert seen_bbox == [({"x": 100, "y": 50, "width": 1820, "height": 1030}, (0, 0))]
+
+
+async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_offscreen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """前台窗口完全在主屏外（如副屏）→ 裁剪无效，OCR 回退全图（bbox=None）。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x3333, "副屏窗"))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: False)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+    )
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (2560, 0, 4480, 1080))
+
+    seen_bbox: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_bbox.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert seen_bbox == [(None, (0, 0))]
+
+
+# ── 指定 window_handle 感知（解除前台耦合，Task 12 实测需求） ─────────────────
+
+
+async def test_screen_snapshot_targets_specified_window_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """window_handle 指定时，UIA 树 / hollow 探测 / OCR 裁剪均以该窗口为准，
+    完全不读前台窗口（前台可被第三方窗口/自家子进程控制台抢占）。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+
+    def fail_active() -> tuple[int | None, str | None]:
+        raise AssertionError("指定 window_handle 时不得读取前台窗口")
+
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", fail_active)
+    monkeypatch.setattr(perception_mod, "_get_window_title", lambda hwnd: "钉钉")
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+
+    seen_hollow_hwnd: list[int] = []
+    seen_tree_hwnd: list[int] = []
+
+    def fake_hollow(hwnd: int) -> bool:
+        seen_hollow_hwnd.append(hwnd)
+        return False
+
+    def fake_tree(hwnd: int, max_depth: int) -> list[Any]:
+        seen_tree_hwnd.append(hwnd)
+        return []
+
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", fake_hollow)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", fake_tree)
+    # PrintWindow 捕获失败（如窗口最小化）→ 回退 mss 全屏 + rect 裁剪
+    monkeypatch.setattr(perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: None)
+    monkeypatch.setattr(
+        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+    )
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (100, 100, 900, 700))
+
+    seen_bbox: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_bbox.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr",
+        capture_screenshot=False,
+        caps=caps,
+        screenshot_tmp_dir="",
+        window_handle=0x4444,
+    )
+
+    assert seen_hollow_hwnd == [0x4444]
+    assert seen_tree_hwnd == [0x4444]
+    assert seen_bbox == [({"x": 100, "y": 100, "width": 800, "height": 600}, (0, 0))]
+    assert snapshot.active_window_title == "钉钉"
+
+
+async def test_screen_snapshot_window_handle_uses_print_window_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """window_handle 指定且 PrintWindow 捕获成功 → OCR 直接全图 + origin 补偿回
+    屏幕绝对坐标（被遮挡/无焦点也能感知，Task 12 实测核心需求）。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(perception_mod, "_get_window_title", lambda hwnd: "钉钉")
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: True)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: "C:/fake/win.png"
+    )
+
+    def fail_mss(snap_id: str, tmp_dir: str) -> str:
+        raise AssertionError("PrintWindow 成功时不得走 mss 全屏截图")
+
+    monkeypatch.setattr(perception_mod, "_take_screenshot_sync", fail_mss)
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (730, 304, 1754, 944))
+
+    seen: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen.append((screenshot_path, bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr",
+        capture_screenshot=False,
+        caps=caps,
+        screenshot_tmp_dir="",
+        window_handle=0x5555,
+    )
+
+    # 窗口图全图 OCR（bbox=None），origin=窗口左上角 → 坐标恒为屏幕绝对
+    assert seen == [("C:/fake/win.png", None, (730, 304))]
+    assert snapshot.screenshot_path == "C:/fake/win.png"
 
 
 # ── OCR TextBlock 映射 ────────────────────────────────────────────────────────

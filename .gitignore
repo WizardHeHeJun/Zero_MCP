@@ -68,5 +68,6 @@ desktop.ini
 *.swp
 *~
 
-# ── PoC 测量产物（原始 JSON，结论见 notes/） ──
+# ── PoC / e2e 测量产物（原始 JSON 含真实屏幕 OCR 文本，结论见 notes/） ──
 tests/poc/output/
+tests/e2e/output/

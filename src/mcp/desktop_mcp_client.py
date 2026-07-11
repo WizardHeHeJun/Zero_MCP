@@ -281,12 +281,15 @@ class DesktopMCPClient:
         self,
         mode: str = "uia_ocr",
         capture_screenshot: bool = False,
+        window_handle: int | None = None,
     ) -> ScreenSnapshot:
         """获取完整屏幕感知快照。
 
         Args:
             mode: 感知模式，"uia_only" | "uia_ocr" | "full"（默认 uia_ocr）。
             capture_screenshot: 是否同时截图落磁盘（默认 False）。
+            window_handle: 目标窗口 HWND（None = 前台窗口）。指定时 UIA 树
+                与 OCR 裁剪均以该窗口为准，感知不再依赖前台归属。
 
         Returns:
             ScreenSnapshot Pydantic 模型实例。
@@ -294,10 +297,10 @@ class DesktopMCPClient:
         Raises:
             DesktopMCPCallError: server 工具调用失败。
         """
-        text = await self._call_tool(
-            "screen_snapshot",
-            {"mode": mode, "capture_screenshot": capture_screenshot},
-        )
+        args: dict[str, Any] = {"mode": mode, "capture_screenshot": capture_screenshot}
+        if window_handle is not None:
+            args["window_handle"] = window_handle
+        text = await self._call_tool("screen_snapshot", args)
         return ScreenSnapshot.model_validate_json(text)
 
     async def get_uia_tree(

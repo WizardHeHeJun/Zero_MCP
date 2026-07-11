@@ -222,6 +222,17 @@ async def test_screen_snapshot_round_trip(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
 
+async def test_screen_snapshot_with_window_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """window_handle 指定时随参数下发（定向感知，解除前台耦合）；None 时不带键。"""
+    client, mock_session = _build_mock_client(monkeypatch)
+    _set_tool_return(mock_session, _make_screen_snapshot_json())
+    await client.screen_snapshot(mode="uia_ocr", window_handle=0x1234)
+    mock_session.call_tool.assert_called_once_with(
+        "screen_snapshot",
+        {"mode": "uia_ocr", "capture_screenshot": False, "window_handle": 0x1234},
+    )
+
+
 async def test_get_uia_tree_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.agents.models.screen_snapshot import UIAElement
 

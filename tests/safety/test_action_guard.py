@@ -631,9 +631,14 @@ class TestSanitizeScreenTextLayer2Chinese:
         assert result == "[FILTERED]"
 
     def test_clean_chinese_text_not_filtered(self) -> None:
-        """正常中文界面文本不含越权词，不被过滤。"""
-        text = "请点击「发送」按钮完成消息发送，或按回车键。"
+        """正常中文界面文本不含越权词，不被判为注入。
+
+        用不被 NFKC 改写的标点（、。），验证字节保持不变；安全属性核心是
+        「不被替换为 [FILTERED]」。
+        """
+        text = "请点击发送按钮完成消息发送、或按回车键。"
         result = sanitize_screen_text(text)
+        assert result != "[FILTERED]"
         assert result == text
 
     def test_normal_instruction_word_not_filtered(self) -> None:
@@ -642,6 +647,18 @@ class TestSanitizeScreenTextLayer2Chinese:
         # 单独「指令」不触发「忽略所有指令」等完整短语
         result = sanitize_screen_text(text)
         assert result == text
+
+    def test_nfkc_normalizes_fullwidth_punctuation_side_effect(self) -> None:
+        """记录既有行为：第三层 NFKC 规范化把全角标点（，！？）转半角。
+
+        这是反混淆层对所有文本的副作用——真实中文 UI 大量用全角标点，会被
+        规范化（gap#9：Task 12 评估此副作用对下游 perception_summary 的影响）。
+        不影响安全属性：正常文本仍不被判为注入（≠ [FILTERED]）。
+        """
+        text = "请确认，是否发送？"  # 含全角逗号 U+FF0C、全角问号 U+FF1F
+        result = sanitize_screen_text(text)
+        assert result != "[FILTERED]"
+        assert result == "请确认,是否发送?"  # 全角标点被 NFKC 转半角
 
 
 # ── sanitize_screen_text 第三层：混淆检测 ────────────────────────────────────
