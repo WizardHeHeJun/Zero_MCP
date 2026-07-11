@@ -79,6 +79,10 @@ class ScreenSnapshot(BaseModel):
     # Task 1 实测：目标窗口 UIA 内容树为空（如微信 4.x mmui 自绘）。
     # True 时 uia_elements 仅含窗口帧节点，文字/控件 grounding 依赖 L2/L3。
     uia_hollow: bool = False
+    # Task 12：screenshot_path 图像坐标系原点的屏幕绝对坐标。全屏截图为 (0,0)；
+    # PrintWindow 窗口捕获为窗口左上角。消费方（如 TOCTOU 局部裁剪）用它把
+    # 屏幕绝对坐标换算为图像坐标。
+    capture_origin: tuple[int, int] = (0, 0)
 
 
 class ActionRisk(StrEnum):

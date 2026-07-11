@@ -677,6 +677,7 @@ async def do_screen_snapshot(
         capability_flags=capability_flags,
         is_untrusted=True,
         uia_hollow=uia_hollow,
+        capture_origin=capture_origin,
     )
 
 

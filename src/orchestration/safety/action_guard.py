@@ -30,12 +30,15 @@ logger = logging.getLogger(__name__)
 # Task 12 已标定（notes/e2e-desktop-task-results.md §四.2/§五）：
 #   TOCTOU_WAIT_MS=200 相对单快照 ~1.2s 延迟为安全下限，保留。
 #   TOCTOU_HASH_THRESHOLD=0.1 —— 全窗口 phash 对有动画的现代应用无静止基线
-#   （钉钉无人操作时 delta 在 0/0.47 间跳），此阈值只在 hash 裁剪到「目标元素
-#   局部 bbox」口径下才成立。toctou_verify 当前取全屏 hash 属已知口径局限，
-#   改元素级裁剪是 algo-team 框架待办（不擅改比对语义）。
+#   （钉钉无人操作时 delta 在 0/0.47 间跳），此阈值只在 hash 裁剪到「操作目标
+#   局部邻域」口径下成立 → toctou_verify 对坐标动作按 TOCTOU_CROP_HALF_PX
+#   邻域裁剪比对；无坐标的动作（如 close_window）退回整图口径。
+#   TOCTOU_CROP_HALF_PX=150（300×300 邻域）为工程假设：覆盖常见按钮/菜单目标，
+#   小于动画区到目标的典型距离；动效恰在目标上时 abort 是正确行为（目标不稳定）。
 
 TOCTOU_WAIT_MS: int = int(os.environ.get("TOCTOU_WAIT_MS", "200"))
 TOCTOU_HASH_THRESHOLD: float = float(os.environ.get("TOCTOU_HASH_THRESHOLD", "0.1"))
+TOCTOU_CROP_HALF_PX: int = int(os.environ.get("TOCTOU_CROP_HALF_PX", "150"))
 
 # ── 三级白名单（action_type → 最大允许 ActionRisk） ───────────────────────────
 # 不在白名单中的 action_type 一律升级为 DESTRUCTIVE。
@@ -152,6 +155,9 @@ class ActionGuard:
           2. 等待 TOCTOU_WAIT_MS 毫秒。
           3. 再调一次 screen_snapshot 取第二张截图。
           4. 比对两次 phash，delta > TOCTOU_HASH_THRESHOLD 则 abort（界面已变）。
+             坐标动作按 TOCTOU_CROP_HALF_PX 邻域**局部裁剪**比对（Task 12 实测：
+             整图 hash 被应用自身动效持续误报，无静止基线）；坐标经各图
+             capture_origin 换算，兼容全屏截图与 PrintWindow 窗口图混用。
 
         注意：本方法只做只读操作（两次截图 + hash 比对），适合放在 interrupt 前只读区。
 
@@ -173,25 +179,44 @@ class ActionGuard:
             return "pass"
 
         # --- interrupt 前只读区 ---
+        # 局部裁剪口径（Task 12 §四.2/§五 实测）：坐标动作只比对目标邻域，
+        # 避免窗口自身动效（动画/红点/时钟）造成整图 hash 无静止基线。
+        # crop 按各自图像的 capture_origin 把屏幕绝对坐标换算为图像坐标——
+        # 两张图可能一张全屏(origin=(0,0))一张 PrintWindow 窗口图，但比对的
+        # 屏幕区域一致。
+        def _crop_for(origin: tuple[int, int]) -> tuple[int, int, int, int] | None:
+            if action.coordinates is None:
+                return None  # 无坐标动作（如 close_window）退回整图口径
+            cx, cy = action.coordinates[0] - origin[0], action.coordinates[1] - origin[1]
+            return (
+                cx - TOCTOU_CROP_HALF_PX,
+                cy - TOCTOU_CROP_HALF_PX,
+                cx + TOCTOU_CROP_HALF_PX,
+                cy + TOCTOU_CROP_HALF_PX,
+            )
+
         # 取第一张截图（phash 计算）
         path_before: str | None = None
+        origin_before: tuple[int, int] = (0, 0)
         if snapshot_before is not None and snapshot_before.screenshot_path is not None:
             path_before = snapshot_before.screenshot_path
+            origin_before = snapshot_before.capture_origin
         else:
             snap_a = await self.client.screen_snapshot(capture_screenshot=True, mode="uia_only")
             path_before = snap_a.screenshot_path
+            origin_before = snap_a.capture_origin
 
         if path_before is None:
             logger.warning("toctou_verify: 第一次截图无路径，无法比对，放行（降级）")
             return "pass"
 
         try:
-            bits_before = _compute_phash_bits(path_before)
+            bits_before = _compute_phash_bits(path_before, _crop_for(origin_before))
         except ValueError as exc:
             logger.warning("toctou_verify: 第一次 phash 失败（%s），放行（降级）", exc)
             return "pass"
 
-        # 等待 TOCTOU 窗口（工程假设：200ms 保守下限，Task 12 标定）
+        # 等待 TOCTOU 窗口（Task 12 标定：200ms 相对单快照 ~1.2s 延迟为安全下限）
         await asyncio.sleep(TOCTOU_WAIT_MS / 1000.0)
 
         # 取第二张截图
@@ -203,7 +228,7 @@ class ActionGuard:
             return "pass"
 
         try:
-            bits_after = _compute_phash_bits(path_after)
+            bits_after = _compute_phash_bits(path_after, _crop_for(snap_b.capture_origin))
         except ValueError as exc:
             logger.warning("toctou_verify: 第二次 phash 失败（%s），放行（降级）", exc)
             return "pass"

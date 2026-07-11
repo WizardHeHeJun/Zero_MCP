@@ -41,11 +41,18 @@ def _average_hash_bits(gray_img: np.ndarray) -> np.ndarray:
     return bits
 
 
-def average_hash_from_path(screenshot_path: str) -> np.ndarray:
+def average_hash_from_path(
+    screenshot_path: str,
+    crop: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
     """从文件路径计算 average hash 位向量（TOCTOU 验证用）。
 
     Args:
         screenshot_path: 截图文件路径。
+        crop: 可选裁剪区域 (left, top, right, bottom)，**图像坐标**。Task 12 实测：
+            现代应用窗口自带持续动效（动画/红点/时钟），整图 hash 无静止基线——
+            TOCTOU 须裁剪到操作目标的局部邻域。越界自动 clamp；clamp 后退化为
+            空区域时回退整图（并非静默缩小比对范围——空裁剪无意义）。
 
     Returns:
         shape=(64,) dtype=bool 的位向量。
@@ -56,6 +63,21 @@ def average_hash_from_path(screenshot_path: str) -> np.ndarray:
     img = cv2.imread(screenshot_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"无法读取截图文件：{screenshot_path}")
+    if crop is not None:
+        height, width = img.shape[:2]
+        left = max(0, min(crop[0], width))
+        top = max(0, min(crop[1], height))
+        right = max(0, min(crop[2], width))
+        bottom = max(0, min(crop[3], height))
+        if right > left and bottom > top:
+            img = img[top:bottom, left:right]
+        else:
+            logger.warning(
+                "average_hash_from_path: 裁剪区域 %s clamp 后为空（图像 %dx%d），回退整图",
+                crop,
+                width,
+                height,
+            )
     return _average_hash_bits(img)
 
 

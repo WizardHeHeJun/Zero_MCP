@@ -338,6 +338,111 @@ class TestToctouVerify:
 
         assert result == "pass"
 
+    # ── 局部裁剪口径（Task 12 §四.2：整图 hash 被应用动效误报，无静止基线） ──
+
+    async def test_toctou_crop_ignores_animation_outside_target(self, tmp_path: Path) -> None:
+        """坐标动作：变化发生在目标邻域**之外**（模拟窗口角落动画）→ pass。
+
+        对照 test_toctou_crop_detects_change_at_target——同样的图像变化幅度，
+        区外不误报、区内必拦截，证明裁剪口径生效。
+        """
+        img_a = np.zeros((200, 200), dtype=np.uint8)
+        img_a[:, 100:] = 255
+        img_b = img_a.copy()
+        img_b[0:40, 0:40] = 200  # 左上角"动画区"，远离目标 (160,160)
+
+        path_a = str(tmp_path / "a.png")
+        path_b = str(tmp_path / "b.png")
+        cv2.imwrite(path_a, img_a)
+        cv2.imwrite(path_b, img_b)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard = ActionGuard(client)
+        action = _make_action("click", ActionRisk.DESTRUCTIVE, coordinates=(160, 160))
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch("src.orchestration.safety.action_guard.TOCTOU_CROP_HALF_PX", 40):
+                with patch("src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1):
+                    result = await guard.toctou_verify(action)
+
+        assert result == "pass"
+
+    async def test_toctou_crop_detects_change_at_target(self, tmp_path: Path) -> None:
+        """坐标动作：变化发生在目标邻域**之内**（目标被劫持/替换）→ abort。
+
+        邻域内容用「左黑右白 → 左白右黑」反转产生真实 phash 差异——
+        均匀色块（全白↔全黑）的 average hash 位向量同为全 False，测不出变化
+        （见 test_toctou_abort_when_hash_delta_above_threshold 的注释）。
+        """
+        # 目标 (160,160)，裁剪半径 40 → 邻域 (120,120)-(200,200)；边界放 x=160
+        img_a = np.zeros((200, 200), dtype=np.uint8)
+        img_a[:, 160:] = 255  # 邻域内：左黑右白
+        img_b = img_a.copy()
+        img_b[120:200, 120:160] = 255  # 邻域内反转：左白右黑
+        img_b[120:200, 160:200] = 0
+
+        path_a = str(tmp_path / "a.png")
+        path_b = str(tmp_path / "b.png")
+        cv2.imwrite(path_a, img_a)
+        cv2.imwrite(path_b, img_b)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard = ActionGuard(client)
+        action = _make_action("click", ActionRisk.DESTRUCTIVE, coordinates=(160, 160))
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch("src.orchestration.safety.action_guard.TOCTOU_CROP_HALF_PX", 40):
+                with patch("src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1):
+                    result = await guard.toctou_verify(action)
+
+        assert result == "abort"
+
+    async def test_toctou_crop_converts_via_capture_origin(self, tmp_path: Path) -> None:
+        """capture_origin 坐标换算：snapshot_before 为 PrintWindow 窗口图
+        （origin=(100,100)），第二张为全屏图（origin=(0,0)）——两图裁剪的是
+        同一屏幕区域，内容一致 → pass（区外差异被裁剪屏蔽，证明换算正确）。"""
+        # 屏幕语义：目标 (160,160)，邻域 ±40 → 屏幕区域 (120,120)-(200,200)，
+        # 区域内容=左黑右白（边界在屏幕 x=160）。两图区外底色各不相同——
+        # 若 origin 换算错误，窗口图会裁到均匀灰底（hash 全 False）与全屏图的
+        # 混合位向量产生 delta → abort，测试即失败。
+        # 窗口图（200x200，origin (100,100)）：屏幕区域 = 图像 (20,20)-(100,100)，边界在图像 x=60
+        win_img = np.full((200, 200), 200, dtype=np.uint8)
+        win_img[20:100, 20:60] = 0
+        win_img[20:100, 60:100] = 255
+        # 全屏图（300x300，origin (0,0)）：同一屏幕区域 = 图像 (120,120)-(200,200)，边界在 x=160
+        full_img = np.full((300, 300), 64, dtype=np.uint8)
+        full_img[120:200, 120:160] = 0
+        full_img[120:200, 160:200] = 255
+
+        path_win = str(tmp_path / "win.png")
+        path_full = str(tmp_path / "full.png")
+        cv2.imwrite(path_win, win_img)
+        cv2.imwrite(path_full, full_img)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(path_full),  # 第二张：全屏
+        ]
+        guard = ActionGuard(client)
+        action = _make_action("click", ActionRisk.DESTRUCTIVE, coordinates=(160, 160))
+        snapshot_before = _make_snapshot(path_win)
+        snapshot_before = snapshot_before.model_copy(update={"capture_origin": (100, 100)})
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch("src.orchestration.safety.action_guard.TOCTOU_CROP_HALF_PX", 40):
+                with patch("src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1):
+                    result = await guard.toctou_verify(action, snapshot_before=snapshot_before)
+
+        assert result == "pass"
+
 
 # ── phash 辅助函数单测 ─────────────────────────────────────────────────────────
 
