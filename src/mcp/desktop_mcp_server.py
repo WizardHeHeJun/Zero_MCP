@@ -167,12 +167,16 @@ async def ocr_region(
 ) -> str:
     """OCR 识别截图区域。
 
+    ⚠ 坐标系口径（Task 13）：bbox 与返回的 TextBlock.bbox 均为**图像自身坐标系**
+    （原点=图像左上角），非屏幕绝对坐标。需要屏幕绝对坐标时按对应快照的
+    capture_origin 换算（screen_xy = image_xy + capture_origin）。
+
     Args:
-        bbox: 矩形区域 {"x": int, "y": int, "width": int, "height": int}（物理像素）。
+        bbox: 矩形区域 {"x": int, "y": int, "width": int, "height": int}（图像坐标，物理像素）。
         screenshot_path: 截图文件绝对路径（落磁盘后的 PNG）。
 
     Returns:
-        TextBlock 列表序列化 JSON。
+        TextBlock 列表序列化 JSON（bbox 为图像坐标）。
     """
     _require_enabled()
     import src.mcp.desktop.tools.perception as perception  # noqa: PLC0415

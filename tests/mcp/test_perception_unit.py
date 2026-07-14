@@ -191,10 +191,11 @@ async def test_not_hollow_uia_only_stays(monkeypatch: pytest.MonkeyPatch) -> Non
 async def test_screen_snapshot_crops_ocr_to_active_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """do_screen_snapshot 把前台窗口 rect（clamp 到主屏）作为 OCR 裁剪 bbox 传入。
+    """do_screen_snapshot 把前台窗口 rect（clamp 到虚拟屏）作为 OCR 裁剪 bbox 传入。
 
     Task 12 e2e 实测：全图 OCR 会把其他应用文本混入 perception_summary
     （跨窗口注入面），故 L2 OCR 必须与 L1 UIA 同口径裁剪到前台窗口。
+    2026-07-11 多显示器修正：mss 抓全虚拟屏，clamp 口径从主屏改为虚拟屏 rect。
     """
     caps = _make_caps(ocr=True, mss_available=True)
     monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x2222, "钉钉"))
@@ -202,9 +203,11 @@ async def test_screen_snapshot_crops_ocr_to_active_window(
     monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: True)
     monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
     monkeypatch.setattr(
-        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (0, 0, 3840, 1080)),
     )
-    # 窗口右/下缘越出主屏 → 期望 clamp 到 (100,50)-(1920,1080)
+    # 窗口下缘越出虚拟屏 → 期望 clamp 到 (100,50)-(2000,1080)（右缘 2000 在虚拟屏内）
     monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (100, 50, 2000, 1200))
 
     seen_bbox: list[Any] = []
@@ -222,22 +225,27 @@ async def test_screen_snapshot_crops_ocr_to_active_window(
     )
 
     assert snapshot.perception_mode == "uia_ocr"
-    assert seen_bbox == [({"x": 100, "y": 50, "width": 1820, "height": 1030}, (0, 0))]
+    assert seen_bbox == [({"x": 100, "y": 50, "width": 1900, "height": 1030}, (0, 0))]
+    assert snapshot.capture_origin == (0, 0)
 
 
-async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_offscreen(
+async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_outside_virtual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """前台窗口完全在主屏外（如副屏）→ 裁剪无效，OCR 回退全图（bbox=None）。"""
+    """窗口 rect 与虚拟屏截图完全无交集（如已断开的显示器残留 rect）→
+    裁剪无效，OCR 回退全图（bbox=None），origin 仍为虚拟屏 origin。"""
     caps = _make_caps(ocr=True, mss_available=True)
-    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x3333, "副屏窗"))
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x3333, "幽灵窗"))
     monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
     monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: False)
     monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
     monkeypatch.setattr(
-        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (0, 0, 3840, 1080)),
     )
-    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (2560, 0, 4480, 1080))
+    # rect 完全在虚拟屏 (0,0)-(3840,1080) 之外
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (4000, 200, 4800, 600))
 
     seen_bbox: list[Any] = []
 
@@ -254,6 +262,90 @@ async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_offscreen(
     )
 
     assert seen_bbox == [(None, (0, 0))]
+
+
+async def test_screen_snapshot_secondary_screen_window_crops_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """副屏窗口（rect 在 (1920,0)-(3840,1080) 内）经 mss 回退路径 OCR 裁剪正确。
+
+    2026-07-11 实测修 bug：旧实现抓 mss monitors[1]（枚举顺序不保证是主屏）
+    且 clamp 到主屏 → 副屏窗口被判「不在截图范围内」回退全图。新实现抓
+    monitors[0] 全虚拟屏 → 副屏窗口正常裁剪（图像坐标 = 屏幕绝对坐标 − origin）。
+    """
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x6666, "副屏窗"))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: False)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (0, 0, 3840, 1080)),
+    )
+    # 窗口完全在副屏 (1920,0)-(3840,1080) 内
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (2000, 100, 3000, 900))
+
+    seen_bbox: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_bbox.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    # 不再回退全图：bbox 为图像坐标（origin=(0,0) 时与屏幕绝对坐标一致）
+    assert seen_bbox == [({"x": 2000, "y": 100, "width": 1000, "height": 800}, (0, 0))]
+    assert snapshot.capture_origin == (0, 0)
+    # 主屏尺寸字段语义不变（不受虚拟屏影响）
+    assert snapshot.screen_width == 1920
+    assert snapshot.screen_height == 1080
+
+
+async def test_screen_snapshot_negative_virtual_origin_crop_correct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """负虚拟屏 origin（副屏排在主屏左侧，SM_XVIRTUALSCREEN<0）下裁剪正确：
+
+    - capture_origin = 虚拟屏 origin（负值）；
+    - OCR crop bbox 为图像坐标 = 屏幕绝对坐标 − 虚拟屏 origin（恒非负）。
+    """
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x7777, "左副屏窗"))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: False)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (-1920, 0, 3840, 1080)),
+    )
+    # 窗口在左副屏（屏幕绝对坐标为负）
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (-1800, 100, -800, 600))
+
+    seen_bbox: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_bbox.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    # 图像坐标：x = -1800 - (-1920) = 120；origin 传 capture_origin（负值）
+    assert seen_bbox == [({"x": 120, "y": 100, "width": 1000, "height": 500}, (-1920, 0))]
+    assert snapshot.capture_origin == (-1920, 0)
 
 
 # ── 指定 window_handle 感知（解除前台耦合，Task 12 实测需求） ─────────────────
@@ -286,10 +378,12 @@ async def test_screen_snapshot_targets_specified_window_handle(
 
     monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", fake_hollow)
     monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", fake_tree)
-    # PrintWindow 捕获失败（如窗口最小化）→ 回退 mss 全屏 + rect 裁剪
+    # PrintWindow 捕获失败（如窗口最小化）→ 回退 mss 全虚拟屏 + rect 裁剪
     monkeypatch.setattr(perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: None)
     monkeypatch.setattr(
-        perception_mod, "_take_screenshot_sync", lambda snap_id, tmp_dir: "C:/fake/shot.png"
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (0, 0, 3840, 1080)),
     )
     monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (100, 100, 900, 700))
 
@@ -331,7 +425,7 @@ async def test_screen_snapshot_window_handle_uses_print_window_capture(
         perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: "C:/fake/win.png"
     )
 
-    def fail_mss(snap_id: str, tmp_dir: str) -> str:
+    def fail_mss(snap_id: str, tmp_dir: str) -> tuple[str, tuple[int, int, int, int]]:
         raise AssertionError("PrintWindow 成功时不得走 mss 全屏截图")
 
     monkeypatch.setattr(perception_mod, "_take_screenshot_sync", fail_mss)
@@ -444,6 +538,39 @@ def test_run_ocr_with_bbox_offset(tmp_path: Any) -> None:
     assert blocks[0].bbox.x == 105
     # y_min(5) + offset_y(50) = 55
     assert blocks[0].bbox.y == 55
+
+
+def test_run_ocr_with_bbox_and_negative_origin(tmp_path: Any) -> None:
+    """负虚拟屏 origin 下坐标补偿正确：TextBlock.bbox = 图像坐标 + bbox + origin。
+
+    模拟左副屏场景：全虚拟屏截图 origin=(-1920,0)，窗口图像坐标 bbox.x=120
+    （屏幕绝对 -1800），OCR 识别点 x_min=5 → 屏幕绝对 x = 5 + 120 + (-1920) = -1795。
+    """
+    import rapidocr_onnxruntime as _rapidocr_real
+    from PIL import Image
+
+    img_path = tmp_path / "virtual.png"
+    Image.new("RGB", (400, 300), color=(255, 255, 255)).save(str(img_path))
+
+    fake_result = [
+        [[[5, 5], [45, 5], [45, 25], [5, 25]], "Left", 0.9],
+    ]
+    fake_engine = MagicMock()
+    fake_engine.return_value = (fake_result, None)
+
+    with patch.object(_rapidocr_real, "RapidOCR", return_value=fake_engine):
+        blocks = perception_mod._run_ocr_on_file_sync(
+            screenshot_path=str(img_path),
+            bbox={"x": 120, "y": 100, "width": 200, "height": 150},
+            snapshot_id="neg-origin",
+            origin=(-1920, 0),
+        )
+
+    assert len(blocks) == 1
+    # x_min(5) + bbox.x(120) + origin.x(-1920) = -1795（屏幕绝对坐标，允许为负）
+    assert blocks[0].bbox.x == -1795
+    # y_min(5) + bbox.y(100) + origin.y(0) = 105
+    assert blocks[0].bbox.y == 105
 
 
 def test_run_ocr_empty_result(tmp_path: Any) -> None:

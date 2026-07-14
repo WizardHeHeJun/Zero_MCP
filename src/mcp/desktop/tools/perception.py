@@ -298,8 +298,19 @@ def _uia_elements_to_models(
 def _take_screenshot_sync(
     snapshot_id: str,
     screenshot_tmp_dir: str,
-) -> str:
-    """用 mss 截全屏，PIL 转换后存 PNG，返回绝对路径（阻塞）。"""
+) -> tuple[str, tuple[int, int, int, int]]:
+    """用 mss 抓全虚拟屏（monitors[0]），PIL 转换后存 PNG（阻塞）。
+
+    多显示器修正（2026-07-11 实测）：mss monitors[1] **不保证**是主显示器
+    （本机实测 monitors[1]=副屏、monitors[2]=主屏，枚举顺序不可依赖），
+    且主屏单幅截图会漏掉副屏窗口。故固定抓 monitors[0]=全虚拟屏。
+    虚拟屏 origin 可为负（显示器排列在主屏左/上方时 SM_XVIRTUALSCREEN<0）。
+
+    Returns:
+        (png_path, (left, top, width, height))——第二项是实际抓取的
+        虚拟屏 rect（mss monitors[0]），其 (left, top) 即图像坐标系原点
+        的屏幕绝对坐标（capture_origin）。
+    """
     import mss
     from PIL import Image
 
@@ -314,13 +325,19 @@ def _take_screenshot_sync(
     out_path = out_dir / f"snap_{snapshot_id}.png"
 
     with mss.mss() as sct:
-        monitor = sct.monitors[1]  # monitors[0] = 全虚拟屏，[1] = 主显示器
+        monitor = sct.monitors[0]  # monitors[0] = 全虚拟屏（覆盖所有显示器）
         sct_img = sct.grab(monitor)
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         img.save(str(out_path), "PNG")
+        virtual_rect = (
+            int(monitor["left"]),
+            int(monitor["top"]),
+            int(monitor["width"]),
+            int(monitor["height"]),
+        )
 
-    logger.debug("截图已保存：%s", out_path)
-    return str(out_path)
+    logger.debug("截图已保存：%s（虚拟屏 rect=%s）", out_path, virtual_rect)
+    return str(out_path), virtual_rect
 
 
 class _BITMAPINFOHEADER(ctypes.Structure):
@@ -339,6 +356,44 @@ class _BITMAPINFOHEADER(ctypes.Structure):
     ]
 
 
+# PrintWindow 捕获专用的私有 DLL 实例 + 显式签名。
+# Task 13 实测坑：ctypes.windll.* 是进程级共享对象——第三方库（pyautogui/
+# pywinauto 等）会给共享的 user32.GetWindowDC 设 restype=c_void_p，返回的
+# 64 位 HDC（>2^31）再传给未声明 argtypes 的 gdi32 调用（默认按 c_int 转换）
+# 即 OverflowError: int too long to convert，且是否触发取决于 import 顺序
+# （进程状态依赖，Task 12 钉钉实测未暴露）。私有 WinDLL 实例 + 全量显式
+# argtypes/restype 与第三方库解耦，句柄一律按指针宽度传递。
+_pw_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_pw_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+_pw_user32.GetWindowDC.argtypes = [wintypes.HWND]
+_pw_user32.GetWindowDC.restype = wintypes.HDC
+_pw_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_pw_user32.ReleaseDC.restype = ctypes.c_int
+_pw_user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+_pw_user32.PrintWindow.restype = wintypes.BOOL
+_pw_gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+_pw_gdi32.CreateCompatibleDC.restype = wintypes.HDC
+_pw_gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+_pw_gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+_pw_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+_pw_gdi32.SelectObject.restype = wintypes.HGDIOBJ
+_pw_gdi32.GetDIBits.argtypes = [
+    wintypes.HDC,
+    wintypes.HBITMAP,
+    wintypes.UINT,
+    wintypes.UINT,
+    ctypes.c_void_p,
+    ctypes.POINTER(_BITMAPINFOHEADER),
+    wintypes.UINT,
+]
+_pw_gdi32.GetDIBits.restype = ctypes.c_int
+_pw_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_pw_gdi32.DeleteObject.restype = wintypes.BOOL
+_pw_gdi32.DeleteDC.argtypes = [wintypes.HDC]
+_pw_gdi32.DeleteDC.restype = wintypes.BOOL
+
+
 def _capture_window_sync(
     window_handle: int,
     snapshot_id: str,
@@ -354,9 +409,6 @@ def _capture_window_sync(
     """
     from PIL import Image
 
-    user32 = ctypes.windll.user32
-    gdi32 = ctypes.windll.gdi32
-
     rect = _get_window_rect(window_handle)
     if rect is None:
         return None
@@ -365,22 +417,22 @@ def _capture_window_sync(
     if width <= 0 or height <= 0 or left <= -32000:
         return None  # 最小化哨兵 rect 或空窗口
 
-    hwnd_dc = user32.GetWindowDC(window_handle)
+    hwnd_dc = _pw_user32.GetWindowDC(window_handle)
     if not hwnd_dc:
         return None
-    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
-    bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+    mem_dc = _pw_gdi32.CreateCompatibleDC(hwnd_dc)
+    bmp = _pw_gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
     try:
-        gdi32.SelectObject(mem_dc, bmp)
+        _pw_gdi32.SelectObject(mem_dc, bmp)
         PW_RENDERFULLCONTENT = 0x00000002
-        if not user32.PrintWindow(window_handle, mem_dc, PW_RENDERFULLCONTENT):
+        if not _pw_user32.PrintWindow(window_handle, mem_dc, PW_RENDERFULLCONTENT):
             logger.warning("PrintWindow 失败（hwnd=%#x），回退屏幕截图", window_handle)
             return None
         bmi = _BITMAPINFOHEADER(
             ctypes.sizeof(_BITMAPINFOHEADER), width, -height, 1, 32, 0, 0, 0, 0, 0, 0
         )
         buf = ctypes.create_string_buffer(width * height * 4)
-        if gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bmi), 0) != height:
+        if _pw_gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bmi), 0) != height:
             logger.warning("GetDIBits 失败（hwnd=%#x），回退屏幕截图", window_handle)
             return None
         img = Image.frombuffer("RGB", (width, height), buf.raw, "raw", "BGRX", 0, 1)
@@ -400,9 +452,9 @@ def _capture_window_sync(
         logger.debug("窗口捕获已保存：%s（hwnd=%#x）", out_path, window_handle)
         return str(out_path)
     finally:
-        gdi32.DeleteObject(bmp)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(window_handle, hwnd_dc)
+        _pw_gdi32.DeleteObject(bmp)
+        _pw_gdi32.DeleteDC(mem_dc)
+        _pw_user32.ReleaseDC(window_handle, hwnd_dc)
 
 
 # ── OCR（RapidOCR） ────────────────────────────────────────────────────────────
@@ -569,10 +621,13 @@ async def do_screen_snapshot(
     # ── 截图 ──────────────────────────────────────────────────────────────────
     # 指定 window_handle 时优先 PrintWindow 捕获窗口自身渲染面（被遮挡/无焦点/
     # 压 z 序底都能取到真实像素，Task 12 实测真实桌面上目标窗口几乎总被遮挡）；
-    # 失败（最小化/未渲染）回退 mss 全屏截图 + 窗口 rect 裁剪。
+    # 失败（最小化/未渲染）回退 mss 全虚拟屏截图 + 窗口 rect 裁剪。
     screenshot_path: str | None = None
     window_captured = False
     capture_origin: tuple[int, int] = (0, 0)
+    # mss 全虚拟屏截图实际抓取的 rect（left, top, width, height）；
+    # PrintWindow 路径恒为 None。OCR 裁剪 clamp 以它为准。
+    virtual_rect: tuple[int, int, int, int] | None = None
     # mode=uia_ocr/full 或 capture_screenshot=True 时截图
     need_screenshot = capture_screenshot or effective_mode in {"uia_ocr", "full"}
     if need_screenshot and window_handle is not None:
@@ -594,11 +649,14 @@ async def do_screen_snapshot(
     if need_screenshot and screenshot_path is None:
         if caps.mss_available:
             try:
-                screenshot_path = await asyncio.to_thread(
+                mss_result: tuple[str, tuple[int, int, int, int]] = await asyncio.to_thread(
                     _take_screenshot_sync,
                     snapshot_id,
                     screenshot_tmp_dir,
                 )
+                screenshot_path, virtual_rect = mss_result
+                # 图像原点 = 虚拟屏 origin（可为负，显示器在主屏左/上方时）
+                capture_origin = (mss_result[1][0], mss_result[1][1])
             except Exception as exc:
                 logger.error("截图失败（非致命，继续感知）：%s", exc, exc_info=True)
         else:
@@ -609,28 +667,34 @@ async def do_screen_snapshot(
     if effective_mode in {"uia_ocr", "full"} and screenshot_path is not None:
         if caps.ocr:
             # OCR 与 L1 UIA 同口径：PrintWindow 窗口图直接全图 OCR（origin 补偿回
-            # 屏幕绝对坐标）；mss 全屏截图则裁剪到目标窗口 rect。Task 12 实测
+            # 屏幕绝对坐标）；mss 全虚拟屏截图则裁剪到目标窗口 rect。Task 12 实测
             # （2026-07-10）：全图 OCR 会把其他应用的文本混入 perception_summary——
             # 既误导编排层，也构成跨窗口注入面。
-            # mss 路径窗口 rect 需 clamp 到主屏内，完全在副屏时裁剪无效 →
-            # 回退全图并告警（已知局限：mss 截图仅覆盖主屏）。
+            # mss 路径窗口 rect clamp 到虚拟屏 rect（2026-07-11 多显示器修正：
+            # 副屏窗口不再回退全图；虚拟屏 origin 可为负）。裁剪 bbox 传的是
+            # **图像坐标**（屏幕绝对坐标 − 虚拟屏 origin），origin 参数传
+            # capture_origin，_run_ocr_on_file_sync 会补偿回屏幕绝对坐标。
             ocr_bbox: dict[str, int] | None = None
-            if not window_captured and active_hwnd is not None:
+            if not window_captured and active_hwnd is not None and virtual_rect is not None:
                 win_rect = _get_window_rect(active_hwnd)
                 if win_rect is not None:
-                    clamp_x0, clamp_y0 = max(0, win_rect[0]), max(0, win_rect[1])
-                    clamp_x1 = min(screen_width, win_rect[2])
-                    clamp_y1 = min(screen_height, win_rect[3])
+                    vs_left, vs_top, vs_width, vs_height = virtual_rect
+                    clamp_x0 = max(vs_left, win_rect[0])
+                    clamp_y0 = max(vs_top, win_rect[1])
+                    clamp_x1 = min(vs_left + vs_width, win_rect[2])
+                    clamp_y1 = min(vs_top + vs_height, win_rect[3])
                     if clamp_x1 > clamp_x0 and clamp_y1 > clamp_y0:
                         ocr_bbox = {
-                            "x": clamp_x0,
-                            "y": clamp_y0,
+                            "x": clamp_x0 - vs_left,
+                            "y": clamp_y0 - vs_top,
                             "width": clamp_x1 - clamp_x0,
                             "height": clamp_y1 - clamp_y0,
                         }
                     else:
                         logger.warning(
-                            "前台窗口 rect=%s 不在主屏截图范围内，OCR 回退全图", win_rect
+                            "窗口 rect=%s 不在虚拟屏截图范围 %s 内，OCR 回退全图",
+                            win_rect,
+                            virtual_rect,
                         )
             try:
                 text_blocks = await asyncio.to_thread(
@@ -711,13 +775,19 @@ async def do_ocr_region(
 ) -> list[TextBlock]:
     """对截图文件的指定区域执行 OCR。
 
+    ⚠ 坐标系口径（Task 13）：bbox 与返回的 TextBlock.bbox 均为**该图像自身
+    坐标系**（原点=图像左上角），不是屏幕绝对坐标。mss 全虚拟屏截图的图像
+    坐标与屏幕绝对坐标仅在虚拟屏 origin=(0,0) 时重合；PrintWindow 窗口图则
+    恒不重合。需要屏幕绝对坐标时，调用方自行按快照的 capture_origin 换算
+    （screen_xy = image_xy + capture_origin）。
+
     Args:
-        bbox: 裁剪区域 {"x": int, "y": int, "width": int, "height": int}。
+        bbox: 裁剪区域 {"x": int, "y": int, "width": int, "height": int}（图像坐标）。
         screenshot_path: 截图文件绝对路径（PNG）。
         caps: 能力标志（ocr=False 时 raise RuntimeError）。
 
     Returns:
-        TextBlock 列表。
+        TextBlock 列表（bbox 为图像坐标）。
 
     Raises:
         RuntimeError: caps.ocr=False（RapidOCR 不可用）。
