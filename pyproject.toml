@@ -82,4 +82,5 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "realenv: 需要真实桌面环境（实机手动运行，CI 跳过）",
+    "zerorepo: 需 D:\\Zero 源码在位的跨仓契约回归（缺失即 skip）",
 ]

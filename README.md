@@ -29,6 +29,7 @@
 
 MCP 互操作边界（横切）
   · src/mcp        Python MCP server + client：内部能力封装（感知/操控原语，官方 mcp python-sdk，stdio）
+      └ zero/      Zero↔MCP 情感对接边界契约层：(v,a) 刺激注入 + expression 消费骨架（不 import Zero，协议结构化镜像）
   · mcp-server/    TypeScript MCP 服务层：对外聚合层，向 Zero host 等外部方暴露能力（本能力模块内部不使用）
 ```
 
@@ -53,12 +54,14 @@ src/
     safety/          三级白名单 + TOCTOU + 注入过滤
     prompts/         Jinja2 模板（与代码分离）
   agents/          ScreenPerceptionAgent / DesktopControlAgent / 契约模型      ✅ 已实现
+    models/          screen_snapshot（桌面契约）/ zero_affect（Zero↔MCP 情感契约）
   mcp/             Python MCP server + client + 感知/操控原语                   ✅ 已实现
     desktop/         capability_probe / tools（perception, control）
+    zero/            Zero↔MCP 边界契约层：感知(v,a)注入 + expression 消费骨架   ✅ 第一阶段
   memory/          记忆读写 API（当前经 Protocol 打桩，待实现）                 ⬜ 骨架
   storage/         Postgres / Neo4j / Redis 连接与 schema                       ⬜ 骨架
 mcp-server/        TS MCP 对外聚合层（独立 package.json，本模块未用）            ⬜ 骨架
-tests/             单测（poc/mcp/agents/orchestration/safety）+ 行为回归        ✅ 392 绿
+tests/             单测（poc/mcp/agents/orchestration/safety）+ 行为回归        ✅ 563 绿
 evals/             agent 行为级 evals                                          ✅ 53 绿
 ai-docs/           知识库：模块三件套 / catalog / pitfalls
 notes/             设计纪要 / 实测报告 / 工程实施记录
