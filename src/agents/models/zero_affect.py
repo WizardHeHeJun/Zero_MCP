@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -35,11 +35,13 @@ FACS_KEYS_EXT: list[str] = [
     "AU07",
     "AU12",
     "AU15",
+    "AU17",
     "AU20",
     "AU23",
+    "AU26",
     "intensity",
 ]
-"""扩展 11 维 FACS 键集（facs_decoder.py:26-42）。"""
+"""扩展 13 维 FACS 键集（facs_decoder.py:32-47，议会任务 D 起含 AU17/AU26 通用 AU）。"""
 
 COPING_DRIVEN_AUS: tuple[str, ...] = ("AU23", "AU01", "AU02", "AU20")
 """coping_potential 驱动的 AU 子集（facs_decoder.py:45）。"""
@@ -61,8 +63,13 @@ class AffectStimulus(BaseModel):
 
     对应 ConversationModel.appraise_text() 产出 + coping 独立通道。
     - valence/arousal: 各维 [-1,1]，由 appraise_text 返回（language.py:85）。
-    - coping_potential: 独立通道，默认 None（门控 coping_potential_enabled=False，
-      orchestration/state.py:63）；非 None 时同样 [-1,1]。
+    - coping_potential: 独立通道，默认 None；非 None 时同样 [-1,1]。
+      **Q4 已定（Zero 回传 2026-07-14）**：正式入口 = Zero `Stimulus.control_appraisal`
+      （state.py:33，Smith & Ellsworth 1985 control 维，与 goal_congruence 正交）——
+      本字段接线时**映射到 `Stimulus.control_appraisal`**，**不要**走
+      `state_overrides={"coping_potential_state":...}`（enabled 时被 AppraisalAgent
+      每轮从 stim.control_appraisal 覆写，appraisal.py:174-176）。需 Zero 侧开
+      `coping_potential_enabled` 门控。coping 决定 (-v,+a) 象限愤怒↔恐惧判别性 AU。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -118,14 +125,13 @@ class ModalityPrior(BaseModel):
 
 
 class ProsodyChannel(BaseModel):
-    """韵律通道（Zero → MCP 方向的占位/真实口径双方言）。
+    """韵律通道（Zero → MCP 方向），保持纯 3 值（Zero 侧刻意不塞 prosody_scale）。
 
-    AD-5 量纲双方言说明：
-    - 占位路径（placeholder decoder）：speech_rate ∈ [0.5, 1.5]（基线 1.0），
-      pitch ∈ [0.7, 1.3]（基线 1.0），为倍率口径。
-    - 真实语音模型：三值归一 [0, 1]。
-    待对齐项：与 Zero 窗口 Q1 确认统一量纲后收窄校验上界。
-    当前契约只做 sanity ≥ 0，不硬卡上界，兼容两种方言。
+    量纲双方言（Q1 已定 2026-07-14，canonical=normalized [0,1]）由**兄弟键**
+    `prosody_scale` 标注（在 ExpressionHead / ExpressionBundle 上，非本通道内）：
+    - "ratio"：占位路径，speech_rate∈[0.5,1.5]/pitch∈[0.7,1.3] 倍率（基线 1.0）；
+    - "normalized"：真模型，三值归一 [0,1]。
+    本通道只做 ≥0 sanity，不硬卡上界（收窄由 ExpressionHead 依 prosody_scale 承担）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -157,6 +163,11 @@ class ExpressionHead(BaseModel):
 
     facs_au 键校验：键 ⊆ FACS_KEYS_EXT 全集（FACS_KEYS ∪ FACS_KEYS_EXT），
     值 ∈ [0, 1]。AD-4：不要求全集——占位路径只出象限相关子集（3/9 键）。
+
+    prosody_scale（Q1，Zero 回传 2026-07-14）：韵律量纲**兄弟键**，与 prosody 同级
+    （Zero 刻意不塞进 prosody 子 dict，见 affect_math.py:476）——"ratio"=倍率占位、
+    "normalized"=归一真模型；缺省 None（decoder 未标注量纲，如 mock，additive 零回归）。
+    当 "normalized" 时校验 prosody 三值收窄到 [0,1]。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -165,9 +176,10 @@ class ExpressionHead(BaseModel):
     text_label: str
     physiology: PhysiologyChannel
     prosody: ProsodyChannel
+    prosody_scale: Literal["ratio", "normalized"] | None = None
 
     @model_validator(mode="after")
-    def _validate_facs(self) -> ExpressionHead:
+    def _validate(self) -> ExpressionHead:
         unknown = set(self.facs_au) - _FACS_VALID_KEYS
         if unknown:
             raise ValueError(f"facs_au 包含未知 AU 键: {unknown}")
@@ -176,6 +188,14 @@ class ExpressionHead(BaseModel):
             raise ValueError(f"facs_au 值超出 [0,1]: {out_of_range}")
         if self.text_label not in TEXT_LABELS:
             raise ValueError(f"text_label {self.text_label!r} 不在 TEXT_LABELS 内")
+        if self.prosody_scale == "normalized":
+            for name, val in (
+                ("speech_rate", self.prosody.speech_rate),
+                ("pitch", self.prosody.pitch),
+                ("energy", self.prosody.energy),
+            ):
+                if not (0.0 <= val <= 1.0):
+                    raise ValueError(f"prosody_scale=normalized 下 prosody.{name}={val} 超出 [0,1]")
         return self
 
 
@@ -206,6 +226,11 @@ class ExpressionBundle(BaseModel):
 
     valence_arousal / ExpressionHead 内部的 tuple 字段均兼容 JSON 化后的 list 输入
     （Zero 内部是 tuple，过 MCP/JSON 边界变 list）——pydantic v2 默认支持 list→tuple 强转。
+
+    prosody_scale（Q1）：Zero 在 expression 顶层**提升**一份 prosody 量纲标记
+    （`expression["prosody_scale"] = spontaneous["prosody_scale"]`，expression.py:88-91），
+    供 MCP TTS mapper 单点读；两头共用同一无状态 decoder 故量纲一致。缺省 None
+    （decoder 未标注量纲时不挂键，additive 零回归）。各头内也各带一份同名兄弟键。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -213,6 +238,7 @@ class ExpressionBundle(BaseModel):
     valence_arousal: tuple[float, float]
     spontaneous: ExpressionHead
     voluntary: ExpressionHead
+    prosody_scale: Literal["ratio", "normalized"] | None = None
     language: LanguageOutput | None = None
 
     @classmethod

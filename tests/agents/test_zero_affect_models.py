@@ -2,7 +2,7 @@
 
 覆盖：
   1. 值域校验：AffectStimulus / ModalityPrior 越界 raise ValidationError；合法值通过。
-  2. facs_au 校验：接受 legacy 3 键子集、extended 9 键子集、全 11 键；
+  2. facs_au 校验：接受 legacy 3 键子集、extended 9 键子集、全 13 键；
      未知键 "AU99" 被拒；值超 [0,1] 被拒。
   3. text_label 枚举门控：合法值通过；非法标签被拒。
   4. list→tuple 兼容：valence_arousal / mu 传 list 能存入 tuple 字段。
@@ -257,8 +257,8 @@ class TestExpressionHeadFacsAu:
         head = ExpressionHead(**_make_expression_head(nine_keys))
         assert len(head.facs_au) == 9
 
-    def test_all_11_keys_accepted(self) -> None:
-        """全 11 键（FACS_KEYS_EXT 完整集）被接受。"""
+    def test_all_ext_keys_accepted(self) -> None:
+        """全 13 键（FACS_KEYS_EXT 完整集）被接受。"""
         all_keys = {k: 0.5 for k in FACS_KEYS_EXT}
         head = ExpressionHead(**_make_expression_head(all_keys))
         assert set(head.facs_au.keys()) == set(FACS_KEYS_EXT)
@@ -319,6 +319,73 @@ class TestExpressionHeadTextLabel:
         """空字符串标签被拒绝。"""
         with pytest.raises(ValidationError):
             ExpressionHead(**_make_expression_head(text_label=""))
+
+
+# ---------------------------------------------------------------------------
+# 4b. Q1 prosody_scale 量纲标记（Zero 回传 2026-07-14）
+# ---------------------------------------------------------------------------
+
+
+class TestProsodyScale:
+    """Q1：prosody_scale 是 ExpressionHead/ExpressionBundle 的**兄弟键**（非 prosody 子 dict 内，
+    Zero affect_math.py:476 刻意如此）。normalized→prosody 三值收窄 [0,1]；ratio/缺省放宽
+    （兼容当前 Zero 输出）。
+    """
+
+    def test_absent_scale_allows_ratio_prosody(self) -> None:
+        """缺省 prosody_scale（decoder 未标注，如 mock）→ 放宽，倍率 prosody 通过。"""
+        head = ExpressionHead(**_make_expression_head())
+        assert head.prosody_scale is None
+
+    def test_ratio_scale_allows_over_one_prosody(self) -> None:
+        """prosody_scale="ratio" + 倍率 prosody（speech_rate>1）→ 通过。"""
+        data = _make_expression_head()
+        data["prosody"] = {"speech_rate": 1.5, "pitch": 1.3, "energy": 0.7}
+        data["prosody_scale"] = "ratio"
+        head = ExpressionHead(**data)
+        assert head.prosody_scale == "ratio"
+
+    def test_normalized_scale_accepts_in_range(self) -> None:
+        """prosody_scale="normalized" 且 prosody 三值 ∈ [0,1] → 通过。"""
+        data = _make_expression_head()
+        data["prosody"] = {"speech_rate": 0.8, "pitch": 0.5, "energy": 0.9}
+        data["prosody_scale"] = "normalized"
+        head = ExpressionHead(**data)
+        assert head.prosody_scale == "normalized"
+
+    def test_normalized_scale_rejects_over_one(self) -> None:
+        """prosody_scale="normalized" 但 prosody.speech_rate>1 → 拒绝。"""
+        data = _make_expression_head()
+        data["prosody"] = {"speech_rate": 1.5, "pitch": 0.5, "energy": 0.5}
+        data["prosody_scale"] = "normalized"
+        with pytest.raises(ValidationError, match="normalized"):
+            ExpressionHead(**data)
+
+    def test_invalid_scale_value_rejected(self) -> None:
+        """非法 prosody_scale 值被拒绝。"""
+        data = _make_expression_head()
+        data["prosody_scale"] = "linear"
+        with pytest.raises(ValidationError):
+            ExpressionHead(**data)
+
+    def test_scale_inside_prosody_dict_rejected(self) -> None:
+        """兄弟键约束：塞进 prosody 子 dict 会被 ProsodyChannel extra=forbid 拒。"""
+        data = _make_expression_head()
+        data["prosody"] = {
+            "speech_rate": 1.0,
+            "pitch": 1.0,
+            "energy": 0.7,
+            "prosody_scale": "ratio",
+        }
+        with pytest.raises(ValidationError):
+            ExpressionHead(**data)
+
+    def test_bundle_top_level_prosody_scale(self) -> None:
+        """ExpressionBundle 顶层接受 Zero 提升的 prosody_scale（expression.py:88-91）。"""
+        data = _make_expression_bundle_dict()
+        data["prosody_scale"] = "ratio"
+        bundle = ExpressionBundle(**data)
+        assert bundle.prosody_scale == "ratio"
 
 
 # ---------------------------------------------------------------------------

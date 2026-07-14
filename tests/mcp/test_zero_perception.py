@@ -6,7 +6,7 @@
   3. 单通道 sense() 抛异常 → 被跳过（warning），其余先验不受影响。
   4. 单通道 sense() 返回 None → 被跳过（warning），其余先验不受影响。
   5. as_zero_streams 形状 = list[(name, (v,a), (Πv,Πa))]。
-  6. as_state_overrides：单先验 → text_affect 首条 mu；空列表 → {}。
+  6. Q3：state_overrides 过渡路径已撤下（Zero 回传 2026-07-14 否决 text_affect 挪用）。
   7. isinstance(channel, PerceptionChannel) True（runtime_checkable 协议符合性）。
 """
 
@@ -242,31 +242,26 @@ class TestAsZeroStreams:
 
 
 # ---------------------------------------------------------------------------
-# 4. as_state_overrides 形状
+# 4. Q3：state_overrides 过渡路径已撤下（Zero 回传 2026-07-14）
 # ---------------------------------------------------------------------------
 
 
-class TestAsStateOverrides:
-    """as_state_overrides 静态方法：透传首条 mu 为 text_affect。"""
+class TestNoStateOverridesTransitional:
+    """Q3 决议：借 text_affect 的 state_overrides 过渡路径会被 PerceptionAgent
+    每轮覆盖、不生效，Zero 明确否决。正式入口是 Zero 将新增的 external_priors 字段
+    （需 Zero 走 PRP+议会门）。锁定 PerceptionHub 不提供 as_state_overrides，
+    避免误发无效过渡路径。
+    """
 
-    def test_single_prior_gives_text_affect(self) -> None:
-        """单先验 → text_affect 为首条 mu。"""
+    def test_hub_does_not_expose_state_overrides(self) -> None:
+        """PerceptionHub 不应提供 as_state_overrides（Q3 已撤下）。"""
+        assert not hasattr(PerceptionHub, "as_state_overrides")
+
+    def test_as_zero_streams_still_available(self) -> None:
+        """as_zero_streams 仍在（正式多流形状，待接 external_priors）。"""
         prior = _make_prior("vision", mu=(0.5, -0.3), precision=(0.6, 0.6))
-        overrides = PerceptionHub.as_state_overrides([prior])
-        assert overrides == {"text_affect": (pytest.approx(0.5), pytest.approx(-0.3))}
-
-    def test_empty_priors_returns_empty_dict(self) -> None:
-        """空先验列表 → 返回 {}。"""
-        assert PerceptionHub.as_state_overrides([]) == {}
-
-    def test_multiple_priors_uses_first(self) -> None:
-        """多条先验只透传第一条 mu。"""
-        priors = [
-            _make_prior("vision", mu=(0.8, 0.2), precision=(0.6, 0.6)),
-            _make_prior("audio", mu=(-0.3, 0.5), precision=(0.4, 0.4)),
-        ]
-        overrides = PerceptionHub.as_state_overrides(priors)
-        assert overrides["text_affect"] == (pytest.approx(0.8), pytest.approx(0.2))
+        streams = PerceptionHub.as_zero_streams([prior])
+        assert streams == [("vision", (pytest.approx(0.5), pytest.approx(-0.3)), (0.6, 0.6))]
 
 
 # ---------------------------------------------------------------------------

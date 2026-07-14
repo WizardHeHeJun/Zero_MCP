@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from src.agents.models.zero_affect import ModalityPrior
 
@@ -57,8 +57,7 @@ class PerceptionHub:
 
         hub = PerceptionHub([VisionChannel(), AudioChannel()])
         priors = await hub.collect()
-        streams = PerceptionHub.as_zero_streams(priors)   # → Zero streams 形状
-        overrides = PerceptionHub.as_state_overrides(priors)  # → state_overrides 形态
+        streams = PerceptionHub.as_zero_streams(priors)   # → 独立先验流（待接 external_priors）
     """
 
     def __init__(self, channels: list[PerceptionChannel]) -> None:
@@ -97,29 +96,20 @@ class PerceptionHub:
     def as_zero_streams(
         priors: list[ModalityPrior],
     ) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
-        """将先验列表转为 Zero affect_core streams 形状。
+        """将先验列表转为 Zero 独立先验流形状（不均值，AD-3）。
 
-        对齐 D:\\Zero\\src\\affect_core.py:77-95::
+        每条先验调用 ModalityPrior.as_stream() → (name, (μ_v,μ_a), (Π_v,Π_a))，
+        对齐 Zero 内部 streams 形状（D:\\Zero\\src\\affect_core.py:77-95）。
 
-            streams = [(name, (μ_v, μ_a), (Π_v, Π_a)), ...]
+        **Q3 已定（Zero 回传 2026-07-14）**：正式多流注入口 = Zero 将新增的专用字段
+        ``external_priors: list[(name, (μ_v,μ_a), precision: float)]``（**需 Zero 走
+        PRP + 科学家议会门后落地**；默认空 = 零回归），AffectCore 把每条 append 进 streams。
+        届时本方法产物接进该字段。⚠ external_priors 的 precision 是**标量 float**
+        （AffectCore 广播为 (p,p)），本方法当前返回 tuple 精度——待 external_priors
+        落地时按最终签名收敛精度形状。
 
-        每条先验调用 ModalityPrior.as_stream()，**独立保留**，不做均值（AD-3）。
+        ⛔ Zero 明确否决了借 ``text_affect``（PerceptionAgent 每轮覆写）或
+        ``interlocutor_affect``（ToM 共情偏置）挪用作过渡——故本模块**不提供**
+        state_overrides 过渡路径；external_priors 落地前不发多模态注入路径。
         """
         return [p.as_stream() for p in priors]
-
-    @staticmethod
-    def as_state_overrides(priors: list[ModalityPrior]) -> dict[str, Any]:
-        """将先验转为 Zero session.step(stim, state_overrides={...}) 形态。
-
-        当前实现：透传首条先验的 mu 作为 text_affect（优先级最高的模态先验）。
-        Zero 的 text_affect 先验以 text_affect_precision（默认 0.3）加权注入
-        （affect_core.py:77-95 / chat_driver.py:313-320）。
-
-        多条先验时只透传第一条，其余独立先验应经 as_zero_streams() 走多流接口。
-        TODO(Q3)：待 Zero 在 AffectCore streams 开放正式多流注入口后，
-        将所有先验以完整 streams 形式注入，废弃此单条 text_affect 兜底。
-        """
-        if not priors:
-            return {}
-        first = priors[0]
-        return {"text_affect": first.mu}

@@ -60,8 +60,8 @@ class ZeroCopingChannelDecoder(ZeroChannelDecoder, Protocol):
 
         证据：D:\\Zero\\src\\expression.py:48-54。
         参数均为必填位置参数（无默认值），与 Zero 调用侧一致。
-        facs_extended=True 时解码器输出 FACS_KEYS_EXT（11 维）；
-        False 时输出 FACS_KEYS（5 维）（facs_decoder.py:16-42）。
+        facs_extended=True 时解码器输出 FACS_KEYS_EXT（13 维，任务 D 起含 AU17/AU26）；
+        False 时输出 FACS_KEYS（5 维）（facs_decoder.py:16-47）。
         """
         ...
 
