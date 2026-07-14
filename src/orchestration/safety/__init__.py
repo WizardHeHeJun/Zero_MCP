@@ -10,5 +10,6 @@ ActionGuard 实现三级风险判定、TOCTOU 验证与屏幕文本过滤。
 
 from src.agents.text_filter import sanitize_screen_text
 from src.orchestration.safety.action_guard import ActionGuard
+from src.orchestration.safety.incident_reporter import FileIncidentReporter
 
-__all__ = ["ActionGuard", "sanitize_screen_text"]
+__all__ = ["ActionGuard", "FileIncidentReporter", "sanitize_screen_text"]

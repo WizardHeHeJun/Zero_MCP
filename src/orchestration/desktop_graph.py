@@ -61,6 +61,7 @@ from src.orchestration.protocols import (
     SnapshotStore,
 )
 from src.orchestration.safety.action_guard import ActionGuard
+from src.orchestration.safety.incident_reporter import FileIncidentReporter
 from src.orchestration.state import DesktopTaskState, StepArchive, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,31 @@ PHASH_UNCHANGED_THRESHOLD: int = int(os.environ.get("PHASH_UNCHANGED_THRESHOLD",
 STALL_CONSECUTIVE_ERROR_WINDOW: int = 2
 """连续错误（perception_error | control_error）次数达此值触发停滞信号。
 工程假设：2 次连续错误即视为连续错误停滞。"""
+
+INCIDENT_STEP_WINDOW: int = int(os.environ.get("INCIDENT_STEP_WINDOW", "10"))
+"""异常上报时附带的最近步骤窗口大小（error_report_node metadata.recent_steps）。"""
+
+INCIDENT_SUMMARY_MAX_CHARS: int = 2000
+"""现场包 recent_steps 中 perception_summary 的逐步截断上限（字符）。
+对齐 PERCEPTION_SUMMARY_MAX_TOKENS 的字符近似口径；全文可经 snapshot_ref 回查。"""
+
+
+def _truncate_step_for_incident(step: dict[str, Any]) -> dict[str, Any]:
+    """截断 StepRecord dump 中的长文本字段，保证现场包单包体积有界。
+
+    Args:
+        step: StepRecord.model_dump(mode="json") 结果。
+
+    Returns:
+        原字典（perception_summary 超限时替换为截断副本 + 截断标记）。
+    """
+    summary = step.get("perception_summary")
+    if isinstance(summary, str) and len(summary) > INCIDENT_SUMMARY_MAX_CHARS:
+        step["perception_summary"] = (
+            summary[:INCIDENT_SUMMARY_MAX_CHARS]
+            + f"…[截断 {len(summary) - INCIDENT_SUMMARY_MAX_CHARS} 字符]"
+        )
+    return step
 
 
 # ── 辅助函数：感知哈希 ────────────────────────────────────────────────────────
@@ -411,6 +437,13 @@ def make_error_report_node(
                     "task_description": state.task_description,
                     "task_status": state.task_status,
                     "step_count": len(state.step_history),
+                    # 前 N 步流程（Task 14：异常现场含步骤历史，窗口 INCIDENT_STEP_WINDOW）。
+                    # perception_summary 逐步截断（对齐 PERCEPTION_SUMMARY_MAX_TOKENS 的
+                    # 2000 字符近似口径）——现场包单包有界，长文本全文可经 snapshot_ref 回查
+                    "recent_steps": [
+                        _truncate_step_for_incident(s.model_dump(mode="json"))
+                        for s in state.step_history[-INCIDENT_STEP_WINDOW:]
+                    ],
                 },
             )
         except Exception as exc:
@@ -539,6 +572,38 @@ async def _playwright_placeholder_node(state: DesktopTaskState) -> dict[str, Any
     }
 
 
+# ── incident_reporter feature-flag 接线（Task 14，默认关零回归）──────────────
+
+
+def _resolve_incident_reporter(
+    incident_reporter: IncidentReporter | None,
+    snapshot_store: SnapshotStore | None,
+) -> IncidentReporter | None:
+    """解析 get_graph 使用的 IncidentReporter（feature-flag 纪律：默认关零回归）。
+
+    优先级：
+      1. 显式注入的 incident_reporter → 原样返回。
+      2. env INCIDENT_DIR 已设（非空）→ FileIncidentReporter（现场包落盘，
+         注入 snapshot_store 以便附截图）。
+      3. 否则 → None（make_error_report_node 内落 NoopIncidentReporter，
+         现有测试全部不设 env，零回归）。
+
+    Args:
+        incident_reporter: get_graph 调用方显式注入的实现（None 表示未注入）。
+        snapshot_store: get_graph 传入的快照存取接口（透传给 FileIncidentReporter）。
+
+    Returns:
+        IncidentReporter 实现或 None（Noop 兜底在 make_error_report_node）。
+    """
+    if incident_reporter is not None:
+        return incident_reporter
+    incident_dir = os.environ.get("INCIDENT_DIR")
+    if incident_dir:
+        logger.info("get_graph: INCIDENT_DIR=%r 已设，启用 FileIncidentReporter", incident_dir)
+        return FileIncidentReporter(incident_dir=incident_dir, snapshot_store=snapshot_store)
+    return None
+
+
 # ── get_graph 工厂 ─────────────────────────────────────────────────────────────
 
 
@@ -576,7 +641,9 @@ def get_graph(
         perception_agent: ScreenPerceptionAgent 实例；None 且 client 非 None 时自动创建。
         control_agent: DesktopControlAgent 实例；None 且 client 非 None 时自动创建。
         memory_api: MemoryAPI 实现；None 时使用 NoopMemoryAPI 打桩。
-        incident_reporter: IncidentReporter 实现；None 时使用 NoopIncidentReporter 打桩。
+        incident_reporter: IncidentReporter 实现；None 时看 env INCIDENT_DIR——
+                已设则启用 FileIncidentReporter（异常现场落盘，Task 14），
+                未设则 NoopIncidentReporter 打桩（默认关零回归）。
         snapshot_store: SnapshotStore 实现；None 时跳过 phash 信号 A。
         step_archive: StepArchive 实现；None 时使用无操作打桩。
         checkpointer: LangGraph Checkpointer；None 时使用 InMemorySaver（测试默认）。
@@ -629,7 +696,9 @@ def get_graph(
             return {"control_error": "ControlAgent 未注入"}
 
     stall_node = make_stall_detect_node(snapshot_store=snapshot_store)
-    err_node = make_error_report_node(incident_reporter=incident_reporter)
+    err_node = make_error_report_node(
+        incident_reporter=_resolve_incident_reporter(incident_reporter, snapshot_store)
+    )
     mem_node = make_memory_flush_node(
         memory_api=memory_api,
         step_archive=step_archive,

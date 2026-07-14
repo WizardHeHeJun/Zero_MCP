@@ -84,7 +84,8 @@ cd mcp-server && npm install && npm run typecheck
 - ✅ **Task 1-11 已实现收口**：屏幕感知/操控 MCP 层 + agents + LangGraph 编排 + 安全门（code-reviewer PASS）。
 - ✅ **Task 12 端到端标定完成**：真实钉钉桌面标定全部 gap（成功率/OCR 精度/UIA 覆盖/TOCTOU/注入 FP/延迟），修复 3 个 e2e 独有 bug（OCR 全屏污染、RapidOCR 引擎重建 9 倍延迟、rect 契约），新增 PrintWindow 定向后台感知。
 - ✅ **Task 13 DPI/多显示器坐标一致性完成**：双屏 × 双感知路径 × 12 点 PoC 全过（11 点 0.0px），mss 全虚拟屏修复消除副屏盲区（`monitors[1]≠主屏` 实测证伪）、支持负虚拟屏原点。
-- ⬜ **Task 14-15 待推进**：异常现场上报（incident_reporter）、录制回放。
+- ✅ **Task 14 异常现场上报完成**：`FileIncidentReporter` 落盘现场包（incident.json + 截图副本 + 最近 N 步流程），四级降级永不吞包；feature-flag `INCIDENT_DIR` 默认关零回归。
+- ⬜ **Task 15 待推进**：录制→回放（成本优化后期）。
 - ⬜ **memory / storage 层**：当前 Protocol 打桩，待随记忆/存储模块实现落地。
 
 ## 深入阅读
