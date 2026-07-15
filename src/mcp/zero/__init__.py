@@ -7,6 +7,7 @@
 - 渲染终端（RenderFrame / RenderingExpressionSink）
 - 韵律映射器（ProsodyParams / LinearProsodyMapper）
 - FACS 映射器（AU_TO_ARKIT / ArkitFacsMapper）
+- 生理映射器（PhysiologyParams / LinearPhysiologyMapper）
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 - external_priors 接线（Q3，EXTERNAL_PRIOR_SCHEMA_VERSION / build_external_priors_override）
@@ -57,11 +58,13 @@ from src.mcp.zero.external_priors import (
     recommended_precision,
 )
 
-# -- FACS 映射器 --------------------------------------------------------------
+# -- FACS / 生理 / 韵律 映射器 ------------------------------------------------
 from src.mcp.zero.mappers import (
     AU_TO_ARKIT,
     ArkitFacsMapper,
+    LinearPhysiologyMapper,
     LinearProsodyMapper,
+    PhysiologyParams,
     ProsodyParams,
 )
 from src.mcp.zero.perception import (
@@ -108,6 +111,9 @@ __all__ = [
     # FACS 映射器
     "AU_TO_ARKIT",
     "ArkitFacsMapper",
+    # 生理映射器
+    "LinearPhysiologyMapper",
+    "PhysiologyParams",
     # 韵律映射器
     "LinearProsodyMapper",
     "ProsodyParams",

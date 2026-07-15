@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from src.agents.models.zero_affect import ExpressionBundle, ExpressionHead
 from src.mcp.zero.expression_sink import ExpressionSink, HeadPolicy
 from src.mcp.zero.mappers.facs import ArkitFacsMapper
+from src.mcp.zero.mappers.physiology import LinearPhysiologyMapper, PhysiologyParams
 from src.mcp.zero.mappers.prosody import LinearProsodyMapper, ProsodyParams
 from src.mcp.zero.sinks import RenderFrame, RenderingExpressionSink
 
@@ -604,3 +605,111 @@ class TestRenderFacsMapper:
             prosody=None,
         )
         assert frame.facs_mapped == mapped
+
+
+# ---------------------------------------------------------------------------
+# 9. PhysiologyMapper 接入：physiology_mapped 字段
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPhysiologyMapper:
+    """physiology_mapper 接入：physiology_mapped 字段行为验证（零回归 + 新增）。"""
+
+    def test_physiology_mapper_none_by_default(self) -> None:
+        """默认 physiology_mapper=None（零回归保证）。"""
+        sink = RenderingExpressionSink()
+        assert sink.physiology_mapper is None
+
+    async def test_no_physiology_mapper_physiology_mapped_is_none(self) -> None:
+        """无 physiology_mapper：frame.physiology_mapped is None（零回归——既有行为不变）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].physiology_mapped is None
+
+    async def test_with_mapper_physiology_mapped_is_params(self) -> None:
+        """带 LinearPhysiologyMapper：frame.physiology_mapped 是 PhysiologyParams 实例。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert isinstance(sink.frames[0].physiology_mapped, PhysiologyParams)
+
+    async def test_physiology_mapped_equals_direct_mapper_output(self) -> None:
+        """带 mapper：frame.physiology_mapped 等于直接调 mapper.map(head) 的返回值。"""
+        mapper = LinearPhysiologyMapper()
+        sink = RenderingExpressionSink(physiology_mapper=mapper)
+        head = _make_expression_head()
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected = await mapper.map(head)
+        assert sink.frames[0].physiology_mapped == expected
+
+    async def test_physiology_raw_and_mapped_coexist(self) -> None:
+        """带 mapper：physiology 原样透传 dict 与 physiology_mapped PhysiologyParams 并存不冲突。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        head = _make_expression_head()
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        # physiology 原样透传（dict）
+        assert frame.physiology == head.physiology.model_dump()
+        # physiology_mapped 为映射结果（PhysiologyParams，非 None）
+        assert frame.physiology_mapped is not None
+        assert isinstance(frame.physiology_mapped, PhysiologyParams)
+
+    async def test_dual_both_frames_have_physiology_mapped(self) -> None:
+        """DUAL + physiology_mapper：两帧 physiology_mapped 均非 None。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].physiology_mapped is not None
+        assert sink.frames[1].physiology_mapped is not None
+
+    async def test_dual_no_physiology_mapper_both_frames_none(self) -> None:
+        """DUAL 无 physiology_mapper：两帧 physiology_mapped 均为 None（零回归）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].physiology_mapped is None
+        assert sink.frames[1].physiology_mapped is None
+
+    async def test_render_frame_physiology_mapped_default_none(self) -> None:
+        """直接构造 RenderFrame 时 physiology_mapped 默认值为 None。"""
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.physiology_mapped is None
+
+    async def test_all_three_mappers_combined(self) -> None:
+        """同时带三 mapper：帧同时含 prosody、facs_mapped、physiology_mapped。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+            physiology_mapper=LinearPhysiologyMapper(),
+        )
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        assert isinstance(frame.prosody, ProsodyParams)
+        assert isinstance(frame.facs_mapped, dict)
+        assert isinstance(frame.physiology_mapped, PhysiologyParams)
