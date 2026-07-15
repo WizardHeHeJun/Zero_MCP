@@ -9,6 +9,7 @@
 - FACS 映射器（AU_TO_ARKIT / ArkitFacsMapper）
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
+- external_priors 接线（Q3，EXTERNAL_PRIOR_SCHEMA_VERSION / build_external_priors_override）
 """
 
 from __future__ import annotations
@@ -39,6 +40,15 @@ from src.mcp.zero.expression_sink import (
     HeadPolicy,
     PhysiologyMapper,
     ProsodyMapper,
+)
+
+# -- external_priors 接线（Q3）------------------------------------------------
+from src.mcp.zero.external_priors import (
+    EXTERNAL_PRIOR_SCHEMA_VERSION,
+    PHYSIO_STREAM_PREFIXES,
+    ExternalPriorTuple,
+    build_external_priors_override,
+    is_physio_stream,
 )
 
 # -- FACS 映射器 --------------------------------------------------------------
@@ -103,4 +113,10 @@ __all__ = [
     "ZeroCopingChannelDecoder",
     "ZeroConversationModel",
     "ZeroLanguageModel",
+    # external_priors 接线（Q3）
+    "EXTERNAL_PRIOR_SCHEMA_VERSION",
+    "PHYSIO_STREAM_PREFIXES",
+    "ExternalPriorTuple",
+    "build_external_priors_override",
+    "is_physio_stream",
 ]

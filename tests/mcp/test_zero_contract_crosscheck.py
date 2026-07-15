@@ -76,6 +76,34 @@ print(json.dumps({"skip": False, "results": results}))
 # 带 coping 的扩展采样脚本
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M5 跨仓 schema 版本断言脚本
+# ---------------------------------------------------------------------------
+
+_SCHEMA_VERSION_SCRIPT = """
+import sys
+import json
+
+sys.path.insert(0, sys.argv[1])  # D:\\Zero（包根）
+
+try:
+    from src.orchestration.external_prior import EXTERNAL_PRIOR_SCHEMA_VERSION, ExternalPrior
+except ImportError as e:
+    reason = f"import src.orchestration.external_prior 失败: {e}"
+    print(json.dumps({"skip": True, "reason": reason}))
+    sys.exit(0)
+
+import typing
+# 取类型别名的字符串表示，用于验证逐维 tuple 精度契约
+type_str = str(ExternalPrior)
+
+print(json.dumps({
+    "skip": False,
+    "schema_version": EXTERNAL_PRIOR_SCHEMA_VERSION,
+    "external_prior_type_str": type_str,
+}))
+"""
+
 _DECODE_COPING_SCRIPT = """
 import sys
 import json
@@ -265,6 +293,76 @@ class TestZeroContractCrosscheck:
                 parse_errors.append(f"(v={item['v']}, a={item['a']}): {exc}")
 
         assert not parse_errors, "\n".join(parse_errors)
+
+
+# ---------------------------------------------------------------------------
+# M5 跨仓 schema 版本断言
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.zerorepo
+class TestExternalPriorSchemaVersion:
+    """M5 跨仓协议版本一致性断言——本仓 EXTERNAL_PRIOR_SCHEMA_VERSION 与 D:\\Zero 对齐。
+
+    所有用例：D:\\Zero 不可用 → skip。
+    """
+
+    def _skip_if_zero_unavailable(self) -> None:
+        """检查 D:\\Zero 是否在位，不在位则 skip。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过 M5 跨仓版本断言")
+
+    def test_schema_version_matches_zero(self) -> None:
+        """本仓 EXTERNAL_PRIOR_SCHEMA_VERSION 与 Zero 侧同名常量相等（M5 一致性）。"""
+        self._skip_if_zero_unavailable()
+
+        try:
+            data = _run_subprocess_with_script(_SCHEMA_VERSION_SCRIPT)
+        except subprocess.TimeoutExpired:
+            pytest.skip("子进程超时，跳过 M5 版本断言")
+        except RuntimeError as exc:
+            pytest.skip(f"子进程非零退出，跳过: {exc}")
+        except json.JSONDecodeError as exc:
+            pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
+
+        if data.get("skip"):
+            pytest.skip(data.get("reason", "D:\\Zero import 失败，跳过 M5 版本断言"))
+
+        from src.mcp.zero.external_priors import EXTERNAL_PRIOR_SCHEMA_VERSION
+
+        zero_version: int = data["schema_version"]
+        assert zero_version == EXTERNAL_PRIOR_SCHEMA_VERSION, (
+            f"M5 版本不一致：Zero 侧 EXTERNAL_PRIOR_SCHEMA_VERSION={zero_version}，"
+            f"本仓 EXTERNAL_PRIOR_SCHEMA_VERSION={EXTERNAL_PRIOR_SCHEMA_VERSION}。"
+            "两仓须协调同步修改。"
+        )
+
+    def test_external_prior_type_is_tuple_of_tuples(self) -> None:
+        """Zero ExternalPrior 类型字符串符合逐维 tuple 精度契约（M1 形状未漂移）。
+
+        期望形状：tuple[str, tuple[float, float], tuple[float, float]]
+        （name, (μv, μa), (Πv, Πa)）。
+        """
+        self._skip_if_zero_unavailable()
+
+        try:
+            data = _run_subprocess_with_script(_SCHEMA_VERSION_SCRIPT)
+        except subprocess.TimeoutExpired:
+            pytest.skip("子进程超时，跳过 M1 形状断言")
+        except RuntimeError as exc:
+            pytest.skip(f"子进程非零退出，跳过: {exc}")
+        except json.JSONDecodeError as exc:
+            pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
+
+        if data.get("skip"):
+            pytest.skip(data.get("reason", "D:\\Zero import 失败，跳过 M1 形状断言"))
+
+        type_str: str = data["external_prior_type_str"]
+        expected = "tuple[str, tuple[float, float], tuple[float, float]]"
+        assert type_str == expected, (
+            f"Zero ExternalPrior 类型字符串漂移：期望 {expected!r}，实际 {type_str!r}。"
+            "逐维 tuple 精度契约（M1）在 Zero 侧已变更，须两仓协调对齐。"
+        )
 
 
 # ---------------------------------------------------------------------------
