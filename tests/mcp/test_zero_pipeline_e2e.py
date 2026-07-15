@@ -26,6 +26,9 @@ import pytest
 from src.agents.models.zero_affect import ExpressionBundle, ModalityPrior
 from src.mcp.zero.channels import CallablePerceptionChannel
 from src.mcp.zero.expression_sink import ExpressionRouter, HeadPolicy
+from src.mcp.zero.mappers.facs import (
+    ArkitFacsMapper,  # noqa: F401 – used in TestDualProsodyFacsPipeline
+)
 from src.mcp.zero.mappers.prosody import LinearProsodyMapper, ProsodyParams
 from src.mcp.zero.perception import PerceptionHub
 from src.mcp.zero.sinks import RenderFrame, RenderingExpressionSink
@@ -448,3 +451,93 @@ class TestFullContractLoop:
         assert len(streams) == 1
         assert len(sink.frames) == 2
         assert isinstance(bundle, ExpressionBundle)
+
+
+# ---------------------------------------------------------------------------
+# 5. 双映射端到端：prosody + facs 同时驱动
+# ---------------------------------------------------------------------------
+
+
+class TestDualProsodyFacsPipeline:
+    """端到端：expression → prosody + facs 双映射 → RenderFrame 同时含两字段。"""
+
+    async def test_dual_mapper_frame_has_prosody_and_facs_mapped(self) -> None:
+        """RenderingExpressionSink(prosody_mapper=..., facs_mapper=...) + DUAL
+        → 每帧同时有 prosody(ProsodyParams) 与 facs_mapped(ARKit dict)。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        router = ExpressionRouter([sink], policy=HeadPolicy.DUAL)
+
+        await router.route(_make_step_out())
+
+        assert len(sink.frames) == 2
+        for frame in sink.frames:
+            assert isinstance(frame.prosody, ProsodyParams), (
+                f"frame.prosody 应为 ProsodyParams，实际 {type(frame.prosody)}"
+            )
+            assert isinstance(frame.facs_mapped, dict), (
+                f"frame.facs_mapped 应为 dict，实际 {type(frame.facs_mapped)}"
+            )
+            assert len(frame.facs_mapped) > 0, "facs_mapped 不应为空 dict（AU12/AU06 均应被驱动）"
+
+    async def test_dual_mapper_facs_mapped_contains_smile_and_cheek(self) -> None:
+        """默认 facs_au（AU12/AU06/intensity）→ facs_mapped 含 mouthSmile* 与 cheekSquint*。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        router = ExpressionRouter([sink], policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        await router.route(_make_step_out())
+
+        facs_mapped = sink.frames[0].facs_mapped
+        assert facs_mapped is not None
+        assert "mouthSmileLeft" in facs_mapped
+        assert "mouthSmileRight" in facs_mapped
+        assert "cheekSquintLeft" in facs_mapped
+        assert "cheekSquintRight" in facs_mapped
+
+    async def test_dual_mapper_prosody_rate_ratio_correct(self) -> None:
+        """双映射时 prosody.rate_ratio 仍等于 speech_rate（ratio 量纲，无干扰）。"""
+        voluntary_rate = 1.2
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        router = ExpressionRouter([sink], policy=HeadPolicy.DUAL)
+
+        await router.route(_make_step_out(voluntary_speech_rate=voluntary_rate))
+
+        main_prosody = sink.frames[0].prosody
+        assert main_prosody is not None
+        assert main_prosody.rate_ratio == pytest.approx(voluntary_rate)
+
+    async def test_dual_mapper_facs_au_passthrough_unaffected(self) -> None:
+        """双映射时 facs_au 原样透传字段不受 facs_mapped 影响。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        router = ExpressionRouter([sink], policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        step_out = _make_step_out()
+        bundle = await router.route(step_out)
+
+        expected_facs_au = dict(bundle.voluntary.facs_au)
+        assert sink.frames[0].facs_au == expected_facs_au
+
+    async def test_dual_mapper_no_exception_full_pipeline(self) -> None:
+        """prosody + facs 双映射完整链路无异常，返回有效 ExpressionBundle。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        router = ExpressionRouter([sink], policy=HeadPolicy.DUAL)
+
+        bundle = await router.route(_make_step_out(valence=0.6, arousal=0.4))
+
+        assert isinstance(bundle, ExpressionBundle)
+        for frame in sink.frames:
+            assert isinstance(frame, RenderFrame)

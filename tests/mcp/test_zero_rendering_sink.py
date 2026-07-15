@@ -11,6 +11,10 @@
   8. text_label 透传。
   9. 多次 render 累积 frames。
   10. RenderFrame extra=forbid（非法字段抛 ValidationError）。
+  11. 带 facs_mapper=ArkitFacsMapper() 时 RenderFrame.facs_mapped 为 dict 且等于直接 map(head)。
+  12. 无 facs_mapper 时 facs_mapped is None（零回归——既有测试不改语义）。
+  13. facs_au 原样透传字段与 facs_mapped 并存（两字段共存不冲突）。
+  14. facs_mapper=None 为默认值（零回归保证）。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from pydantic import ValidationError
 
 from src.agents.models.zero_affect import ExpressionBundle, ExpressionHead
 from src.mcp.zero.expression_sink import ExpressionSink, HeadPolicy
+from src.mcp.zero.mappers.facs import ArkitFacsMapper
 from src.mcp.zero.mappers.prosody import LinearProsodyMapper, ProsodyParams
 from src.mcp.zero.sinks import RenderFrame, RenderingExpressionSink
 
@@ -463,3 +468,139 @@ class TestTopLevelExport:
         from src.mcp.zero import RenderingExpressionSink as RES  # noqa: PLC0415
 
         assert RES is RenderingExpressionSink
+
+
+# ---------------------------------------------------------------------------
+# 8. FacsMapper 接入：facs_mapped 字段
+# ---------------------------------------------------------------------------
+
+
+class TestRenderFacsMapper:
+    """facs_mapper 接入：facs_mapped 字段行为验证（零回归 + 新增）。"""
+
+    def test_facs_mapper_none_by_default(self) -> None:
+        """默认 facs_mapper=None（零回归保证）。"""
+        sink = RenderingExpressionSink()
+        assert sink.facs_mapper is None
+
+    async def test_no_facs_mapper_facs_mapped_is_none(self) -> None:
+        """无 facs_mapper：frame.facs_mapped is None（零回归——既有行为不变）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].facs_mapped is None
+
+    async def test_with_arkit_facs_mapper_facs_mapped_is_dict(self) -> None:
+        """带 facs_mapper=ArkitFacsMapper()：frame.facs_mapped 为 dict 实例。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert isinstance(sink.frames[0].facs_mapped, dict)
+
+    async def test_facs_mapped_equals_direct_mapper_output(self) -> None:
+        """带 ArkitFacsMapper：frame.facs_mapped 等于直接调 mapper.map(head) 的返回值。"""
+        facs_mapper = ArkitFacsMapper()
+        sink = RenderingExpressionSink(facs_mapper=facs_mapper)
+        head = _make_expression_head(facs_au={"AU12": 0.8, "AU06": 0.6, "intensity": 0.7})
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected = await facs_mapper.map(head)
+        actual = sink.frames[0].facs_mapped
+        assert actual == expected
+
+    async def test_facs_au_and_facs_mapped_coexist(self) -> None:
+        """带 facs_mapper：facs_au 原样透传字段与 facs_mapped ARKit 输出并存不冲突。"""
+        facs = {"AU12": 0.8, "AU06": 0.6, "intensity": 0.7}
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        head = _make_expression_head(facs_au=facs)
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        # facs_au 原样透传
+        assert frame.facs_au == facs
+        # facs_mapped 为 ARKit 输出（非 None、非同一对象）
+        assert frame.facs_mapped is not None
+        assert isinstance(frame.facs_mapped, dict)
+        # 两字段键集不重叠（facs_au 含 AU* 键，facs_mapped 含 blendshape 名）
+        assert not (set(frame.facs_au.keys()) & set(frame.facs_mapped.keys()))
+
+    async def test_dual_both_frames_have_facs_mapped(self) -> None:
+        """DUAL + facs_mapper：两帧 facs_mapped 均非 None。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].facs_mapped is not None
+        assert sink.frames[1].facs_mapped is not None
+
+    async def test_dual_no_facs_mapper_both_frames_facs_mapped_none(self) -> None:
+        """DUAL 无 facs_mapper：两帧 facs_mapped 均为 None（零回归）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].facs_mapped is None
+        assert sink.frames[1].facs_mapped is None
+
+    async def test_facs_mapped_values_are_floats_in_unit_range(self) -> None:
+        """带 ArkitFacsMapper：facs_mapped 所有值在 [0.0, 1.0] 内（clamp 保证）。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        facs_mapped = sink.frames[0].facs_mapped
+        assert facs_mapped is not None
+        for bs_name, coeff in facs_mapped.items():
+            assert 0.0 <= coeff <= 1.0, f"blendshape {bs_name!r} 系数 {coeff} 超出 [0,1]"
+
+    async def test_prosody_and_facs_mapper_combined(self) -> None:
+        """同时带 prosody_mapper 和 facs_mapper：帧同时包含 prosody 和 facs_mapped。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        assert isinstance(frame.prosody, ProsodyParams)
+        assert isinstance(frame.facs_mapped, dict)
+        assert frame.facs_mapped is not None
+
+    async def test_render_frame_facs_mapped_default_none(self) -> None:
+        """直接构造 RenderFrame 时 facs_mapped 默认值为 None。"""
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.facs_mapped is None
+
+    async def test_render_frame_facs_mapped_explicit_dict(self) -> None:
+        """直接构造 RenderFrame 时可传入 facs_mapped dict。"""
+        mapped = {"mouthSmileLeft": 0.8, "mouthSmileRight": 0.8}
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            facs_mapped=mapped,
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.facs_mapped == mapped

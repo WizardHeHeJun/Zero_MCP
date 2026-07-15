@@ -50,14 +50,15 @@ class HeadPolicy(StrEnum):
 
 @runtime_checkable
 class FacsMapper(Protocol):
-    """将 ExpressionHead.facs_au → 具体引擎 blendshape 参数。
+    """将 ExpressionHead.facs_au（13 AU 子集）→ 引擎 blendshape 系数。
 
-    典型实现：AU → Live2D 参数名的 mapping + 值域线性映射。
-    本阶段只定接口，具体引擎接入为后续任务。
+    返回 `dict[str, float]`：引擎 blendshape/参数名 → 系数（值域 [0,1]，
+    只含被驱动的键，未驱动项由消费方默认静息 0）。
+    参考实现：`src.mcp.zero.mappers.facs.ArkitFacsMapper`（AU → ARKit 52 blendshape）。
     """
 
-    async def map(self, channel: ExpressionHead) -> Any:
-        """async：将 FACS 通道映射到引擎参数 dict。"""
+    async def map(self, channel: ExpressionHead) -> dict[str, float]:
+        """async：将 FACS 通道映射到引擎 blendshape 系数 dict[str, float]。"""
         ...
 
 
@@ -114,6 +115,9 @@ class ExpressionRouter:
     - route() 返回已解析的 ExpressionBundle 供调用方复用（如记录 metrics、
       传入后续编排节点），不需要调用方重新解析。
     - gather 结果引用被持有（赋值给局部变量 results），不丢弃 Promise。
+
+    ⚠ sink 生命周期由**调用方**管理：有状态 sink（如 RenderingExpressionSink 的
+    frames 只增不减）长期复用同一实例时须配合其 clear()，或每轮构造新实例，防无界增长。
     """
 
     def __init__(

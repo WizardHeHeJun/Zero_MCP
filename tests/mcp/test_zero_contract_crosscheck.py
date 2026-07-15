@@ -41,12 +41,12 @@ _DECODE_SCRIPT = """
 import sys
 import json
 
-sys.path.insert(0, sys.argv[1])  # D:\\Zero\\src
+sys.path.insert(0, sys.argv[1])  # D:\\Zero（包根；Zero 现用 src. 前缀绝对 import）
 
 try:
-    from agents.affect_math import decode_channels
+    from src.agents.affect_math import decode_channels
 except ImportError as e:
-    print(json.dumps({"skip": True, "reason": f"import agents.affect_math 失败: {e}"}))
+    print(json.dumps({"skip": True, "reason": f"import src.agents.affect_math 失败: {e}"}))
     sys.exit(0)
 
 # 采样若干 (v, a) 组合，覆盖四个象限
@@ -83,9 +83,9 @@ import json
 sys.path.insert(0, sys.argv[1])
 
 try:
-    from agents.affect_math import decode_channels
+    from src.agents.affect_math import decode_channels
 except ImportError as e:
-    print(json.dumps({"skip": True, "reason": f"import agents.affect_math 失败: {e}"}))
+    print(json.dumps({"skip": True, "reason": f"import src.agents.affect_math 失败: {e}"}))
     sys.exit(0)
 
 # 检查 decode_channels 是否接受 coping / facs_extended 参数
@@ -275,7 +275,7 @@ class TestZeroContractCrosscheck:
 def _run_subprocess_with_script(script: str) -> dict[str, Any]:
     """在子进程中运行给定 script，返回 stdout 解析的 JSON dict。"""
     result = subprocess.run(
-        [sys.executable, "-c", script, str(_ZERO_SRC)],
+        [sys.executable, "-c", script, str(_ZERO_ROOT)],
         capture_output=True,
         text=True,
         timeout=30,

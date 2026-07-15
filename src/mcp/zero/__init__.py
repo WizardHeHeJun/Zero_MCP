@@ -6,6 +6,7 @@
 - 表达消费通路（ExpressionRouter / ExpressionSink / HeadPolicy）
 - 渲染终端（RenderFrame / RenderingExpressionSink）
 - 韵律映射器（ProsodyParams / LinearProsodyMapper）
+- FACS 映射器（AU_TO_ARKIT / ArkitFacsMapper）
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 """
@@ -40,8 +41,10 @@ from src.mcp.zero.expression_sink import (
     ProsodyMapper,
 )
 
-# -- 韵律映射器 ---------------------------------------------------------------
+# -- FACS 映射器 --------------------------------------------------------------
 from src.mcp.zero.mappers import (
+    AU_TO_ARKIT,
+    ArkitFacsMapper,
     LinearProsodyMapper,
     ProsodyParams,
 )
@@ -72,11 +75,9 @@ __all__ = [
     "ExpressionBundle",
     "ExpressionHead",
     "LanguageOutput",
-    "LinearProsodyMapper",
     "ModalityPrior",
     "PhysiologyChannel",
     "ProsodyChannel",
-    "ProsodyParams",
     # 感知输入通路
     "CallablePerceptionChannel",
     "PerceptionChannel",
@@ -88,6 +89,12 @@ __all__ = [
     "HeadPolicy",
     "PhysiologyMapper",
     "ProsodyMapper",
+    # FACS 映射器
+    "AU_TO_ARKIT",
+    "ArkitFacsMapper",
+    # 韵律映射器
+    "LinearProsodyMapper",
+    "ProsodyParams",
     # 渲染终端
     "RenderFrame",
     "RenderingExpressionSink",
