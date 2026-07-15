@@ -4,6 +4,7 @@
 - 契约数据模型（来自 src/agents/models/zero_affect）
 - 感知输入通路（PerceptionHub / PerceptionChannel）
 - 表达消费通路（ExpressionRouter / ExpressionSink / HeadPolicy）
+- 韵律映射器（ProsodyParams / LinearProsodyMapper）
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 """
@@ -35,6 +36,12 @@ from src.mcp.zero.expression_sink import (
     ProsodyMapper,
 )
 
+# -- 韵律映射器 ---------------------------------------------------------------
+from src.mcp.zero.mappers import (
+    LinearProsodyMapper,
+    ProsodyParams,
+)
+
 # -- 感知输入通路 -------------------------------------------------------------
 from src.mcp.zero.perception import (
     PerceptionChannel,
@@ -60,9 +67,11 @@ __all__ = [
     "ExpressionBundle",
     "ExpressionHead",
     "LanguageOutput",
+    "LinearProsodyMapper",
     "ModalityPrior",
     "PhysiologyChannel",
     "ProsodyChannel",
+    "ProsodyParams",
     # 感知输入通路
     "PerceptionChannel",
     "PerceptionHub",
