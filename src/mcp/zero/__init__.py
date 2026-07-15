@@ -2,8 +2,9 @@
 
 本包聚合：
 - 契约数据模型（来自 src/agents/models/zero_affect）
-- 感知输入通路（PerceptionHub / PerceptionChannel）
+- 感知输入通路（PerceptionHub / PerceptionChannel / CallablePerceptionChannel）
 - 表达消费通路（ExpressionRouter / ExpressionSink / HeadPolicy）
+- 渲染终端（RenderFrame / RenderingExpressionSink）
 - 韵律映射器（ProsodyParams / LinearProsodyMapper）
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
@@ -26,6 +27,9 @@ from src.agents.models.zero_affect import (
     ProsodyChannel,
 )
 
+# -- 感知输入通路 -------------------------------------------------------------
+from src.mcp.zero.channels import CallablePerceptionChannel
+
 # -- 表达消费通路 -------------------------------------------------------------
 from src.mcp.zero.expression_sink import (
     ExpressionRouter,
@@ -41,8 +45,6 @@ from src.mcp.zero.mappers import (
     LinearProsodyMapper,
     ProsodyParams,
 )
-
-# -- 感知输入通路 -------------------------------------------------------------
 from src.mcp.zero.perception import (
     PerceptionChannel,
     PerceptionHub,
@@ -55,6 +57,9 @@ from src.mcp.zero.protocols import (
     ZeroCopingChannelDecoder,
     ZeroLanguageModel,
 )
+
+# -- 渲染终端 -----------------------------------------------------------------
+from src.mcp.zero.sinks import RenderFrame, RenderingExpressionSink
 
 __all__ = [
     # 常量
@@ -73,6 +78,7 @@ __all__ = [
     "ProsodyChannel",
     "ProsodyParams",
     # 感知输入通路
+    "CallablePerceptionChannel",
     "PerceptionChannel",
     "PerceptionHub",
     # 表达消费通路
@@ -82,6 +88,9 @@ __all__ = [
     "HeadPolicy",
     "PhysiologyMapper",
     "ProsodyMapper",
+    # 渲染终端
+    "RenderFrame",
+    "RenderingExpressionSink",
     # Zero 协议镜像
     "ZeroChannelDecoder",
     "ZeroCopingChannelDecoder",
