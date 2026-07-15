@@ -11,6 +11,7 @@
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 - external_priors 接线（Q3，EXTERNAL_PRIOR_SCHEMA_VERSION / build_external_priors_override）
+- Zero MCP Client（Task 1-4，ZeroLinkClient + 三个自定义异常）
 """
 
 from __future__ import annotations
@@ -32,6 +33,14 @@ from src.agents.models.zero_affect import (
 
 # -- 感知输入通路 -------------------------------------------------------------
 from src.mcp.zero.channels import CallablePerceptionChannel
+
+# -- Zero MCP Client（Task 1-4）-----------------------------------------------
+from src.mcp.zero.client import (
+    ZeroLinkCallError,
+    ZeroLinkClient,
+    ZeroLinkConnectionError,
+    ZeroLinkDisabledError,
+)
 
 # -- 表达消费通路 -------------------------------------------------------------
 from src.mcp.zero.expression_sink import (
@@ -137,4 +146,9 @@ __all__ = [
     "build_recommended_prior",
     "is_physio_stream",
     "recommended_precision",
+    # Zero MCP Client（Task 1-4）
+    "ZeroLinkClient",
+    "ZeroLinkDisabledError",
+    "ZeroLinkConnectionError",
+    "ZeroLinkCallError",
 ]
