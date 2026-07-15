@@ -45,10 +45,16 @@ from src.mcp.zero.expression_sink import (
 # -- external_priors 接线（Q3）------------------------------------------------
 from src.mcp.zero.external_priors import (
     EXTERNAL_PRIOR_SCHEMA_VERSION,
+    MIN_PRECISION,
     PHYSIO_STREAM_PREFIXES,
+    ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT,
+    ZERO_MAX_EXTERNAL_STREAMS_DEFAULT,
     ExternalPriorTuple,
+    ModalityKind,
     build_external_priors_override,
+    build_recommended_prior,
     is_physio_stream,
+    recommended_precision,
 )
 
 # -- FACS 映射器 --------------------------------------------------------------
@@ -115,8 +121,14 @@ __all__ = [
     "ZeroLanguageModel",
     # external_priors 接线（Q3）
     "EXTERNAL_PRIOR_SCHEMA_VERSION",
+    "MIN_PRECISION",
     "PHYSIO_STREAM_PREFIXES",
+    "ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT",
+    "ZERO_MAX_EXTERNAL_STREAMS_DEFAULT",
     "ExternalPriorTuple",
+    "ModalityKind",
     "build_external_priors_override",
+    "build_recommended_prior",
     "is_physio_stream",
+    "recommended_precision",
 ]

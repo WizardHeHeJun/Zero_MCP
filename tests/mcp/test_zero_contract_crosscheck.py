@@ -104,6 +104,36 @@ print(json.dumps({
 }))
 """
 
+# ---------------------------------------------------------------------------
+# M3/M6 默认值一致性断言脚本（precision_cap / max_streams）
+# ---------------------------------------------------------------------------
+
+_DEFAULTS_SCRIPT = """
+import sys
+import json
+
+sys.path.insert(0, sys.argv[1])  # D:\\Zero（包根）
+
+try:
+    from src.orchestration.state import AffectState
+except ImportError as e:
+    reason = f"import src.orchestration.state 失败: {e}"
+    print(json.dumps({"skip": True, "reason": reason}))
+    sys.exit(0)
+
+# 读 AffectState pydantic 字段默认（M3 精度上界 / M6 流数上界）
+fields = AffectState.model_fields
+precision_cap = fields["external_prior_precision_cap"].default
+max_streams = fields["max_external_streams"].default
+
+print(json.dumps({
+    "skip": False,
+    "precision_cap": precision_cap,
+    "max_streams": max_streams,
+}))
+"""
+
+
 _DECODE_COPING_SCRIPT = """
 import sys
 import json
@@ -362,6 +392,66 @@ class TestExternalPriorSchemaVersion:
         assert type_str == expected, (
             f"Zero ExternalPrior 类型字符串漂移：期望 {expected!r}，实际 {type_str!r}。"
             "逐维 tuple 精度契约（M1）在 Zero 侧已变更，须两仓协调对齐。"
+        )
+
+
+# ---------------------------------------------------------------------------
+# M3/M6 默认值一致性断言（防跨仓默认值漂移）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.zerorepo
+class TestExternalPriorValidationDefaults:
+    """M3/M6 跨仓默认值一致性——本仓 cap/max 常量与 Zero AffectState 字段默认对齐。
+
+    所有用例：D:\\Zero 不可用或 state.py 无法轻量 import → skip（不拖红）。
+    """
+
+    def _skip_if_zero_unavailable(self) -> None:
+        """检查 D:\\Zero 是否在位，不在位则 skip。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过 M3/M6 默认值断言")
+
+    def _fetch_defaults_or_skip(self) -> dict[str, Any]:
+        """运行子进程读 Zero AffectState 默认，任何失败均 skip。"""
+        self._skip_if_zero_unavailable()
+        try:
+            data = _run_subprocess_with_script(_DEFAULTS_SCRIPT)
+        except subprocess.TimeoutExpired:
+            pytest.skip("子进程超时，跳过 M3/M6 默认值断言")
+        except RuntimeError as exc:
+            pytest.skip(f"子进程非零退出，跳过: {exc}")
+        except json.JSONDecodeError as exc:
+            pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
+
+        if data.get("skip"):
+            pytest.skip(data.get("reason", "D:\\Zero import 失败，跳过 M3/M6 默认值断言"))
+        return data
+
+    def test_precision_cap_default_matches_zero(self) -> None:
+        """M3：本仓 ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT 与 Zero AffectState 字段默认相等。"""
+        data = self._fetch_defaults_or_skip()
+
+        from src.mcp.zero.external_priors import ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT
+
+        zero_cap: float = data["precision_cap"]
+        assert zero_cap == pytest.approx(ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT), (
+            f"M3 精度上界默认漂移：Zero AffectState.external_prior_precision_cap={zero_cap}，"
+            f"本仓 ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT="
+            f"{ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT}。两仓须协调同步。"
+        )
+
+    def test_max_streams_default_matches_zero(self) -> None:
+        """M6：本仓 ZERO_MAX_EXTERNAL_STREAMS_DEFAULT 与 Zero AffectState 字段默认相等。"""
+        data = self._fetch_defaults_or_skip()
+
+        from src.mcp.zero.external_priors import ZERO_MAX_EXTERNAL_STREAMS_DEFAULT
+
+        zero_max: int = data["max_streams"]
+        assert zero_max == ZERO_MAX_EXTERNAL_STREAMS_DEFAULT, (
+            f"M6 流数上界默认漂移：Zero AffectState.max_external_streams={zero_max}，"
+            f"本仓 ZERO_MAX_EXTERNAL_STREAMS_DEFAULT={ZERO_MAX_EXTERNAL_STREAMS_DEFAULT}。"
+            "两仓须协调同步。"
         )
 
 

@@ -101,15 +101,16 @@ class PerceptionHub:
         每条先验调用 ModalityPrior.as_stream() → (name, (μ_v,μ_a), (Π_v,Π_a))，
         对齐 Zero 内部 streams 形状（D:\\Zero\\src\\affect_core.py:77-95）。
 
-        **Q3 已定（Zero 回传 2026-07-14）**：正式多流注入口 = Zero 将新增的专用字段
-        ``external_priors: list[(name, (μ_v,μ_a), precision: float)]``（**需 Zero 走
-        PRP + 科学家议会门后落地**；默认空 = 零回归），AffectCore 把每条 append 进 streams。
-        届时本方法产物接进该字段。⚠ external_priors 的 precision 是**标量 float**
-        （AffectCore 广播为 (p,p)），本方法当前返回 tuple 精度——待 external_priors
-        落地时按最终签名收敛精度形状。
+        **Q3 已交付（Zero 2026-07-15，commit 143ac72）**：正式多流注入口 = Zero 专用字段
+        ``external_priors: list[(name, (μ_v,μ_a), (Π_v,Π_a))]``（默认空 = 零回归），
+        AffectCore 展开后把每条 append 进 streams 竞争融合。⚠ **M1 议会裁决：精度为
+        逐维 tuple (Π_v,Π_a)，非标量 float**（三席强收敛：面部 valence 强/语音 arousal
+        强/生理 valence 盲，逐维信噪比不对称）——本方法返回的 tuple 精度即最终契约形状，
+        无需收敛。产物经 external_priors.build_external_priors_override() 构造为
+        session.step(state_overrides=...) 载荷（M3/M6 客户端 fail-fast，阈值对齐 Zero）。
 
         ⛔ Zero 明确否决了借 ``text_affect``（PerceptionAgent 每轮覆写）或
-        ``interlocutor_affect``（ToM 共情偏置）挪用作过渡——故本模块**不提供**
-        state_overrides 过渡路径；external_priors 落地前不发多模态注入路径。
+        ``interlocutor_affect``（ToM 共情偏置）挪用作过渡——external_priors 是唯一正式口，
+        本方法产物经 build_external_priors_override 接入，不走任何 state_overrides 过渡路径。
         """
         return [p.as_stream() for p in priors]
