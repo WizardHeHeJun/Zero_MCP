@@ -32,7 +32,13 @@ from src.agents.models.zero_affect import (
 )
 
 # -- 感知输入通路 -------------------------------------------------------------
-from src.mcp.zero.channels import CallablePerceptionChannel
+from src.mcp.zero.channels import (
+    AudioChannel,
+    CallablePerceptionChannel,
+    EdaChannel,
+    HrvChannel,
+    VisionChannel,
+)
 
 # -- Zero MCP Client（Task 1-4）-----------------------------------------------
 from src.mcp.zero.client import (
@@ -108,6 +114,10 @@ __all__ = [
     "ProsodyChannel",
     # 感知输入通路
     "CallablePerceptionChannel",
+    "EdaChannel",
+    "HrvChannel",
+    "AudioChannel",
+    "VisionChannel",
     "PerceptionChannel",
     "PerceptionHub",
     # 表达消费通路

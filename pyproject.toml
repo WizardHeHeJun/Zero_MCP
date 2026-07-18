@@ -46,6 +46,11 @@ gpu-cuda = [
 gpu-dml = [
     "onnxruntime-directml>=1.18",
 ]
+physio = [
+    "neurokit2>=0.2",
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
 omniparser = [
     "torch>=2.0",  # OmniParser 推理依赖；模型走 .env OMNIPARSER_MODEL_DIR 本地目录
 ]
@@ -75,6 +80,7 @@ module = [
     "PIL.Image",
     "pyautogui",
     "pyperclip",
+    "neurokit2",
 ]
 ignore_missing_imports = true
 
