@@ -25,9 +25,10 @@ import sys
 import types
 from typing import Any
 
+import httpx
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 from mcp.types import TextContent
 from pydantic import ValidationError
@@ -210,11 +211,16 @@ class ZeroLinkClient:
                     stdio_client(transport_params)
                 )
             else:
-                # http 传输：streamablehttp_client yield (read, write, get_session_id)
+                # http 传输：streamable_http_client(url, *, http_client) yield 三元组。
+                # 新 API 不直接收 headers——Bearer token 经预置 httpx.AsyncClient 注入。
                 endpoint, token = transport_params
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                http_client: httpx.AsyncClient | None = None
+                if token:
+                    http_client = await stack.enter_async_context(
+                        httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
+                    )
                 read_stream, write_stream, _get_session_id = await stack.enter_async_context(
-                    streamablehttp_client(endpoint, headers=headers)
+                    streamable_http_client(endpoint, http_client=http_client)
                 )
 
             # 建立 ClientSession

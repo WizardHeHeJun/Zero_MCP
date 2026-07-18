@@ -17,7 +17,12 @@ open → step(裸) → step(带 external_priors 含 physio 流) → step(带 cop
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +38,34 @@ from src.mcp.zero.client import ZeroLinkCallError, ZeroLinkClient, ZeroLinkConne
 
 _ZERO_SERVER = Path("D:/Zero/src/mcp_server/server.py")
 _VALID_FACS = frozenset(FACS_KEYS_EXT)
+# 真 13-AU 权重（Zero artifacts；缺失/无 torch → 真权重用例 skip，占位路径不受影响）
+_FACS_WEIGHT_V2 = Path("D:/Zero/artifacts/facs_decoder_ext_v2.pt")
+_TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+_UVICORN_AVAILABLE = importlib.util.find_spec("uvicorn") is not None
+
+# HTTP（streamable-http）联调 endpoint（对齐 Zero 回执 §一默认；server 子进程由测试起/拆）
+_HTTP_HOST = "127.0.0.1"
+_HTTP_PORT = 8000
+_HTTP_PATH = "/mcp"
+_HTTP_ENDPOINT = f"http://{_HTTP_HOST}:{_HTTP_PORT}{_HTTP_PATH}"
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    """检测端口空闲（避免撞到其它进程占用的 8000 导致误连/flaky）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex((host, port)) != 0
+
+
+def _wait_port(host: str, port: int, *, timeout: float = 40.0) -> bool:
+    """轮询端口就绪（server 起来后接受连接）；超时返回 False。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            if s.connect_ex((host, port)) == 0:
+                return True
+        time.sleep(0.5)
+    return False
 
 
 def _set_stdio_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,3 +159,121 @@ class TestZeroClientE2E:
                 await client.step(sid, AffectStimulus(valence=0.0, arousal=0.0))
         finally:
             await client.__aexit__(None, None, None)
+
+    async def test_real_facs_weights_13_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """设 ZERO_FACS_MODEL_PATH → server 出**全 13 键 facs_au**（值∈[0,1]、python float）。
+
+        对抗核验 Zero 的量纲更正（`2026-07-16-zero-followup-http-and-realweights.md` §三）：
+        设 FACS 权重**不翻** prosody_scale——仍为 "ratio"（FACS 模型不覆盖 prosody，
+        normalized 只在另接真 prosody 模型时出现）。torch/权重缺失即 skip。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        if not _TORCH_AVAILABLE:
+            pytest.skip("torch 未安装，跳过真 13-AU 权重路径")
+        if not _FACS_WEIGHT_V2.is_file():
+            pytest.skip(f"真 13-AU 权重缺失（{_FACS_WEIGHT_V2}）")
+        _set_stdio_env(monkeypatch)
+        monkeypatch.setenv("ZERO_FACS_MODEL_PATH", str(_FACS_WEIGHT_V2))
+        monkeypatch.setenv("ZERO_FACS_EXTENDED", "true")
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server（真权重路径 import torch/加载失败？）：{exc}")
+        try:
+            sid = await client.open_session()
+            bundle = await client.step(sid, AffectStimulus(valence=0.6, arousal=0.4))
+            for head_name in ("spontaneous", "voluntary"):
+                head = getattr(bundle, head_name)
+                assert set(head.facs_au) == _VALID_FACS, (
+                    f"{head_name}: 真权重应出全 13 键，实际 {sorted(head.facs_au)}"
+                )
+                for key, val in head.facs_au.items():
+                    assert isinstance(val, float), (
+                        f"{head_name}.facs_au[{key}] 非 float: {type(val)}"
+                    )
+                    assert 0.0 <= val <= 1.0, f"{head_name}.facs_au[{key}]={val} 超出 [0,1]"
+            # 对抗核验 Zero 更正：FACS 权重不翻 prosody_scale（仍 ratio）
+            assert bundle.prosody_scale == "ratio", (
+                f"设 FACS 权重后 prosody_scale 应仍 'ratio'（Zero 更正：normalized 只在接真 "
+                f"prosody 模型时出现），实际 {bundle.prosody_scale!r}"
+            )
+            await client.close_session(sid)
+        finally:
+            await client.__aexit__(None, None, None)
+
+    async def test_http_transport_full_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """HTTP（streamable-http）传输端到端：测试起 Zero 真 http server（uvicorn 子进程），
+        client 的 http 分支连 endpoint 跑全契约，验证与 stdio 逐字一致。
+
+        对齐 Zero 回执 `2026-07-16-zero-followup-http-and-realweights.md` §一
+        （`ZERO_MCP_TRANSPORT=http` + host/port/path）。server 缺失/uvicorn 缺失/端口占用/
+        起不来 → skip（不拖红）。⚠ 本轮 HTTP 无鉴权，仅 127.0.0.1 本机联调。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        if not _UVICORN_AVAILABLE:
+            pytest.skip("uvicorn 未安装，跳过 HTTP 传输端到端")
+        if not _port_is_free(_HTTP_HOST, _HTTP_PORT):
+            pytest.skip(f"端口 {_HTTP_PORT} 被占用，跳过（避免误连/flaky）")
+
+        # 起 Zero http server 子进程（env：ZERO_MCP_TRANSPORT=http + host/port/path）
+        server_env = dict(os.environ)
+        server_env.update(
+            {
+                "ZERO_MCP_TRANSPORT": "http",
+                "ZERO_MCP_HTTP_HOST": _HTTP_HOST,
+                "ZERO_MCP_HTTP_PORT": str(_HTTP_PORT),
+                "ZERO_MCP_HTTP_PATH": _HTTP_PATH,
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "src.mcp_server"],
+            cwd=r"D:\Zero",
+            env=server_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            if not _wait_port(_HTTP_HOST, _HTTP_PORT, timeout=40.0):
+                pytest.skip(f"Zero http server 端口 {_HTTP_PORT} 未在 40s 内就绪，跳过")
+
+            # client http 分支
+            monkeypatch.setenv("ZERO_LINK_ENABLED", "true")
+            monkeypatch.setenv("ZERO_LINK_TRANSPORT", "http")
+            monkeypatch.setenv("ZERO_HTTP_ENDPOINT", _HTTP_ENDPOINT)
+            monkeypatch.delenv("ZERO_HTTP_TOKEN", raising=False)  # 本轮 server 无鉴权
+
+            client = ZeroLinkClient()
+            try:
+                await client.__aenter__()
+            except ZeroLinkConnectionError as exc:
+                pytest.skip(f"http client 连不上 {_HTTP_ENDPOINT}：{exc}")
+            try:
+                # 全契约（与 stdio 用例同结构，验证契约逐字一致）
+                sid = await client.open_session(persona="http-e2e")
+                assert isinstance(sid, str) and sid
+                bundle = await client.step(sid, AffectStimulus(valence=0.6, arousal=0.4))
+                assert isinstance(bundle, ExpressionBundle)
+                _assert_valid_head(bundle.voluntary, "http.step裸.voluntary")
+                assert bundle.prosody_scale in ("ratio", "normalized", None)
+                # coping 路径
+                b2 = await client.step(
+                    sid, AffectStimulus(valence=-0.5, arousal=0.7, coping_potential=0.8)
+                )
+                _assert_valid_head(b2.voluntary, "http.step_coping.voluntary")
+                # 未知 session → ZeroLinkCallError（HTTP 错误路径）
+                with pytest.raises(ZeroLinkCallError):
+                    await client.step("bogus-http-sid", AffectStimulus(valence=0.0, arousal=0.0))
+                await client.close_session(sid)
+            finally:
+                await client.__aexit__(None, None, None)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
