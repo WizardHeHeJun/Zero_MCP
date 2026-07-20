@@ -3,9 +3,9 @@
 导出：
 - CallablePerceptionChannel：将任意 async callable 包装为满足 PerceptionChannel Protocol
   的感知通道，可直接交给 PerceptionHub。
-- EdaChannel / HrvChannel：生理感知通道（EDA/SC·HRV/RMSSD → ModalityPrior，真接入）。
-- AudioChannel：语音感知通道（stub，真接入挂 Wav2Small ONNX）。
-- VisionChannel：视觉面部感知通道（stub，真接入挂 EmotiEffLib）。
+- EdaChannel / HrvChannel：生理感知通道（EDA/SC·HRV/RMSSD → ModalityPrior，真接入 NeuroKit2）。
+- AudioChannel：语音感知通道（真接入 audeering w2v2 维度 SER，走 ZERO_AUDIO_MODEL_PATH）。
+- VisionChannel：视觉面部感知通道（真接入 EmotiEffLib ONNX 多任务 VA，走 ZERO_VISION_MODEL_NAME）。
 """
 
 from __future__ import annotations

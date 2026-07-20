@@ -51,6 +51,20 @@ physio = [
     "pandas>=2.0",
     "numpy>=1.24",
 ]
+# zero-link §5.1 语音感知通道（AudioChannel）：audeering w2v2 维度 SER（torch/transformers）。
+# 权重走 .env ZERO_AUDIO_MODEL_PATH；librosa 仅 I/O 适配层加载 wav 用，Channel 核心不需。
+perception-audio = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "numpy>=1.24",
+]
+# zero-link §5.1 视觉感知通道（VisionChannel）：EmotiEffLib ONNX 后端（零 timm，绕过 gap-1）。
+# 模型走 .env ZERO_VISION_MODEL_NAME/DIR；onnx+onnxruntime+opencv 由 emotiefflib 传递引入。
+perception-vision = [
+    "emotiefflib>=1.1",
+    "onnxruntime>=1.16",
+    "numpy>=1.24",
+]
 omniparser = [
     "torch>=2.0",  # OmniParser 推理依赖；模型走 .env OMNIPARSER_MODEL_DIR 本地目录
 ]
@@ -81,8 +95,18 @@ module = [
     "pyautogui",
     "pyperclip",
     "neurokit2",
+    "emotiefflib",
+    "emotiefflib.facial_analysis",
+    "librosa",
 ]
 ignore_missing_imports = true
+
+# transformers 5.x 自带 py.typed，但其内部大量 untyped 调用（__init_subclass__/post_init/
+# from_pretrained 装饰器）在 strict 下与自定义 EmotionModel 子类冲突。follow_imports=skip
+# 将其视作 Any（子类需 ignore[misc]），只豁免这个 ML 边界；torch 仍按 stubs 严格检查。
+[[tool.mypy.overrides]]
+module = ["transformers", "transformers.*"]
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
