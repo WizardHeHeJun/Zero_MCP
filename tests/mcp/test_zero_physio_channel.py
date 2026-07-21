@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import types
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -678,3 +680,77 @@ class TestEdaChannelPercentileNormalization:
         hub.reset_all()  # 不应因 hrv 无 reset 而崩
 
         assert len(eda._amplitude_history["highpass"]) == 0, "reset_all 应清空 EdaChannel 历史"
+
+
+# ---------------------------------------------------------------------------
+# W3：并发线程安全 —— _process 经 asyncio.to_thread 后同实例并发 sense() 不损坏历史
+# ---------------------------------------------------------------------------
+
+
+def _fake_standardize(x: Any) -> Any:
+    """纯函数 neurokit2.standardize 桩（无状态、无调用记录 → 线程安全）。"""
+    return np.asarray(x, dtype=float)
+
+
+def _fake_eda_phasic(x: Any, sampling_rate: int, method: str) -> pd.DataFrame:
+    """纯函数 neurokit2.eda_phasic 桩：EDA_Phasic 均值 = 输入 abs 均值（随信号变化）。
+
+    用输入自身派生幅度（无共享状态）：不同信号 → 不同幅度 → 暖机后走非退化 percentile
+    分支，同时对并发临界区施压。返回全新 DataFrame，无跨线程共享可变对象。
+    """
+    val = float(np.abs(np.asarray(x, dtype=float)).mean())
+    return pd.DataFrame({"EDA_Phasic": [val] * 10})
+
+
+# 纯函数桩：**刻意不用 MagicMock**——MagicMock 的调用记录（call_args_list 等）本身线程
+# 不安全，并发下会伪造/掩盖竞争，使本测试失去意义。SimpleNamespace + 纯函数则完全无状态。
+_THREAD_SAFE_FAKE_NK = types.SimpleNamespace(
+    standardize=_fake_standardize,
+    eda_phasic=_fake_eda_phasic,
+)
+
+
+class TestEdaChannelConcurrencySafety:
+    """W3：_process 经 asyncio.to_thread 到线程池后，同实例并发 sense() 的**不变式守卫**。
+
+    本测试是**并发正确性/回归守卫**，不是「锁必要性」判别测试——现场核验（scratch mech_probe，
+    CPython 3.12）表明 np.asarray(deque)/list(deque) 是 GIL 下 C 级原子拷贝，并发 append 既不
+    互撕也**不**触发「deque mutated during iteration」（该异常仅经显式 Python 迭代 iter(deque)
+    才有）；故当前解释器下**有锁/无锁本测试都全绿**（已 scratch 验证 None==0）。history_lock 是
+    「不赖此 GIL 偶发原子性」的显式保证（前瞻 no-GIL Python 与日后迭代式改写），不由本测试判别。
+
+    本测试实际守护的是：to_thread 化后同实例高并发 sense() 仍产出**合法结果、无崩溃/死锁、
+    deque maxlen 不变式不被写坏**——若日后 _process 引入观察得到的并发损坏（如临界区被拆开
+    且改成显式迭代），此守卫可捕获。压测：window=8 令 deque 常满、200 次并发 sense()。
+    """
+
+    async def test_concurrent_sense_same_instance_thread_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同实例并发 200 次 sense()：全部产合法先验、无 None/崩溃、历史长度受 maxlen 约束。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        window = 8
+        ch = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_cold_start=3,
+            percentile_window=window,
+        )
+        n_calls = 200
+        # 每次不同 seed → 幅度各异 → 暖机后走非退化 percentile 分支（同时压并发临界区）
+        signals: list[dict[str, Any]] = [
+            {"eda": np.random.default_rng(i).random(40), "sampling_rate": 4} for i in range(n_calls)
+        ]
+
+        with patch.dict("sys.modules", {"neurokit2": _THREAD_SAFE_FAKE_NK}):
+            results = await asyncio.gather(*[ch.sense(signal=s) for s in signals])
+
+        # 并发下每次都应产出合法先验（None 会暴露被吞的线程内异常/观察得到的并发损坏）
+        assert all(r is not None for r in results), (
+            "并发下出现 sense()==None：疑同实例并发对滚动历史的读改写产生了观察得到的损坏"
+        )
+        assert all(-1.0 <= r.mu[1] <= 1.0 for r in results if r is not None), "并发下产出 μa 越界"
+        # 200 次 append 后 deque 受 maxlen 约束，长度恒为 window（maxlen 不变式未被并发写坏）
+        assert len(ch._amplitude_history["highpass"]) == window, (
+            f"并发 append 后 highpass 桶长={len(ch._amplitude_history['highpass'])}，应 == {window}"
+        )

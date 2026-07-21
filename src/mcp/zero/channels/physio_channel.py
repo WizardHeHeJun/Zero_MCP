@@ -21,9 +21,11 @@ percentile 归一化选型依据（文献门）：
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import os
+import threading
 from typing import Any, Literal
 
 import numpy as np
@@ -93,6 +95,10 @@ class EdaChannel:
     cvxEDA 与 highpass 量级差 55× 不可混）。将当前幅度定位到被试自身近期 [p_low, p_high]
     区间，实现跨被试可比的自适应归一化（Lykken range correction 思想）。
 
+    **并发/异步**：SCR 提取（neurokit2，cvxEDA/ecg 计算重且非 GIL 释放型）在 ``sense()``
+    里经 ``asyncio.to_thread`` 调度到线程池，不阻塞事件循环（对齐 audio/vision）。滚动历史的
+    读改写由 ``history_lock`` 保护——同实例并发 ``collect()`` 时线程安全（append + 快照落临界区）。
+
     文献依据：
     - [Mõttus 2024 (DOI:10.5772/intechopen.1007760)] 跨被试 EDA 幅度差 10–100×，
       被试自身滚动分位归一化才跨被试可比。
@@ -133,6 +139,12 @@ class EdaChannel:
             "cvxEDA": collections.deque(maxlen=percentile_window),
             "highpass": collections.deque(maxlen=percentile_window),
         }
+        # 保护 _amplitude_history 的读改写：_process 现经 asyncio.to_thread 在线程池执行
+        # （对齐 audio/vision，不阻塞事件循环），同实例并发 collect 时多线程会并发读改同一
+        # deque（共享可变状态）——把 append + 快照收进临界区取一致视图（W3；详见 _process 内
+        # 注释的现场核验与自由线程前瞻）。与 audio/vision 的 threading.Lock 同族（那两处防并发
+        # 双载模型，此处防并发改历史）。
+        self.history_lock = threading.Lock()
 
     def reset(self) -> None:
         """清空滚动幅度历史（**被试切换时调用方必须调用**）。
@@ -142,8 +154,9 @@ class EdaChannel:
         **未调用将导致新被试沿用旧被试的历史分位区间（跨被试污染）**——有状态通道的固有契约，
         Protocol 无法在编译期强制（W2，见 pitfalls「有状态感知通道被试切换须 reset」）。
         """
-        for key in self._amplitude_history:
-            self._amplitude_history[key].clear()
+        with self.history_lock:
+            for key in self._amplitude_history:
+                self._amplitude_history[key].clear()
 
     async def sense(
         self,
@@ -179,8 +192,11 @@ class EdaChannel:
             logger.warning("EdaChannel 无可用信号（signal=None 且 signal_source=None），跳过")
             return None
 
+        # 阻塞处理走线程池，不堵事件循环（cvxEDA 是 cvxopt 线性规划、ecg_process 也重，
+        # 均非 GIL 释放型；对齐 audio/vision 的 asyncio.to_thread，W3）。异常在工作线程内抛出，
+        # 经 await 传回当前协程，仍由下方 except 兜底优雅回退。
         try:
-            return self._process(raw)
+            return await asyncio.to_thread(self._process, raw)
         except ImportError as exc:
             logger.warning("EdaChannel: neurokit2 不可用，本轮跳过: %s", exc)
             return None
@@ -231,18 +247,31 @@ class EdaChannel:
             mu_a = _linear_normalize(scr_amplitude, ref)
         else:
             # percentile 有状态在线自适应归一化
-            # 按 method 分桶——cvxEDA 与 highpass 量级差 55×，混桶会令分位区间跨度失控
+            # 按 method 分桶——cvxEDA 与 highpass 量级差 55×，混桶会令分位区间跨度失控。
+            # 线程安全（W3）：_process 现经 asyncio.to_thread 在线程池执行，同实例并发 collect
+            # 时多线程会并发读改同一 deque（共享可变状态）。history_lock 把 append + 快照收进
+            # 临界区，保证快照是一致视图；percentile 计算落锁外（快照已是独立 ndarray）。
+            # ⚠ 现场核验（scratch mech_probe，CPython 3.12）：np.asarray(deque)/list(deque) 是
+            # GIL 下 C 级原子拷贝，与并发 append 不互撕、也**不**触发「deque mutated during
+            # iteration」（该异常仅经显式 Python 迭代 iter(deque) 触发，本处不用）——即无锁在当前
+            # 解释器下也不崩。锁在此是**不赖此 GIL 偶发原子性**的显式保证：跨线程访问共享可变
+            # 状态不依赖未文档化的原子性，前瞻自由线程(no-GIL)Python 与「日后改成显式迭代」。
+            # 取桶引用可在锁外：_amplitude_history 的 dict 键在 __init__ 后固定、reset() 用
+            # .clear() 原地清（deque 身份不变），此处只读引用不写 dict；真正的 append + 快照落锁内。
             hist = self._amplitude_history[method]
-            hist.append(scr_amplitude)
+            with self.history_lock:
+                hist.append(scr_amplitude)
+                # deque→ndarray 一次转换（快照）：避免两次 list 分配 +「两次转换间 deque 不变」的
+                # 隐式假设（W4），并把对 deque 的一致性拷贝收进锁内。
+                snapshot = np.asarray(hist, dtype=float)
 
-            if len(hist) < self.percentile_cold_start:
+            if snapshot.size < self.percentile_cold_start:
                 # 冷启动：样本不足，回退 linear（暖机前行为等价于 linear，零回归过渡）
                 mu_a = _linear_normalize(scr_amplitude, ref)
             else:
                 q_low, q_high = self.percentile_range
-                # 一次 np.percentile 取双分位（deque→ndarray 一次转换，避免两次 list 分配 +
-                # 「两次转换间 deque 不变」的隐式假设，W4）
-                pcts = np.percentile(np.asarray(hist, dtype=float), [q_low, q_high])
+                # 一次 np.percentile 取双分位（用锁内取的独立快照，锁外计算）
+                pcts = np.percentile(snapshot, [q_low, q_high])
                 p_low, p_high = float(pcts[0]), float(pcts[1])
 
                 if p_high - p_low < _PERCENTILE_EPS:
@@ -327,8 +356,10 @@ class HrvChannel:
             logger.warning("HrvChannel 无可用信号（signal=None 且 signal_source=None），跳过")
             return None
 
+        # 阻塞处理走线程池，不堵事件循环（ecg_process + hrv_time 计算重；对齐 audio/vision 与
+        # EdaChannel，W3）。异常在工作线程内抛出，经 await 传回，仍由下方 except 兜底回退。
         try:
-            return self._process(raw)
+            return await asyncio.to_thread(self._process, raw)
         except ImportError as exc:
             logger.warning("HrvChannel: neurokit2 不可用，本轮跳过: %s", exc)
             return None
