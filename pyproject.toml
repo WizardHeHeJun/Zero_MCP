@@ -50,6 +50,7 @@ physio = [
     "neurokit2>=0.2",
     "pandas>=2.0",
     "numpy>=1.24",
+    "cvxopt>=1.3",  # cvxEDA 分解（rate>4Hz）；缺则 EdaChannel 自动降级 highpass（rate≤4Hz）
 ]
 # zero-link §5.1 语音感知通道（AudioChannel）：audeering w2v2 维度 SER（torch/transformers）。
 # 权重走 .env ZERO_AUDIO_MODEL_PATH；librosa 仅 I/O 适配层加载 wav 用，Channel 核心不需。

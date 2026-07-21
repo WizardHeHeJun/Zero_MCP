@@ -32,8 +32,17 @@ _EDA_CVXEDA_RATE_HZ: int = 4
 # ref=0.6：据 nk.eda_simulate(rate=4,highpass) 合成信号 abs_mean 量级校准：
 #   scr=0 → abs_mean≈0.002 → μa≈-0.99；scr=4 → ≈0.33 → μa≈0.10；
 #   scr=9 → ≈0.53 → μa≈0.77（单调，Δμa≥0.9，远超 0.3 要求）。
-# 工程假设初值，集成测试接真硬件后再校。
+# 工程假设初值，集成测试接真硬件后再校。**仅用于 highpass 分支**（rate≤4Hz）。
 _SCR_REF_AMPLITUDE: float = 0.6
+
+# cvxEDA 分支（rate>4Hz）专属 ref（gap-3 续）：cvxEDA 反卷积出的 phasic 量级比 highpass
+# 大 ~55×，沿用 highpass 的 0.6 会令 μa 恒饱和到 +1（丢失分级分辨力）。据 cvxEDA(rate=8)
+# 合成信号 abs_mean 现场校准（standardize 后）：
+#   scr=0→0.0→μa=-1；scr=2→22.7→+0.13；scr=4→28.7→+0.43；scr=6→31.7→+0.59；scr=9→37.8→+0.89
+#   （ref=40 单调非饱和，除 scr=0 正确钉底 -1）。工程假设初值，接真硬件后再校。
+# ⚠ 装 cvxopt 后现场实测暴露：该 cvxEDA 路径此前因环境缺 cvxopt **未被真测**，旧版对其
+#   复用 0.6 会饱和；真判别 eval（test_zero_physio_real.py）现锁定其分级判别力。
+_SCR_REF_AMPLITUDE_CVXEDA: float = 40.0
 
 # RMSSD 参考上界（ms，工程假设；健康成人休息 RMSSD 通常 20-80ms，取 100ms 保守上界；
 # 集成测试接真硬件后再校）。RMSSD>100ms（极度放松/迷走神经张力极高）时 inverted 钉底
@@ -155,15 +164,17 @@ class EdaChannel:
 
         # abs().mean() 作 SCR 量级度量：nk.standardize 后 EDA_Phasic 零均值，
         # 有符号 .mean() ≈ 0（退化），abs 均值随 SCR 活动单调递增，是零均值信号的正确量级度量。
-        # gap-3 工程假设：ref=0.6（据合成信号 abs_mean 量级校准的初值，集成测试再校）。
+        # gap-3 工程假设：ref 随分解方法（cvxEDA phasic 量级远大于 highpass，各用各的校准 ref，
+        # 否则 cvxEDA 会饱和丢分级）。均为工程假设初值，集成测试再校。
         scr_amplitude = float(phasic_df["EDA_Phasic"].abs().mean())
+        ref = _SCR_REF_AMPLITUDE_CVXEDA if method == "cvxEDA" else _SCR_REF_AMPLITUDE
 
         if self.normalization == "linear":
-            mu_a = _linear_normalize(scr_amplitude, _SCR_REF_AMPLITUDE)
+            mu_a = _linear_normalize(scr_amplitude, ref)
         else:
             # percentile 归一化接口预留，当前 fallback 到 linear（gap-3）
             logger.warning("EdaChannel: normalization='percentile' 尚未实现，fallback 到 linear")
-            mu_a = _linear_normalize(scr_amplitude, _SCR_REF_AMPLITUDE)
+            mu_a = _linear_normalize(scr_amplitude, ref)
 
         # valence 恒 0.0：EDA 对 valence 盲（Kreibig 2010，Zero M2 也会覆写 Πv=MIN）
         mu_v = 0.0

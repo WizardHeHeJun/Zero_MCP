@@ -26,6 +26,8 @@ HRV 合法性测试（不要求判别力，验证真路径不崩）：
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 # 缺 neurokit2 整个文件 skip（不阻断 CI）
@@ -33,6 +35,9 @@ nk = pytest.importorskip("neurokit2")
 
 from src.mcp.zero.channels.physio_channel import EdaChannel, HrvChannel  # noqa: E402
 from src.mcp.zero.external_priors import MIN_PRECISION  # noqa: E402
+
+# cvxEDA 分支（rate>4Hz）需 cvxopt；缺则相关 eval skip（highpass 分支已在 rate=4 覆盖）
+_HAS_CVXOPT = importlib.util.find_spec("cvxopt") is not None
 
 # ---------------------------------------------------------------------------
 # 辅助：开 flag + 构造通道
@@ -134,6 +139,48 @@ class TestEdaChannelDiscriminability:
             f"μa 判别力退化：高唤醒 μa={mu_a_high:.6f} 未严格大于低唤醒 μa={mu_a_low:.6f}"
             f"（差值={mu_a_high - mu_a_low:.6f}）。EdaChannel SCR 量级度量疑回归，回报 algo-lead。"
         )
+
+
+@pytest.mark.skipif(not _HAS_CVXOPT, reason="cvxopt 未装，cvxEDA(rate>4) 路径不可用，跳过")
+class TestEdaChannelCvxEDADiscriminability:
+    """真 cvxEDA 路径（rate>4Hz）**分级**判别性核验（装 cvxopt 后才可真测）。
+
+    背景：cvxEDA 反卷积出的 phasic 量级比 highpass 大 ~55×，若沿用 highpass 的 ref=0.6，
+    μa 会恒饱和到 +1（scr=4/6/9 都读成 +1，丢失分级）。本 eval 断言**非饱和且单调**——
+    旧版（cvxEDA 复用 0.6）会因 scr=4 与 scr=9 都饱和到 +1 而失败，锁定 cvxEDA 专属 ref 校准。
+    """
+
+    async def test_cvxeda_graded_monotonic(self) -> None:
+        """rate=8（cvxEDA）下 scr=0<4<9 的 μa **严格单调且中档不饱和**。"""
+        rate = 8  # >4Hz → cvxEDA 分支
+        dur = 30
+        results: dict[int, float] = {}
+        for scr in (0, 4, 9):
+            sig = nk.eda_simulate(duration=dur, sampling_rate=rate, scr_number=scr, random_state=42)
+            ch = EdaChannel(sampling_rate=rate)
+            r = await ch.sense(signal={"eda": sig, "sampling_rate": rate})
+            assert r is not None, f"scr={scr}: cvxEDA 路径未产出 ModalityPrior"
+            results[scr] = r.mu[1]
+
+        print(
+            f"\n[cvxEDA 分级判别 | rate=8]\n"
+            f"  scr=0 μa={results[0]:+.4f}\n"
+            f"  scr=4 μa={results[4]:+.4f}\n"
+            f"  scr=9 μa={results[9]:+.4f}"
+        )
+
+        # 单调（判别力）
+        assert results[9] > results[4] > results[0], (
+            f"cvxEDA μa 非单调：{results}——疑 ref 未按 cvxEDA 校准（饱和丢分级），回报审查"
+        )
+        # 中档不饱和：若 cvxEDA 复用 highpass 的 0.6，scr=4 会钉 +1（与 scr=9 无从区分）
+        assert results[4] < 0.9, (
+            f"cvxEDA scr=4 μa={results[4]:.4f} 已饱和到接近 +1，丢失分级分辨力"
+            "（cvxEDA 复用了 highpass 的 ref=0.6？应用 _SCR_REF_AMPLITUDE_CVXEDA）"
+        )
+        # 合法性
+        for scr, mu_a in results.items():
+            assert -1.0 <= mu_a <= 1.0, f"scr={scr} μa={mu_a} 越界"
 
 
 class TestEdaChannelPriorValidity:
