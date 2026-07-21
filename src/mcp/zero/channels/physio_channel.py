@@ -10,13 +10,23 @@ EDA/HRV 对 valence 盲，仅产 arousal 分量（μv 恒 0.0，Πv=MIN_PRECISIO
   cvxEDA（>4Hz）/ highpass（≤4Hz）分解 SCR；ecg_process + hrv_time 提取 RMSSD。
 - gap-6：EDA 采样率差异影响分解质量，低采样率用 highpass 更稳，按硬件采样率适配。
 - gap-3：SCR 量级度量采 abs().mean()（零均值信号正确度量），ref=0.6（合成信号校准初值，工程假设）。
+
+percentile 归一化选型依据（文献门）：
+- [Mõttus 2024 (DOI:10.5772/intechopen.1007760)]
+  跨被试 EDA 幅度差 10–100×，固定阈值（如 ref）鲁棒性差；
+  被试自身近期幅度的滚动分位做归一化才跨被试可比（Lykken range correction 思想）。
+- [Matesanz 2024 (DOI:10.3390/math12020202)]
+  在线自适应归一化在生理多模态信号中优于固定尺度归一化，支撑滚动历史分位方案。
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
 from typing import Any, Literal
+
+import numpy as np
 
 from src.agents.models.zero_affect import ModalityPrior
 from src.mcp.zero.external_priors import ModalityKind, build_recommended_prior
@@ -49,6 +59,9 @@ _SCR_REF_AMPLITUDE_CVXEDA: float = 40.0
 # → μa=-1，方向正确（高 RMSSD = 低 arousal = 副交感优势），信息损失可接受。
 _RMSSD_REF_MS: float = 100.0
 
+# percentile 归一化：退化窗口守卫阈值（p_high - p_low < eps 时回退 linear，避免除零）
+_PERCENTILE_EPS: float = 1e-6
+
 
 def _linear_normalize(value: float, ref: float) -> float:
     """线性归一化到 [-1, 1]，clip 到 [0, ref] 后映射。
@@ -75,11 +88,26 @@ class EdaChannel:
     - name: str 属性（"eda/sc"）。
     - async sense(signal=None) -> ModalityPrior | None（signal 有默认值=无参可调）。
 
+    **percentile 归一化（有状态在线自适应）**：
+    normalization="percentile" 时，维护逐实例的滚动 SCR 幅度历史（按 method 分桶，
+    cvxEDA 与 highpass 量级差 55× 不可混）。将当前幅度定位到被试自身近期 [p_low, p_high]
+    区间，实现跨被试可比的自适应归一化（Lykken range correction 思想）。
+
+    文献依据：
+    - [Mõttus 2024 (DOI:10.5772/intechopen.1007760)] 跨被试 EDA 幅度差 10–100×，
+      被试自身滚动分位归一化才跨被试可比。
+    - [Matesanz 2024 (DOI:10.3390/math12020202)] 在线自适应归一化优于固定尺度归一化。
+
     Args:
-        sampling_rate:   默认采样率 Hz（构造时传入；信号 dict 可覆盖）。默认 4Hz。
-        normalization:   归一化策略：``"linear"``（当前实现）或 ``"percentile"``（预留接口）。
-        signal_source:   async callable → dict | None；PerceptionHub 无参调 sense()
-                         时由此获取信号；测试可直接向 sense(signal=...) 传 dict 绕过。
+        sampling_rate:        默认采样率 Hz（构造时传入；信号 dict 可覆盖）。默认 4Hz。
+        normalization:        归一化策略：``"linear"``（默认）或 ``"percentile"``（有状态自适应）。
+        signal_source:        async callable → dict | None；PerceptionHub 无参调 sense()
+                              时由此获取信号；测试可直接向 sense(signal=...) 传 dict 绕过。
+        percentile_window:    滚动历史最大长度（工程假设，接真被试数据再校）。默认 60。
+        percentile_cold_start: 未达此样本数时走冷启动回退（工程假设，接真被试数据再校）。
+                              默认 20（4Hz 下约需累积 20 帧感知才暖机；每帧越短暖机越慢）。
+        percentile_range:     分位范围 (q_low, q_high)（工程假设，接真被试数据再校）。
+                              默认 (5, 95)。
     """
 
     name: str = "eda/sc"
@@ -89,10 +117,33 @@ class EdaChannel:
         sampling_rate: int = 4,
         normalization: Literal["linear", "percentile"] = "linear",
         signal_source: Any | None = None,
+        percentile_window: int = 60,
+        percentile_cold_start: int = 20,
+        percentile_range: tuple[int, int] = (5, 95),
     ) -> None:
         self.sampling_rate = sampling_rate
         self.normalization = normalization
         self.signal_source = signal_source
+        self.percentile_window = percentile_window
+        self.percentile_cold_start = percentile_cold_start
+        self.percentile_range = percentile_range
+        # 按 method 分桶的滚动幅度历史（逐实例状态，非全局）
+        # key: "cvxEDA" | "highpass"；value: 最近 percentile_window 个 scr_amplitude 值
+        self._amplitude_history: dict[str, collections.deque[float]] = {
+            "cvxEDA": collections.deque(maxlen=percentile_window),
+            "highpass": collections.deque(maxlen=percentile_window),
+        }
+
+    def reset(self) -> None:
+        """清空滚动幅度历史（**被试切换时调用方必须调用**）。
+
+        调用后 percentile 模式回到冷启动状态，linear 模式不受影响。
+        ⚠ 调用方（编排/接入层）有责任在被试切换时调用本方法或 ``PerceptionHub.reset_all()``；
+        **未调用将导致新被试沿用旧被试的历史分位区间（跨被试污染）**——有状态通道的固有契约，
+        Protocol 无法在编译期强制（W2，见 pitfalls「有状态感知通道被试切换须 reset」）。
+        """
+        for key in self._amplitude_history:
+            self._amplitude_history[key].clear()
 
     async def sense(
         self,
@@ -143,7 +194,14 @@ class EdaChannel:
         neurokit2 仅在此处 import，避免模块加载时因缺包崩溃。
         采样率 >4Hz 用 cvxEDA，≤4Hz 用 highpass（gap-6，低采样率 highpass 更稳）。
 
+        percentile 分支：维护逐实例滚动历史，按 method 分桶（cvxEDA/highpass 量级差
+        55× 不可混）。冷启动（< percentile_cold_start 样本）回退 linear，保证暖机前
+        行为等价于 linear（零回归过渡）。退化窗口（p_high - p_low < eps）同样回退
+        linear（避免除零/单调窗口塌缩）。
+
         参考：[NeuroKit2 DOI:10.3758/s13428-020-01516-y]
+              [Mõttus 2024 DOI:10.5772/intechopen.1007760]
+              [Matesanz 2024 DOI:10.3390/math12020202]
         """
         import neurokit2 as nk  # 延迟 import（ImportError 由 sense() 捕获）
 
@@ -172,9 +230,29 @@ class EdaChannel:
         if self.normalization == "linear":
             mu_a = _linear_normalize(scr_amplitude, ref)
         else:
-            # percentile 归一化接口预留，当前 fallback 到 linear（gap-3）
-            logger.warning("EdaChannel: normalization='percentile' 尚未实现，fallback 到 linear")
-            mu_a = _linear_normalize(scr_amplitude, ref)
+            # percentile 有状态在线自适应归一化
+            # 按 method 分桶——cvxEDA 与 highpass 量级差 55×，混桶会令分位区间跨度失控
+            hist = self._amplitude_history[method]
+            hist.append(scr_amplitude)
+
+            if len(hist) < self.percentile_cold_start:
+                # 冷启动：样本不足，回退 linear（暖机前行为等价于 linear，零回归过渡）
+                mu_a = _linear_normalize(scr_amplitude, ref)
+            else:
+                q_low, q_high = self.percentile_range
+                # 一次 np.percentile 取双分位（deque→ndarray 一次转换，避免两次 list 分配 +
+                # 「两次转换间 deque 不变」的隐式假设，W4）
+                pcts = np.percentile(np.asarray(hist, dtype=float), [q_low, q_high])
+                p_low, p_high = float(pcts[0]), float(pcts[1])
+
+                if p_high - p_low < _PERCENTILE_EPS:
+                    # 退化窗口守卫：p_high ≈ p_low（单调信号窗口塌缩）→ 回退 linear 避免除零
+                    mu_a = _linear_normalize(scr_amplitude, ref)
+                else:
+                    # 自适应归一化：把当前幅度定位到被试自身近期 [p_low, p_high] 区间
+                    # → 跨被试可比（Lykken range correction 思想）
+                    clipped = min(max((scr_amplitude - p_low) / (p_high - p_low), 0.0), 1.0)
+                    mu_a = clipped * 2.0 - 1.0
 
         # valence 恒 0.0：EDA 对 valence 盲（Kreibig 2010，Zero M2 也会覆写 Πv=MIN）
         mu_v = 0.0

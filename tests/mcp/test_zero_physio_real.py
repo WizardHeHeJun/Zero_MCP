@@ -349,3 +349,278 @@ class TestEdaChannelDisabledWithRealSignal:
         ch = EdaChannel(sampling_rate=rate)
         result = await ch.sense(signal={"eda": sig, "sampling_rate": rate})
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# percentile 归一化真行为 eval（真 NeuroKit2，R1-R2）
+# ---------------------------------------------------------------------------
+
+
+def _make_eda_signal_for_scr(scr_number: int, rate: int = 4, duration: int = 60) -> dict:
+    """合成指定 SCR 数量的 EDA 信号 dict（真 nk.eda_simulate）。"""
+    sig = nk.eda_simulate(
+        duration=duration,
+        sampling_rate=rate,
+        scr_number=scr_number,
+        random_state=42,
+    )
+    return {"eda": sig, "sampling_rate": rate}
+
+
+async def _warmup_channel(
+    ch: EdaChannel,
+    scr_numbers: list[int],
+    rate: int = 4,
+    duration: int = 60,
+) -> None:
+    """向通道顺序喂入一批信号以完成暖机（超过 cold_start 样本数）。
+
+    scr_numbers 中的值循环用于合成信号；每次使用不同 random_state 让信号有变化。
+    """
+    for i, scr in enumerate(scr_numbers):
+        sig = nk.eda_simulate(
+            duration=duration,
+            sampling_rate=rate,
+            scr_number=scr,
+            random_state=i,
+        )
+        await ch.sense(signal={"eda": sig, "sampling_rate": rate})
+
+
+class TestEdaChannelPercentileWarmupDiscriminability:
+    """percentile 归一化：暖机后高 SCR 帧 μa 应显著大于低 SCR 帧（R1）。
+
+    验证流程：
+    1. 用混合 scr 档（0/3/6/9 轮转 >= cold_start 次）喂满暖机窗，历史已覆盖完整幅度区间。
+    2. 再喂 scr=9（高唤醒）与 scr=1（低唤醒）两帧。
+    3. 断言 μa(高) > μa(低)（自适应路径暖机后有判别力）。
+
+    此测试用 rate=4（highpass 分支），不依赖 cvxopt。
+    """
+
+    async def test_r1_warmed_up_percentile_discriminability(self) -> None:
+        """R1：暖机后 percentile 模式对 scr=9 vs scr=1 有判别力。
+
+        暖机序列覆盖 scr∈{0,3,6,9}，确保历史跨越完整幅度区间；
+        暖机后喂 scr=9 与 scr=1，断言自适应路径的 μa 有显著差异。
+        """
+        rate = 4
+        cold_start = 20
+        # 暖机序列：轮转 scr={0,3,6,9}，共 cold_start+4 次，确保历史覆盖完整幅度区间
+        warmup_scrs = [scr for i in range(cold_start + 4) for scr in [0, 3, 6, 9]][: cold_start + 4]
+
+        # 两个独立通道用**相同**暖机序列（_warmup_channel 按 index 定 random_state → 确定性，
+        # 两者历史完全一致），再分别喂高/低帧——避免单通道顺序依赖，且不复制私有历史/硬编码
+        # maxlen（W1：改为公平地各自暖机，而非直接写内部 deque）。
+        ch_high = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        ch_low = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        await _warmup_channel(ch_high, warmup_scrs, rate=rate)
+        await _warmup_channel(ch_low, warmup_scrs, rate=rate)
+        hist_len = len(ch_high._amplitude_history["highpass"])
+        assert hist_len >= cold_start, f"暖机后历史长度={hist_len}，应 >= {cold_start}"
+
+        # 喂高唤醒帧（scr=9）和低唤醒帧（scr=1），固定 random_state 保证可重复
+        sig_high = nk.eda_simulate(duration=60, sampling_rate=rate, scr_number=9, random_state=99)
+        sig_low = nk.eda_simulate(duration=60, sampling_rate=rate, scr_number=1, random_state=99)
+        result_high = await ch_high.sense(signal={"eda": sig_high, "sampling_rate": rate})
+        result_low = await ch_low.sense(signal={"eda": sig_low, "sampling_rate": rate})
+
+        assert result_high is not None, "scr=9 帧未产出 ModalityPrior"
+        assert result_low is not None, "scr=1 帧未产出 ModalityPrior"
+
+        mu_a_high = result_high.mu[1]
+        mu_a_low = result_low.mu[1]
+
+        print(
+            f"\n[R1 percentile 暖机判别 | rate={rate}Hz highpass]\n"
+            f"  暖机样本数 = {hist_len}\n"
+            f"  scr=9 μa  = {mu_a_high:.6f}\n"
+            f"  scr=1 μa  = {mu_a_low:.6f}\n"
+            f"  差值 Δμa  = {mu_a_high - mu_a_low:.6f}"
+        )
+
+        # 合法性
+        assert -1.0 <= mu_a_high <= 1.0, f"scr=9 μa={mu_a_high} 超出 [-1,1]"
+        assert -1.0 <= mu_a_low <= 1.0, f"scr=1 μa={mu_a_low} 超出 [-1,1]"
+        assert result_high.mu[0] == pytest.approx(0.0), "μv 应 == 0.0（valence 盲）"
+        assert result_high.precision[0] == pytest.approx(MIN_PRECISION), "Πv 应 == MIN_PRECISION"
+
+        # 判别力守卫：要求显著 margin（实测 Δ≈1.64；退化/尺度不变 impl 的 Δ≈0 会跌破）
+        assert mu_a_high > mu_a_low + 0.5, (
+            f"[R1] percentile 暖机后判别力不足：scr=9 μa={mu_a_high:.6f} 未显著大于 "
+            f"scr=1 μa={mu_a_low:.6f}（Δ={mu_a_high - mu_a_low:.6f}≤0.5）。"
+            "自适应路径暖机后应显著区分高低 SCR（退化/尺度不变会跌破此 margin），回报 algo-lead。"
+        )
+
+
+@pytest.mark.skipif(not _HAS_CVXOPT, reason="cvxopt 未装，cvxEDA(rate>4) 路径不可用，跳过")
+class TestEdaChannelPercentileCvxEDAWarmup:
+    """percentile 归一化 cvxEDA 分支（rate>4Hz）暖机后判别力（R1 续，需 cvxopt）。"""
+
+    async def test_r1_cvxeda_warmed_up_discriminability(self) -> None:
+        """R1-cvx：cvxEDA 路径暖机后 scr=9 vs scr=1 μa 有判别力。"""
+        rate = 8  # >4Hz → cvxEDA 分支
+        cold_start = 20
+        warmup_scrs = [scr for i in range(cold_start + 4) for scr in [0, 3, 6, 9]][: cold_start + 4]
+
+        # 两通道相同暖机序列（确定性→历史一致），分别喂高/低帧（W1：不复制私有历史）
+        ch_high = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        ch_low = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        await _warmup_channel(ch_high, warmup_scrs, rate=rate, duration=30)
+        await _warmup_channel(ch_low, warmup_scrs, rate=rate, duration=30)
+        hist_len = len(ch_high._amplitude_history["cvxEDA"])
+        assert hist_len >= cold_start, f"cvxEDA 暖机后历史={hist_len}，应 >= {cold_start}"
+
+        sig_high = nk.eda_simulate(duration=30, sampling_rate=rate, scr_number=9, random_state=99)
+        sig_low = nk.eda_simulate(duration=30, sampling_rate=rate, scr_number=1, random_state=99)
+        result_high = await ch_high.sense(signal={"eda": sig_high, "sampling_rate": rate})
+        result_low = await ch_low.sense(signal={"eda": sig_low, "sampling_rate": rate})
+
+        assert result_high is not None and result_low is not None
+        mu_a_high = result_high.mu[1]
+        mu_a_low = result_low.mu[1]
+
+        print(
+            f"\n[R1-cvx cvxEDA 暖机判别 | rate={rate}Hz]\n"
+            f"  scr=9 μa = {mu_a_high:.6f}\n"
+            f"  scr=1 μa = {mu_a_low:.6f}\n"
+            f"  差值 Δμa = {mu_a_high - mu_a_low:.6f}"
+        )
+
+        assert mu_a_high > mu_a_low + 0.5, (
+            f"[R1-cvx] cvxEDA percentile 暖机后判别力不足：scr=9 μa={mu_a_high:.6f} "
+            f"未显著大于 scr=1 μa={mu_a_low:.6f}（Δ={mu_a_high - mu_a_low:.6f}≤0.5）"
+        )
+
+
+class TestEdaChannelPercentileCrossSubjectRobustness:
+    """percentile 归一化跨被试鲁棒性验证（R2）。
+
+    核心命题：EDA 幅度跨被试差异 10–100×，percentile 自适应把不同绝对尺度的被试
+    拉到可比标度；linear 在两被试间同帧读数差距明显更大。
+
+    实验设计：
+    - 被试 A（高响应者）：暖机序列 scr 档偏高（如 {4,6,9} 轮转），高 SCR 幅度绝对值大。
+    - 被试 B（低响应者）：暖机序列 scr 档偏低（如 {0,1,2} 轮转），低 SCR 幅度绝对值小。
+    - 各自喂相同相对起伏的"高档帧"（scr=9 / scr=3）作为测试帧。
+    - percentile 下两者「高档帧」μa 应接近（自适应拉平尺度）。
+    - linear 下两者同帧 μa 差异应明显大于 percentile（证明 adaptive 改善跨被试可比性）。
+
+    使用 rate=4（highpass 分支），不依赖 cvxopt。
+    """
+
+    async def test_r2_cross_subject_robustness(self) -> None:
+        """R2：percentile 自适应缩小跨被试高档帧 μa 差异；linear 差异明显更大。
+
+        A（高响应）与 B（低响应）各自喂自己的暖机序列后，分别喂各自的"高档帧"，
+        断言：
+          |μa_A_pct - μa_B_pct| < |μa_A_lin - μa_B_lin| - margin
+        即 percentile 下的跨被试差异比 linear 至少小 margin（默认 0.1）。
+
+        打印实测数值供人工复查；若两者差异相近则说明未真自适应，回报 algo-lead。
+
+        ⚠ I1 局限：合成信号下 scr=9 vs scr=3 本身绝对幅度就不同，linear 的 diff 部分来自信号
+        量级差被 percentile 压缩，非纯归一化的跨被试自适应效果——本 eval 配合 R1 能抓「退化/
+        尺度不变」实现，但不能区分「真 Lykken range correction」与「信号量级差被压缩」。真被试
+        数据接入后须重新核验。
+        """
+        rate = 4
+        cold_start = 20
+        duration = 60
+
+        # ---- 被试 A（高响应者）：暖机序列 scr∈{4,6,9} ----
+        warmup_a = [scr for i in range(cold_start + 4) for scr in [4, 6, 9]][: cold_start + 4]
+        # ---- 被试 B（低响应者）：暖机序列 scr∈{0,1,2} ----
+        warmup_b = [scr for i in range(cold_start + 4) for scr in [0, 1, 2]][: cold_start + 4]
+
+        # percentile 通道：A 与 B 各自暖机
+        ch_a_pct = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        ch_b_pct = EdaChannel(
+            sampling_rate=rate,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=60,
+        )
+        await _warmup_channel(ch_a_pct, warmup_a, rate=rate, duration=duration)
+        await _warmup_channel(ch_b_pct, warmup_b, rate=rate, duration=duration)
+
+        # 测试帧：A 喂 scr=9（高档相对其响应范围），B 喂 scr=3（高档相对其响应范围）
+        # 选择对各被试而言都是"高唤醒"的信号档——A 的 scr=9 对应高响应，B 的 scr=3 也是高响应
+        sig_a_high = nk.eda_simulate(
+            duration=duration, sampling_rate=rate, scr_number=9, random_state=100
+        )
+        sig_b_high = nk.eda_simulate(
+            duration=duration, sampling_rate=rate, scr_number=3, random_state=100
+        )
+
+        result_a_pct = await ch_a_pct.sense(signal={"eda": sig_a_high, "sampling_rate": rate})
+        result_b_pct = await ch_b_pct.sense(signal={"eda": sig_b_high, "sampling_rate": rate})
+
+        assert result_a_pct is not None and result_b_pct is not None
+
+        mu_a_A_pct = result_a_pct.mu[1]
+        mu_a_B_pct = result_b_pct.mu[1]
+        diff_pct = abs(mu_a_A_pct - mu_a_B_pct)
+
+        # linear 对照：用与 percentile 测试帧完全相同的信号跑 linear
+        ch_a_lin = EdaChannel(sampling_rate=rate, normalization="linear")
+        ch_b_lin = EdaChannel(sampling_rate=rate, normalization="linear")
+        result_a_lin = await ch_a_lin.sense(signal={"eda": sig_a_high, "sampling_rate": rate})
+        result_b_lin = await ch_b_lin.sense(signal={"eda": sig_b_high, "sampling_rate": rate})
+
+        assert result_a_lin is not None and result_b_lin is not None
+
+        mu_a_A_lin = result_a_lin.mu[1]
+        mu_a_B_lin = result_b_lin.mu[1]
+        diff_lin = abs(mu_a_A_lin - mu_a_B_lin)
+
+        print(
+            f"\n[R2 跨被试鲁棒性 | rate={rate}Hz highpass]\n"
+            f"  被试 A（高响应）暖机 scr∈{{4,6,9}}，测试帧 scr=9\n"
+            f"  被试 B（低响应）暖机 scr∈{{0,1,2}}，测试帧 scr=3\n"
+            f"  percentile:  μa_A={mu_a_A_pct:+.4f}, μa_B={mu_a_B_pct:+.4f}, "
+            f"|差|={diff_pct:.4f}\n"
+            f"  linear:      μa_A={mu_a_A_lin:+.4f}, μa_B={mu_a_B_lin:+.4f}, "
+            f"|差|={diff_lin:.4f}\n"
+            f"  diff_lin - diff_pct = {diff_lin - diff_pct:.4f}（>0 表示 adaptive 改善）"
+        )
+
+        # 合法性断言（恒成立）
+        assert -1.0 <= mu_a_A_pct <= 1.0, f"A percentile μa={mu_a_A_pct} 超出 [-1,1]"
+        assert -1.0 <= mu_a_B_pct <= 1.0, f"B percentile μa={mu_a_B_pct} 超出 [-1,1]"
+
+        # 核心命题：percentile 跨被试差异 < linear 跨被试差异（自适应改善跨被试可比性）
+        # margin=0.1 容忍合成信号的量级噪声，但若两者差异相近（< margin）说明未真自适应
+        margin = 0.1
+        assert diff_pct < diff_lin - margin, (
+            f"[R2] percentile 未改善跨被试可比性：\n"
+            f"  percentile 跨被试差异={diff_pct:.4f}，linear 跨被试差异={diff_lin:.4f}\n"
+            f"  期望 diff_pct < diff_lin - {margin}（即减少至少 {margin}），\n"
+            f"  实际 diff_lin - diff_pct = {diff_lin - diff_pct:.4f}。\n"
+            "若两者差异相近，说明 percentile 未真自适应，回报 algo-lead。"
+        )

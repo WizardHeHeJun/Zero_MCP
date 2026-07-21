@@ -63,6 +63,18 @@ class PerceptionHub:
     def __init__(self, channels: list[PerceptionChannel]) -> None:
         self.channels = channels
 
+    def reset_all(self) -> None:
+        """被试切换时的统一入口：对**有状态**通道（实现了 reset()）调用其 reset()。
+
+        有状态感知通道（如 percentile 归一化的 EdaChannel 维护滚动历史）在被试切换时须清空
+        历史，否则新被试沿用旧被试的自适应基线（跨被试污染）。无 reset() 的无状态通道跳过。
+        鸭子类型检测——不强制 PerceptionChannel Protocol 带 reset()（多数通道无状态）。
+        """
+        for ch in self.channels:
+            reset = getattr(ch, "reset", None)
+            if callable(reset):
+                reset()
+
     async def collect(self) -> list[ModalityPrior]:
         """async：并发收集各通道先验，单通道失败/无证据降级跳过。
 

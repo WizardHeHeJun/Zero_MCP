@@ -417,3 +417,264 @@ class TestEdaChannelSamplingRateBranch:
         assert call_kwargs is not None
         _, kwargs = call_kwargs
         assert kwargs.get("method") == "cvxEDA"
+
+
+# ---------------------------------------------------------------------------
+# P1-P5：EdaChannel percentile 归一化（mock neurokit2）
+# ---------------------------------------------------------------------------
+
+
+def _make_nk_mock_with_amplitude(phasic_abs_mean: float) -> MagicMock:
+    """构造 mock neurokit2，eda_phasic 返回的 EDA_Phasic 均值 abs == phasic_abs_mean。
+
+    用正值填充列（abs().mean() == phasic_abs_mean），绕开零均值陷阱。
+    """
+    nk = _make_nk_mock(phasic_value=phasic_abs_mean)
+    # _make_nk_mock 已设 phasic_value 作 DataFrame 值，abs().mean() == phasic_abs_mean（均正值）
+    return nk
+
+
+class TestEdaChannelPercentileNormalization:
+    """percentile 归一化逻辑（mock neurokit2，P1-P5）。
+
+    覆盖：
+      P1. 冷启动期间 percentile 输出 == 同输入 linear 输出（零回归过渡）。
+      P2. reset() 清空历史 → reset 后又走冷启动。
+      P3. normalization 默认 "linear" → 历史 deque 保持空。
+      P4. 退化窗口（喂常量幅度）→ 回退 linear 不崩。
+      P5. 分桶：rate>4(cvxEDA) 与 rate≤4(highpass) 历史互不污染。
+    """
+
+    async def test_p1_cold_start_equals_linear(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P1：前 percentile_cold_start-1 次 percentile 输出 == 对应 linear 输出（冷启动零回归）。
+
+        在暖机阈值（默认 20）前，percentile 模式每次输出应与 linear 模式相同输入的输出一致。
+        测试取 cold_start=5（缩短以节省时间），喂 4 次（< cold_start），断言每次相等。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        cold_start = 5
+        phasic_values = [0.1, 0.3, 0.5, 0.2]  # 4次 < cold_start=5
+
+        for phasic_val in phasic_values:
+            # percentile 通道
+            ch_pct = EdaChannel(
+                sampling_rate=4,
+                normalization="percentile",
+                percentile_cold_start=cold_start,
+            )
+            # linear 通道（基准）
+            ch_lin = EdaChannel(sampling_rate=4, normalization="linear")
+
+            nk_pct = _make_nk_mock(phasic_value=phasic_val)
+            nk_lin = _make_nk_mock(phasic_value=phasic_val)
+
+            with patch.dict("sys.modules", {"neurokit2": nk_pct}):
+                result_pct = await ch_pct.sense(signal=_make_eda_signal(rate=4))
+            with patch.dict("sys.modules", {"neurokit2": nk_lin}):
+                result_lin = await ch_lin.sense(signal=_make_eda_signal(rate=4))
+
+            assert result_pct is not None
+            assert result_lin is not None
+            assert result_pct.mu[1] == pytest.approx(result_lin.mu[1], abs=1e-9), (
+                f"冷启动 phasic={phasic_val}：percentile μa={result_pct.mu[1]:.6f} "
+                f"!= linear μa={result_lin.mu[1]:.6f}，冷启动零回归违反"
+            )
+
+    async def test_p1_cold_start_stateful_accumulation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1b：同一实例连续调用 cold_start-1 次，每次均应等于对应 linear 输出。
+
+        验证逐实例历史正确积累（deque 按顺序追加），且追加后仍在冷启动区间时回退 linear。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        cold_start = 5
+        ch_pct = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+        )
+        phasic_values = [0.1, 0.2, 0.3, 0.4]  # 4 次 < cold_start=5
+
+        for i, phasic_val in enumerate(phasic_values):
+            nk_mock = _make_nk_mock(phasic_value=phasic_val)
+            nk_lin_mock = _make_nk_mock(phasic_value=phasic_val)
+
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                result_pct = await ch_pct.sense(signal=_make_eda_signal(rate=4))
+
+            ch_lin = EdaChannel(sampling_rate=4, normalization="linear")
+            with patch.dict("sys.modules", {"neurokit2": nk_lin_mock}):
+                result_lin = await ch_lin.sense(signal=_make_eda_signal(rate=4))
+
+            assert result_pct is not None and result_lin is not None
+            assert result_pct.mu[1] == pytest.approx(result_lin.mu[1], abs=1e-9), (
+                f"第{i + 1}次调用（phasic={phasic_val}）：percentile μa != linear μa，"
+                f"冷启动积累期零回归违反（hist长度={len(ch_pct._amplitude_history['highpass'])}）"
+            )
+
+        # 验证历史已积累 cold_start-1 个值
+        assert len(ch_pct._amplitude_history["highpass"]) == len(phasic_values)
+
+    async def test_p2_reset_clears_history_and_restores_cold_start(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2：reset() 清空历史；reset 后再调用应再次走冷启动（输出 == linear）。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        cold_start = 3
+        ch = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=20,
+        )
+
+        # 喂满暖机（>= cold_start 次）
+        for _ in range(cold_start):
+            nk_mock = _make_nk_mock(phasic_value=0.3)
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                await ch.sense(signal=_make_eda_signal(rate=4))
+
+        assert len(ch._amplitude_history["highpass"]) >= cold_start, "暖机后历史应 >= cold_start"
+
+        # reset
+        ch.reset()
+        assert len(ch._amplitude_history["highpass"]) == 0, "reset 后 highpass 桶应为空"
+        assert len(ch._amplitude_history["cvxEDA"]) == 0, "reset 后 cvxEDA 桶应为空"
+
+        # reset 后首次调用 → 冷启动，输出应 == linear
+        phasic_val = 0.25
+        nk_after = _make_nk_mock(phasic_value=phasic_val)
+        nk_lin = _make_nk_mock(phasic_value=phasic_val)
+        with patch.dict("sys.modules", {"neurokit2": nk_after}):
+            result_pct = await ch.sense(signal=_make_eda_signal(rate=4))
+        ch_lin = EdaChannel(sampling_rate=4, normalization="linear")
+        with patch.dict("sys.modules", {"neurokit2": nk_lin}):
+            result_lin = await ch_lin.sense(signal=_make_eda_signal(rate=4))
+
+        assert result_pct is not None and result_lin is not None
+        assert result_pct.mu[1] == pytest.approx(result_lin.mu[1], abs=1e-9), (
+            f"reset 后冷启动：percentile μa={result_pct.mu[1]:.6f} "
+            f"!= linear μa={result_lin.mu[1]:.6f}"
+        )
+
+    async def test_p3_default_linear_does_not_touch_history(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3：normalization="linear"（默认）时，历史 deque 保持空，不累积任何幅度值。
+
+        linear 路径完全不动，历史 deque 始终不被写入。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = EdaChannel(sampling_rate=4, normalization="linear")
+
+        for _ in range(5):
+            nk_mock = _make_nk_mock(phasic_value=0.4)
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                await ch.sense(signal=_make_eda_signal(rate=4))
+
+        assert len(ch._amplitude_history["highpass"]) == 0, "linear 模式不应写入 highpass 历史桶"
+        assert len(ch._amplitude_history["cvxEDA"]) == 0, "linear 模式不应写入 cvxEDA 历史桶"
+
+    async def test_p4_degenerate_window_falls_back_to_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P4：喂常量幅度（p_high - p_low < eps）→ 退化窗口守卫回退 linear，不崩溃。
+
+        当所有历史样本幅度相同时，p5 == p95，分位区间塌缩为零宽，
+        应回退 linear 归一化而非除零崩溃。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        cold_start = 3
+        constant_amplitude = 0.3  # 所有样本相同幅度 → 退化窗口
+        ch = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_cold_start=cold_start,
+            percentile_window=20,
+        )
+
+        # 喂超过 cold_start 次的常量幅度，进入暖机后路径
+        for _ in range(cold_start + 2):
+            nk_mock = _make_nk_mock(phasic_value=constant_amplitude)
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                result = await ch.sense(signal=_make_eda_signal(rate=4))
+            assert result is not None, "退化窗口守卫后应仍产出 ModalityPrior（非 None）"
+            assert -1.0 <= result.mu[1] <= 1.0, f"μa={result.mu[1]} 超出 [-1,1]"
+
+        # 最后一次输出应等于 linear（退化窗口回退）
+        nk_final = _make_nk_mock(phasic_value=constant_amplitude)
+        nk_lin = _make_nk_mock(phasic_value=constant_amplitude)
+        ch_lin = EdaChannel(sampling_rate=4, normalization="linear")
+
+        # 对退化后的 ch，再喂一次（历史已全常量，必触发退化守卫）
+        with patch.dict("sys.modules", {"neurokit2": nk_final}):
+            result_pct = await ch.sense(signal=_make_eda_signal(rate=4))
+        with patch.dict("sys.modules", {"neurokit2": nk_lin}):
+            result_lin = await ch_lin.sense(signal=_make_eda_signal(rate=4))
+
+        assert result_pct is not None and result_lin is not None
+        assert result_pct.mu[1] == pytest.approx(result_lin.mu[1], abs=1e-9), (
+            f"退化窗口应回退 linear：percentile μa={result_pct.mu[1]:.6f} "
+            f"!= linear μa={result_lin.mu[1]:.6f}"
+        )
+
+    async def test_p5_buckets_are_independent_by_method(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P5：cvxEDA(rate>4) 与 highpass(rate≤4) 历史桶互不污染。
+
+        给同一实例分别喂高采样率（rate=8, cvxEDA）和低采样率（rate=4, highpass）信号，
+        断言两个桶各自独立积累，且各自的桶长度正确。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_window=20,
+            percentile_cold_start=10,
+        )
+
+        # 喂 3 次 highpass（rate=4），幅度 = 0.2
+        for _ in range(3):
+            nk_mock = _make_nk_mock(phasic_value=0.2)
+            sig = _make_eda_signal(rate=4)
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                await ch.sense(signal=sig)
+
+        # 喂 5 次 cvxEDA（rate=8），幅度 = 25.0（cvxEDA 量级）
+        for _ in range(5):
+            nk_mock = _make_nk_mock(phasic_value=25.0)
+            sig = _make_eda_signal(rate=8)
+            sig["sampling_rate"] = 8
+            with patch.dict("sys.modules", {"neurokit2": nk_mock}):
+                await ch.sense(signal=sig)
+
+        # 断言两桶独立：highpass 桶 3 个，cvxEDA 桶 5 个
+        assert len(ch._amplitude_history["highpass"]) == 3, (
+            f"highpass 桶应有 3 个样本，实际 {len(ch._amplitude_history['highpass'])}"
+        )
+        assert len(ch._amplitude_history["cvxEDA"]) == 5, (
+            f"cvxEDA 桶应有 5 个样本，实际 {len(ch._amplitude_history['cvxEDA'])}"
+        )
+
+        # 验证桶内容互不污染：highpass 桶全为 0.2，cvxEDA 桶全为 25.0
+        assert all(v == pytest.approx(0.2) for v in ch._amplitude_history["highpass"]), (
+            "highpass 桶被 cvxEDA 数据污染"
+        )
+        assert all(v == pytest.approx(25.0) for v in ch._amplitude_history["cvxEDA"]), (
+            "cvxEDA 桶被 highpass 数据污染"
+        )
+
+    def test_p6_hub_reset_all_clears_stateful_skips_stateless(self) -> None:
+        """P6：PerceptionHub.reset_all() 清空有状态通道（EdaChannel）历史，无 reset() 的
+        通道（HrvChannel）安全跳过（W2 修复回归）。"""
+        eda = EdaChannel(normalization="percentile")
+        eda._amplitude_history["highpass"].extend([1.0, 2.0, 3.0])
+        hrv = HrvChannel()  # 无 reset() 方法（鸭子类型应被跳过）
+        assert not hasattr(hrv, "reset")
+
+        hub = PerceptionHub([eda, hrv])
+        hub.reset_all()  # 不应因 hrv 无 reset 而崩
+
+        assert len(eda._amplitude_history["highpass"]) == 0, "reset_all 应清空 EdaChannel 历史"
