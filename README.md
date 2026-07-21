@@ -60,27 +60,51 @@ MCP 互操作边界（横切）
 ## 目录结构
 
 ```text
-src/
-  orchestration/   Supervisor / StateGraph / 安全门（safety/）/ prompt 模板    ✅ 已实现
-    safety/          三级白名单 + TOCTOU + 异常现场上报（注入过滤实现在 agents/text_filter.py，此处调用）
-    prompts/         Jinja2 模板（与代码分离）
-  agents/          ScreenPerceptionAgent / DesktopControlAgent / 契约模型      ✅ 已实现
-    models/          screen_snapshot（桌面契约）/ zero_affect（Zero↔MCP 情感契约唯一真相）
-  mcp/             Python MCP server + client + 感知/操控原语                   ✅ 已实现
-    desktop/         capability_probe / tools（perception, control）
-    zero/            Zero↔MCP 情感对接层（zero-link）                          ✅ 第二阶段
-      client.py        ZeroLinkClient（stdio / Streamable HTTP，三段式会话 + 优雅回退）
-      channels/        感知通道：physio(NeuroKit2) / audio(audeering w2v2) / vision(EmotiEffLib ONNX) / callable
-      mappers/         表达映射：facs(12 AU→ARKit 52) / prosody(情感 TTS) / physiology
-      sinks/           RenderingExpressionSink → RenderFrame（渲染半程终端）
-      （另有 perception.py 多流汇聚 / expression_sink.py 分发 / external_priors.py 注入载荷 / protocols.py 协议镜像）
-  memory/          记忆读写 API（编排层经 Protocol 打桩，src/memory 待实现）    ⬜ 骨架
-  storage/         Postgres / Neo4j / Redis 连接与 schema                       ⬜ 骨架
-mcp-server/        TS MCP 对外聚合层（独立 package.json，暂未用）                ⬜ 骨架
-tests/             单测 + 跨仓回归（poc/mcp/agents/orchestration/safety/e2e）   ✅ 995 用例
-evals/             agent 行为级 evals                                          ✅ 53 绿
-ai-docs/           知识库：模块三件套 / catalog / pitfalls
-notes/             设计纪要 / 实测报告 / 工程实施记录
+Zero_MCP/
+├── src/
+│   ├── orchestration/              # 编排层：LangGraph 装配 + Supervisor + 安全门
+│   │   ├── desktop_graph.py            #   build 桌面任务 StateGraph：节点装配 + 条件边路由 + interrupt 断点续跑
+│   │   ├── desktop_supervisor.py       #   Supervisor：LLM 决策下一步（只分发协调不含业务，模型 ID 走 .env）
+│   │   ├── state.py                    #   结构化 state（pydantic）：节点只返回增量，大对象放引用
+│   │   ├── protocols.py                #   下游打桩：MemoryAPI / SnapshotStore（memory/storage 落地前的 Protocol）
+│   │   ├── phash.py                    #   感知哈希：TOCTOU 比对 + 停滞检测信号（目标局部裁剪口径）
+│   │   ├── prompt_loader.py · prompts/ #   Jinja2 模板加载 + supervisor 模板（prompt 与代码分离）
+│   │   └── safety/                     #   安全门
+│   │       ├── action_guard.py             #     三级白名单 + TOCTOU 二次截图比对 + interrupt 人工确认
+│   │       └── incident_reporter.py        #     异常现场包落盘 incident.json+截图（INCIDENT_DIR 默认关）
+│   ├── agents/                     # Worker Agent 层（职责单一，经 state + Supervisor 协作）
+│   │   ├── screen_perception_agent.py  #   屏幕感知：快照 → 模型无关结构化文本
+│   │   ├── desktop_control_agent.py    #   桌面操控：动作规划与执行封装
+│   │   ├── text_filter.py              #   屏幕文字注入过滤（23 条中文越权词表，实测 FP=0/159）
+│   │   ├── protocols.py                #   agent 层协议
+│   │   └── models/                     #   共享契约层（跨层数据形状唯一真相，pydantic）
+│   │       ├── screen_snapshot.py          #     桌面感知契约（ScreenSnapshot / TextBlock / capture_origin）
+│   │       └── zero_affect.py              #     Zero↔MCP 情感契约（(v,a) 刺激 / 先验流 / 13 维 FACS 双通路 expression）
+│   ├── mcp/                        # MCP 互操作边界（Python = 内部能力封装）
+│   │   ├── desktop_mcp_server.py       #   桌面能力 MCP server（FastMCP + stdio，10 工具，flag 默认关）
+│   │   ├── desktop_mcp_client.py       #   编排层侧 client（spawn 子进程，异常三件套）
+│   │   ├── desktop/
+│   │   │   ├── capability_probe.py         #     启动能力探测：GPU EP 自适应 / OCR / OmniParser（幂等缓存）
+│   │   │   └── tools/                      #     perception.py 感知原语（UIA/mss/RapidOCR/PrintWindow）· control.py 操控原语
+│   │   └── zero/                       #   zero-link：Zero↔MCP 情感对接层（不 import Zero，协议镜像）
+│   │       ├── client.py                   #     ZeroLinkClient：三段式会话 + stdio/Streamable HTTP + graceful_step 回退
+│   │       ├── perception.py               #     PerceptionHub 多流汇聚（各模态独立先验，禁均值，融合归内核）
+│   │       ├── expression_sink.py          #     ExpressionRouter：step_out 解析 + HeadPolicy 双通路分发
+│   │       ├── external_priors.py          #     external_priors 载荷构造 + M3/M6 fail-fast + 各模态推荐精度
+│   │       ├── protocols.py                #     Zero 协议结构化镜像（runtime_checkable，挂 path:line 证据）
+│   │       ├── channels/                   #     感知通道：physio(NeuroKit2) / audio(audeering w2v2) / vision(EmotiEffLib ONNX) / callable
+│   │       ├── mappers/                    #     表达映射：facs(12 AU→ARKit 52) / prosody(→SSML) / physiology（引擎无关）
+│   │       └── sinks/                      #     rendering.py：RenderingExpressionSink → RenderFrame（DUAL 含微表情泄漏帧）
+│   ├── memory/                     # 记忆层（骨架：编排层经 MemoryAPI Protocol 打桩，待实现）
+│   └── storage/                    # 存储层（骨架：Postgres / Neo4j / Redis，待建）
+├── mcp-server/                     # TS MCP 对外聚合层（@modelcontextprotocol/sdk，独立 package.json，暂未用）
+├── tests/                          # 995 用例：agents/mcp/orchestration/safety/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归）
+├── evals/                          # 53 条 agent 行为级 evals（感知/操控/停滞）
+├── ai-docs/                        # 知识库：模块三件套 + catalog + pitfalls（本地维护，不入库）
+├── notes/                          # 设计纪要 / 实测报告 / 工程实施记录（本地，不入库）
+├── .env.example                    # 配置模板（cp 为 .env 启用；所有能力 flag 默认关）
+├── pyproject.toml                  # 依赖与工具链（uv 装包；extras：gpu-cuda/gpu-dml/omniparser/physio/perception-audio/perception-vision）
+└── environment.yml                 # conda 环境声明（复用 D:\Zero 的 affective-expression，勿 prune）
 ```
 
 ## 开发
