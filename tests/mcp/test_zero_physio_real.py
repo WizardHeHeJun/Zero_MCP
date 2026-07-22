@@ -214,6 +214,102 @@ class TestEdaChannelPriorValidity:
 
 
 # ---------------------------------------------------------------------------
+# standardize 不变式守卫（路径回归防护）
+# ---------------------------------------------------------------------------
+
+
+class TestEdaChannelStandardizeInvariance:
+    """standardize 不变式守卫：全局增益 k 与基线偏移 c 不影响 SCR 幅度度量。
+
+    根因：`_process` 在 `nk.eda_phasic` 前做 `nk.standardize(eda)`（z-score）。
+    恒等式 standardize(k·x)==standardize(x)、standardize(x+c)==standardize(x) →
+    全局增益 k 与基线偏移 c 在进 eda_phasic 前被完全消除。
+    现场核验：amp(base*k)==amp(base)，Δ≈1e-16，k=2/5/10 全等。
+
+    这锁定「路径必经 standardize」的回归属性——若日后把 standardize 换成非尺度不变
+    预处理（如 min-max、除以固定常数），此断言立即失败。这**不是冗余测试**，勿删：
+    它同时纠正框架自述——percentile 适配的是 SCR 事件密度分布，非原始幅度。
+
+    使用 normalization="linear"（无状态、逐次确定），隔离 standardize 行为，
+    不受 percentile 历史/冷启动路径干扰。
+    """
+
+    async def test_gain_invariance_on_scr_amplitude(self) -> None:
+        """全局增益 k 不影响 μa：amp(base*k)==amp(base)，Δ<1e-10，k∈[1,2,5,10]。
+
+        现场核验：amp(base*k)==amp(base)，Δ≈1e-16（机器精度），k=2/5/10 全等。
+        断言阈值放宽到 1e-10 容忍 float 累积误差，但远低于任何有意义的幅度差异。
+        若断言失败，说明 _process 预处理不再经过 standardize（或引入了非尺度不变步骤），
+        须回查 _process 并更新 percentile 选型依据（幅度轴鲁棒性恢复后 I1b 可重新评估）。
+        """
+        rate = 4
+        duration = 60
+        scr_number = 5
+        base_sig = nk.eda_simulate(
+            duration=duration,
+            sampling_rate=rate,
+            scr_number=scr_number,
+            random_state=42,
+        )
+
+        # k=1.0 为基准
+        ch_base = EdaChannel(sampling_rate=rate, normalization="linear")
+        result_base = await ch_base.sense(signal={"eda": base_sig * 1.0, "sampling_rate": rate})
+        assert result_base is not None, "基准信号（k=1）未产出 ModalityPrior"
+        mu_a_base = result_base.mu[1]
+
+        for k in [2.0, 5.0, 10.0]:
+            ch_k = EdaChannel(sampling_rate=rate, normalization="linear")
+            result_k = await ch_k.sense(signal={"eda": base_sig * k, "sampling_rate": rate})
+            assert result_k is not None, f"k={k} 信号未产出 ModalityPrior"
+            mu_a_k = result_k.mu[1]
+            delta = abs(mu_a_k - mu_a_base)
+            assert delta < 1e-10, (
+                f"[standardize 增益不变式] k={k} 时 μa={mu_a_k:.15f}，"
+                f"基准 μa={mu_a_base:.15f}，Δ={delta:.2e}（期望 <1e-10）。"
+                "说明 _process 不再经过 nk.standardize 或引入了非尺度不变预处理，"
+                "须回查 _process；percentile 的 SCR 事件密度适配假设也需重新评估。"
+            )
+
+    async def test_baseline_offset_invariance_on_scr_amplitude(self) -> None:
+        """基线偏移 c 不影响 μa：amp(base+c)==amp(base)，Δ<1e-10，c∈[0,1,5,10]。
+
+        z-score standardize 满足 standardize(x+c)==standardize(x)（平移不变），
+        故基线漂移（传感器零点偏置/姿势漂移等）在 standardize 后被完全消除。
+        现场核验：amp(base+c)==amp(base)，Δ≈1e-16，c=1/5/10 全等。
+        断言阈值同增益测试（1e-10），理由同上。
+        """
+        rate = 4
+        duration = 60
+        scr_number = 5
+        base_sig = nk.eda_simulate(
+            duration=duration,
+            sampling_rate=rate,
+            scr_number=scr_number,
+            random_state=42,
+        )
+
+        # c=0.0 为基准
+        ch_base = EdaChannel(sampling_rate=rate, normalization="linear")
+        result_base = await ch_base.sense(signal={"eda": base_sig + 0.0, "sampling_rate": rate})
+        assert result_base is not None, "基准信号（c=0）未产出 ModalityPrior"
+        mu_a_base = result_base.mu[1]
+
+        for c in [1.0, 5.0, 10.0]:
+            ch_c = EdaChannel(sampling_rate=rate, normalization="linear")
+            result_c = await ch_c.sense(signal={"eda": base_sig + c, "sampling_rate": rate})
+            assert result_c is not None, f"c={c} 信号未产出 ModalityPrior"
+            mu_a_c = result_c.mu[1]
+            delta = abs(mu_a_c - mu_a_base)
+            assert delta < 1e-10, (
+                f"[standardize 偏移不变式] c={c} 时 μa={mu_a_c:.15f}，"
+                f"基准 μa={mu_a_base:.15f}，Δ={delta:.2e}（期望 <1e-10）。"
+                "说明 _process 不再经过 nk.standardize 或引入了非平移不变预处理，"
+                "须回查 _process；基线漂移鲁棒性假设需重新评估。"
+            )
+
+
+# ---------------------------------------------------------------------------
 # HRV 合法性核验（不要求判别力，验真路径不崩）
 # ---------------------------------------------------------------------------
 
@@ -405,7 +501,7 @@ class TestEdaChannelPercentileWarmupDiscriminability:
         暖机后喂 scr=9 与 scr=1，断言自适应路径的 μa 有显著差异。
         """
         rate = 4
-        cold_start = 20
+        cold_start = 20  # 刻意<window：不触恒退陷阱、缩短暖机；与产品默认40无关（验密度轴机制）
         # 暖机序列：轮转 scr={0,3,6,9}，共 cold_start+4 次，确保历史覆盖完整幅度区间
         warmup_scrs = [scr for i in range(cold_start + 4) for scr in [0, 3, 6, 9]][: cold_start + 4]
 
@@ -470,7 +566,7 @@ class TestEdaChannelPercentileCvxEDAWarmup:
     async def test_r1_cvxeda_warmed_up_discriminability(self) -> None:
         """R1-cvx：cvxEDA 路径暖机后 scr=9 vs scr=1 μa 有判别力。"""
         rate = 8  # >4Hz → cvxEDA 分支
-        cold_start = 20
+        cold_start = 20  # 刻意<window：不触恒退陷阱、缩短暖机；与产品默认40无关（验密度轴机制）
         warmup_scrs = [scr for i in range(cold_start + 4) for scr in [0, 3, 6, 9]][: cold_start + 4]
 
         # 两通道相同暖机序列（确定性→历史一致），分别喂高/低帧（W1：不复制私有历史）
@@ -516,44 +612,56 @@ class TestEdaChannelPercentileCvxEDAWarmup:
 class TestEdaChannelPercentileCrossSubjectRobustness:
     """percentile 归一化跨被试鲁棒性验证（R2）。
 
-    核心命题：EDA 幅度跨被试差异 10–100×，percentile 自适应把不同绝对尺度的被试
-    拉到可比标度；linear 在两被试间同帧读数差距明显更大。
+    核心命题（修正）：跨被试轴 = **SCR 事件密度**（scr_number），非幅度增益。
+    因 per-call standardize（z-score）已消除全局幅度差与基线偏移（现场核验
+    amp(base·k)==amp(base)，Δ≈1e-16），合成信号下唯一存活的跨被试轴是密度差异。
+    percentile 自适应把不同密度分布的被试拉到可比标度；linear 在两被试间密度差距
+    明显更大。
 
     实验设计：
-    - 被试 A（高响应者）：暖机序列 scr 档偏高（如 {4,6,9} 轮转），高 SCR 幅度绝对值大。
-    - 被试 B（低响应者）：暖机序列 scr 档偏低（如 {0,1,2} 轮转），低 SCR 幅度绝对值小。
-    - 各自喂相同相对起伏的"高档帧"（scr=9 / scr=3）作为测试帧。
-    - percentile 下两者「高档帧」μa 应接近（自适应拉平尺度）。
-    - linear 下两者同帧 μa 差异应明显大于 percentile（证明 adaptive 改善跨被试可比性）。
+    - 被试 A（高密度响应者）：暖机序列 scr 档偏高（{4,6,9} 轮转），历史密度大。
+    - 被试 B（低密度响应者）：暖机序列 scr 档偏低（{0,1,2} 轮转），历史密度小。
+    - 各自喂各自"高档"密度帧（A:scr=9 / B:scr=3），对各被试而言都是高唤醒。
+    - percentile 下两者「高档帧」μa 应接近（自适应按各自密度分布归一化）。
+    - linear 下两者同帧密度差距应明显大于 percentile（证明 adaptive 改善跨被试可比性）。
+
+    局限分类（I1a / I1b）：
+    - I1a（密度轴跨被试自适应）：R1+R2 已在合成信号闭合。
+    - I1b（全局幅度增益轴鲁棒性）：合成信号无法构造有意义对照——standardize 使输出
+      精确相等（见 TestEdaChannelStandardizeInvariance），**正式 defer 至真被试数据**
+      （见重校协议 notes/2026-07-21-eda-percentile-recalibration-protocol.md）。
 
     使用 rate=4（highpass 分支），不依赖 cvxopt。
     """
 
     async def test_r2_cross_subject_robustness(self) -> None:
-        """R2：percentile 自适应缩小跨被试高档帧 μa 差异；linear 差异明显更大。
+        """R2：percentile 自适应缩小跨被试高档帧密度差；linear 密度差明显更大。
 
-        A（高响应）与 B（低响应）各自喂自己的暖机序列后，分别喂各自的"高档帧"，
+        A（高密度）与 B（低密度）各自喂自己的暖机序列后，分别喂各自的"高档帧"，
         断言：
           |μa_A_pct - μa_B_pct| < |μa_A_lin - μa_B_lin| - margin
         即 percentile 下的跨被试差异比 linear 至少小 margin（默认 0.1）。
 
         打印实测数值供人工复查；若两者差异相近则说明未真自适应，回报 algo-lead。
 
-        ⚠ I1 局限：合成信号下 scr=9 vs scr=3 本身绝对幅度就不同，linear 的 diff 部分来自信号
-        量级差被 percentile 压缩，非纯归一化的跨被试自适应效果——本 eval 配合 R1 能抓「退化/
-        尺度不变」实现，但不能区分「真 Lykken range correction」与「信号量级差被压缩」。真被试
-        数据接入后须重新核验。
+        局限（I1a/I1b 分类）：
+        - I1a（密度轴跨被试自适应）：R1+R2 已在合成信号闭合——A/B 的密度分布差异
+          被 percentile 压缩，linear 差距更大，断言成立。
+        - I1b（全局幅度增益轴鲁棒性）：合成信号无法构造有意义对照（standardize 使
+          amp(base·k)==amp(base)，幅度轴输出精确相等，见 TestEdaChannelStandardizeInvariance），
+          **正式 defer 至真被试数据**；真数据须含 standardize 前原始信号 + 不同传感器
+          增益/波形形态对照组（见重校协议）。
         """
         rate = 4
-        cold_start = 20
+        cold_start = 20  # 刻意<window：不触恒退陷阱、缩短暖机；与产品默认40无关（验密度轴机制）
         duration = 60
 
-        # ---- 被试 A（高响应者）：暖机序列 scr∈{4,6,9} ----
+        # ---- 被试 A（高密度响应者）：暖机序列 scr∈{4,6,9} ----
         warmup_a = [scr for i in range(cold_start + 4) for scr in [4, 6, 9]][: cold_start + 4]
-        # ---- 被试 B（低响应者）：暖机序列 scr∈{0,1,2} ----
+        # ---- 被试 B（低密度响应者）：暖机序列 scr∈{0,1,2} ----
         warmup_b = [scr for i in range(cold_start + 4) for scr in [0, 1, 2]][: cold_start + 4]
 
-        # percentile 通道：A 与 B 各自暖机
+        # percentile 通道：A 与 B 各自暖机（按各自密度分布建立历史）
         ch_a_pct = EdaChannel(
             sampling_rate=rate,
             normalization="percentile",
@@ -569,8 +677,7 @@ class TestEdaChannelPercentileCrossSubjectRobustness:
         await _warmup_channel(ch_a_pct, warmup_a, rate=rate, duration=duration)
         await _warmup_channel(ch_b_pct, warmup_b, rate=rate, duration=duration)
 
-        # 测试帧：A 喂 scr=9（高档相对其响应范围），B 喂 scr=3（高档相对其响应范围）
-        # 选择对各被试而言都是"高唤醒"的信号档——A 的 scr=9 对应高响应，B 的 scr=3 也是高响应
+        # 测试帧：A 喂 scr=9（高密度档），B 喂 scr=3（高密度档相对其历史范围）
         sig_a_high = nk.eda_simulate(
             duration=duration, sampling_rate=rate, scr_number=9, random_state=100
         )
@@ -601,20 +708,23 @@ class TestEdaChannelPercentileCrossSubjectRobustness:
 
         print(
             f"\n[R2 跨被试鲁棒性 | rate={rate}Hz highpass]\n"
-            f"  被试 A（高响应）暖机 scr∈{{4,6,9}}，测试帧 scr=9\n"
-            f"  被试 B（低响应）暖机 scr∈{{0,1,2}}，测试帧 scr=3\n"
+            f"  被试 A（高密度）暖机 scr∈{{4,6,9}}，测试帧 scr=9\n"
+            f"  被试 B（低密度）暖机 scr∈{{0,1,2}}，测试帧 scr=3\n"
             f"  percentile:  μa_A={mu_a_A_pct:+.4f}, μa_B={mu_a_B_pct:+.4f}, "
             f"|差|={diff_pct:.4f}\n"
             f"  linear:      μa_A={mu_a_A_lin:+.4f}, μa_B={mu_a_B_lin:+.4f}, "
             f"|差|={diff_lin:.4f}\n"
             f"  diff_lin - diff_pct = {diff_lin - diff_pct:.4f}（>0 表示 adaptive 改善）"
         )
+        print(
+            "[R2 语义] 跨被试轴=SCR事件密度；幅度轴已被 per-call standardize 消除，需真数据闭合 I1b"
+        )
 
         # 合法性断言（恒成立）
         assert -1.0 <= mu_a_A_pct <= 1.0, f"A percentile μa={mu_a_A_pct} 超出 [-1,1]"
         assert -1.0 <= mu_a_B_pct <= 1.0, f"B percentile μa={mu_a_B_pct} 超出 [-1,1]"
 
-        # 核心命题：percentile 跨被试差异 < linear 跨被试差异（自适应改善跨被试可比性）
+        # 核心命题：percentile 跨被试密度差 < linear 跨被试密度差（自适应改善跨被试可比性）
         # margin=0.1 容忍合成信号的量级噪声，但若两者差异相近（< margin）说明未真自适应
         margin = 0.1
         assert diff_pct < diff_lin - margin, (

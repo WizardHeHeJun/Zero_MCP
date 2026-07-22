@@ -17,6 +17,12 @@ percentile 归一化选型依据（文献门）：
   被试自身近期幅度的滚动分位做归一化才跨被试可比（Lykken range correction 思想）。
 - [Matesanz 2024 (DOI:10.3390/math12020202)]
   在线自适应归一化在生理多模态信号中优于固定尺度归一化，支撑滚动历史分位方案。
+
+⚠ 精度限定：`_process` 逐次 `nk.standardize`（z-score）在进 eda_phasic 前已消除全局幅度差
+与基线偏移（现场核验 amp(base·k)==amp(base)，Δ≈1e-16，k=2/5/10 全等）；故 percentile 在
+标准化后适配的是「SCR 事件密度」的分布，非原始幅度。Mõttus 的「跨被试幅度差 10–100×」属
+standardize 前的原始信号层；幅度轴的完整 Lykken range-correction 意义需真被试数据验证
+（见重校协议 notes/2026-07-21-eda-percentile-recalibration-protocol.md）。
 """
 
 from __future__ import annotations
@@ -103,6 +109,8 @@ class EdaChannel:
     - [Mõttus 2024 (DOI:10.5772/intechopen.1007760)] 跨被试 EDA 幅度差 10–100×，
       被试自身滚动分位归一化才跨被试可比。
     - [Matesanz 2024 (DOI:10.3390/math12020202)] 在线自适应归一化优于固定尺度归一化。
+    ⚠ 精度限定：per-call standardize 已消除全局幅度差；percentile 适配的是「SCR 事件密度」
+    分布而非原始幅度（详见模块 docstring 精度限定段）。
 
     Args:
         sampling_rate:        默认采样率 Hz（构造时传入；信号 dict 可覆盖）。默认 4Hz。
@@ -110,10 +118,23 @@ class EdaChannel:
         signal_source:        async callable → dict | None；PerceptionHub 无参调 sense()
                               时由此获取信号；测试可直接向 sense(signal=...) 传 dict 绕过。
         percentile_window:    滚动历史最大长度（工程假设，接真被试数据再校）。默认 60。
+                              单位=样本数；4Hz=15s（落文献 5–20s 区间），8Hz=7.5s，
+                              256Hz=0.23s（崩）。高采样率接入时应按秒换算覆盖此参数；
+                              「按秒参数化(window_seconds×sampling_rate)」列为真数据到位
+                              后的重构 TODO。
         percentile_cold_start: 未达此样本数时走冷启动回退（工程假设，接真被试数据再校）。
-                              默认 20（4Hz 下约需累积 20 帧感知才暖机；每帧越短暖机越慢）。
+                              默认 40（4Hz 下约 10s，落 Matesanz 5–20s 区间；折中安全下界）。
+                              依据：Lahlou 2022 [PMC9197539] N<20 时 P5/P95 尾分位不可靠
+                              （90%CI 需≥175）；Oliveira 2019 [PMC6294150] 偏态数据尾分位
+                              建议≥120–300 样本；此处 40 仍工程假设，真数据再校。
+                              ⚠ percentile 适配的是 SCR 事件密度历史（非原始幅度，
+                              standardize 已消幅度差）。
+                              ⚠ 须 < percentile_window，否则 deque(maxlen=window) 永达不到
+                              阈值、**静默恒退 linear**（扫描实证 cold_start=80/window=60→Δ=0）。
         percentile_range:     分位范围 (q_low, q_high)（工程假设，接真被试数据再校）。
-                              默认 (5, 95)。
+                              默认 (5, 95)。P5/P95 Winsorization 有文献背书、优于 min/max
+                              （Lykken 原典 min/max 对伪迹不鲁棒）；样本量不足时可退 (10,90)，
+                              与 cold_start 联动调整。
     """
 
     name: str = "eda/sc"
@@ -124,7 +145,7 @@ class EdaChannel:
         normalization: Literal["linear", "percentile"] = "linear",
         signal_source: Any | None = None,
         percentile_window: int = 60,
-        percentile_cold_start: int = 20,
+        percentile_cold_start: int = 40,
         percentile_range: tuple[int, int] = (5, 95),
     ) -> None:
         self.sampling_rate = sampling_rate
