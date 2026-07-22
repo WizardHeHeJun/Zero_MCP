@@ -754,3 +754,47 @@ class TestEdaChannelConcurrencySafety:
         assert len(ch._amplitude_history["highpass"]) == window, (
             f"并发 append 后 highpass 桶长={len(ch._amplitude_history['highpass'])}，应 == {window}"
         )
+
+
+# ---------------------------------------------------------------------------
+# NaN 守卫 —— scr_amplitude/rmssd 非有限值 → sense() 返回 None（无有效证据）
+# ---------------------------------------------------------------------------
+
+
+class TestPhysioChannelNaNGuard:
+    """退化/坏信号致度量为 NaN 时通道返回 None（对齐「无证据本轮跳过」契约）——不产出 NaN
+    先验、不污染 percentile 历史。守卫置于 linear/percentile 分支之前，两分支共用。"""
+
+    async def test_eda_nan_amplitude_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EDA_Phasic 全 NaN → abs().mean()=NaN → sense() 返回 None（linear 分支）。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = EdaChannel(sampling_rate=8)
+        nk = _make_nk_mock()
+        nk.eda_phasic.return_value = pd.DataFrame({"EDA_Phasic": [float("nan")] * 10})
+        with patch.dict("sys.modules", {"neurokit2": nk}):
+            result = await ch.sense(signal=_make_eda_signal(rate=8))
+        assert result is None
+
+    async def test_eda_nan_amplitude_percentile_returns_none_and_history_clean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """percentile 分支下 NaN 幅度 → None，且不进滚动历史（守卫在 append 之前 return）。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = EdaChannel(sampling_rate=8, normalization="percentile", percentile_cold_start=3)
+        nk = _make_nk_mock()
+        nk.eda_phasic.return_value = pd.DataFrame({"EDA_Phasic": [float("nan")] * 10})
+        with patch.dict("sys.modules", {"neurokit2": nk}):
+            result = await ch.sense(signal=_make_eda_signal(rate=8))
+        assert result is None
+        assert len(ch._amplitude_history["cvxEDA"]) == 0, "NaN 不应进 cvxEDA 历史桶"
+        assert len(ch._amplitude_history["highpass"]) == 0, "NaN 不应进 highpass 历史桶"
+
+    async def test_hrv_nan_rmssd_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """HRV_RMSSD=NaN（R 峰不足）→ sense() 返回 None。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = HrvChannel(sampling_rate=256)
+        nk = _make_nk_mock()
+        nk.hrv_time.return_value = pd.DataFrame({"HRV_RMSSD": [float("nan")]})
+        with patch.dict("sys.modules", {"neurokit2": nk}):
+            result = await ch.sense(signal=_make_ecg_signal(rate=256))
+        assert result is None

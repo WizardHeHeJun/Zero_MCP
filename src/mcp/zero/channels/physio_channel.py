@@ -262,6 +262,14 @@ class EdaChannel:
         # gap-3 工程假设：ref 随分解方法（cvxEDA phasic 量级远大于 highpass，各用各的校准 ref，
         # 否则 cvxEDA 会饱和丢分级）。均为工程假设初值，集成测试再校。
         scr_amplitude = float(phasic_df["EDA_Phasic"].abs().mean())
+        # NaN 守卫（置于 linear/percentile 分支之前，两分支共用）：phasic 全 NaN（退化/坏信号）→
+        # abs().mean()=NaN，会穿透 min/max 钳制产出 NaN 先验；percentile 的退化守卫
+        # `p_high-p_low<eps` 也因 NaN 比较恒 False 而被跳过，且 NaN 会污染滚动历史。NaN=**无有效
+        # 证据** → 返回 None（对齐通道「本轮无证据则跳过」契约，非 -1 假称低唤醒；此处 return 亦阻止
+        # NaN 进 _amplitude_history）。
+        if not np.isfinite(scr_amplitude):
+            logger.warning("EdaChannel: SCR 幅度非有限值（NaN/inf，退化信号），本轮跳过")
+            return None
         ref = _SCR_REF_AMPLITUDE_CVXEDA if method == "cvxEDA" else _SCR_REF_AMPLITUDE
 
         if self.normalization == "linear":
@@ -412,6 +420,11 @@ class HrvChannel:
             raise RuntimeError(f"hrv_time 输出缺少 'HRV_RMSSD' 列，实际列: {list(hrv_df.columns)}")
 
         rmssd_ms = float(hrv_df["HRV_RMSSD"].iloc[0])
+        # NaN 守卫：R 峰不足/坏 ECG → RMSSD 可能 NaN，会穿透归一化产出 NaN 先验。
+        # NaN=无有效证据 → 返回 None（对齐通道「本轮无证据则跳过」契约）。
+        if not np.isfinite(rmssd_ms):
+            logger.warning("HrvChannel: RMSSD 非有限值（NaN/inf，R 峰不足/坏信号），本轮跳过")
+            return None
 
         # RMSSD 高 = 副交感优势 = arousal 低；取反后归一化到 [-1,1]。
         # RMSSD>_RMSSD_REF_MS（极度放松）时 inverted 钉底 → μa=-1，方向正确：
