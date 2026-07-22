@@ -28,12 +28,15 @@ logger = logging.getLogger(__name__)
 
 
 def _lerp(bounds: tuple[float, float], t: float) -> float:
-    """线性插值：lo + (hi-lo)*t。
+    """线性插值：lo + (hi-lo)*clip(t,0,1)。
 
-    t 期望在 [0,1] 内（由调用方依量纲契约保证），此处不额外 clamp。
+    t 期望在 [0,1]（量纲契约保证）；**防御性 clamp 到 [0,1]**——Zero 回执建议（对未来非 sigmoid
+    注入的 normalized 模型稳健；Zero 现役 ProsodyDecoder 末端 sigmoid 本已 ∈(0,1)、其侧同步在打
+    tag 处加 bounds 断言，双保险）。见 notes/2026-07-22-zero-link-t4t5t6-*.md。
     """
     lo, hi = bounds
-    return lo + (hi - lo) * t
+    t_clamped = min(max(t, 0.0), 1.0)
+    return lo + (hi - lo) * t_clamped
 
 
 # ---------------------------------------------------------------------------

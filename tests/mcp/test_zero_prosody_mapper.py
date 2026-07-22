@@ -512,3 +512,35 @@ class TestProsodyParamsImmutabilityAndValidation:
     def test_model_config_extra_forbid(self) -> None:
         """ProsodyParams.model_config extra="forbid"。"""
         assert ProsodyParams.model_config.get("extra") == "forbid"
+
+
+# ---------------------------------------------------------------------------
+# 9. T4 防御性 clamp（Zero 回执建议）：_lerp 把 t clamp 到 [0,1]，越界不外插
+# ---------------------------------------------------------------------------
+
+
+class TestLerpDefensiveClamp:
+    """_lerp 把 t clamp 到 [0,1]——normalized 值越界时不线性外插（Zero 回执 T4 建议的防御，
+    对未来非 sigmoid 注入模型稳健；见 notes/2026-07-22-zero-link-t4t5t6-*.md）。"""
+
+    def test_lerp_t_in_range_unchanged(self) -> None:
+        """t∈[0,1] 行为不变（零回归）。"""
+        from src.mcp.zero.mappers.prosody import _lerp
+
+        assert _lerp((0.5, 1.5), 0.0) == pytest.approx(0.5)
+        assert _lerp((0.5, 1.5), 0.5) == pytest.approx(1.0)
+        assert _lerp((0.5, 1.5), 1.0) == pytest.approx(1.5)
+
+    def test_lerp_t_above_one_clamped_to_hi(self) -> None:
+        """t>1 → clamp 到 1.0（取 hi，不外插超过上界）。"""
+        from src.mcp.zero.mappers.prosody import _lerp
+
+        assert _lerp((0.5, 1.5), 1.5) == pytest.approx(1.5)  # 非 0.5+1.0*1.5=2.0
+        assert _lerp((-4.0, 4.0), 2.0) == pytest.approx(4.0)
+
+    def test_lerp_t_below_zero_clamped_to_lo(self) -> None:
+        """t<0 → clamp 到 0.0（取 lo，不外插低于下界）。"""
+        from src.mcp.zero.mappers.prosody import _lerp
+
+        assert _lerp((0.5, 1.5), -0.5) == pytest.approx(0.5)  # 非 0.5+1.0*(-0.5)=0.0
+        assert _lerp((-4.0, 4.0), -2.0) == pytest.approx(-4.0)
