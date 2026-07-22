@@ -141,6 +141,9 @@ class TestZeroClientE2E:
             assert len(bundle4.valence_arousal) == 2
 
             # 6. 未知 session_id → server ToolError → ZeroLinkCallError（tool 字段正确）
+            # 注：Zero server T6·② 接线后 step 会返回带 `unknown-session:` 机读前缀的 ToolError，
+            # 本仓据此抛 ZeroLinkUnknownSessionError（ZeroLinkCallError 子类）——故此断言对新旧 Zero
+            # 均成立。待 Zero 侧提交该接线后，可收窄为 pytest.raises(ZeroLinkUnknownSessionError)。
             with pytest.raises(ZeroLinkCallError) as exc_info:
                 await client.step("bogus-sid-xyz", AffectStimulus(valence=0.0, arousal=0.0))
             assert exc_info.value.tool == "zero.step"

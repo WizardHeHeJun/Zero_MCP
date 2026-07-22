@@ -34,9 +34,11 @@ from src.mcp.zero.client import (
     ZeroLinkClient,
     ZeroLinkConnectionError,
     ZeroLinkDisabledError,
+    ZeroLinkUnknownSessionError,
     _build_http_client,
     _build_transport_params,
     _is_enabled,
+    _is_unknown_session_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -549,3 +551,108 @@ async def test_step_stim_includes_coping_when_set(monkeypatch: pytest.MonkeyPatc
 
     _tool, arguments = mock_session.call_tool.call_args.args
     assert arguments["stim"]["coping_potential"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task 5.18 unknown-session 机读标记（zero-link T6·②）
+#
+# Zero step 命中未知/过期 session_id → ToolError 文本以机读前缀 "unknown-session:" 打头
+# （Zero server `_UNKNOWN_SESSION_MARKER`）。本仓据此前缀抛更精确的 ZeroLinkUnknownSessionError
+# 子类，供上层区分「可 resume 续会话」态。判别性重点：**只认前缀**，不误判 Zero 的其它含
+# "session_id" 中文错误（如 open_session 的 config 校验）→ 证明是机读标记而非脆弱文本匹配。
+# ---------------------------------------------------------------------------
+
+# Zero server 真实抛出的 unknown-session 文本（逐字对齐 server.py step 分支，session_id='sid-1'）。
+# ⚠ 冒号后中文仅供可读性——判定只看机读前缀 `unknown-session:`，Zero 若改中文措辞不影响本仓判定。
+_ZERO_UNKNOWN_SESSION_TEXT = (
+    "unknown-session: 未知 session_id='sid-1'；请先调 zero.open_session（可用同 id resume 续会话）"
+)
+
+
+def test_is_unknown_session_text_matches_zero_marker() -> None:
+    """机读前缀命中：Zero 真实 unknown-session 文本 + 前导空白包裹变体 → True。"""
+    assert _is_unknown_session_text(_ZERO_UNKNOWN_SESSION_TEXT) is True
+    # 容忍未来包裹换行/缩进（lstrip 后仍以前缀打头）
+    assert _is_unknown_session_text("\n  unknown-session: 未知 session_id='x'") is True
+
+
+def test_is_unknown_session_text_rejects_non_marker() -> None:
+    """判别性：非 unknown-session 消息一律 False，避免误判。
+
+    覆盖三类易误判：(a) 通用错误；(b) Zero 其它含「session_id」的中文错误（open_session
+    的 config 校验，不该被当成 unknown-session）；(c) marker 出现在**中间**而非前缀。
+    """
+    assert _is_unknown_session_text("boom") is False
+    assert _is_unknown_session_text("server 返回 isError=True") is False
+    # Zero open_session 的 config 校验错误——含 "session_id" 中文，但非 unknown-session
+    assert _is_unknown_session_text("session_id 须为非空字符串，实际为 ''") is False
+    # marker 只出现在中间（非前缀）→ 不算，防子串误判
+    assert _is_unknown_session_text("error: unknown-session happened downstream") is False
+
+
+async def test_step_unknown_session_raises_subclass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """step 命中 unknown-session isError → 抛 ZeroLinkUnknownSessionError，
+    且是 ZeroLinkCallError 子类、`.tool == 'zero.step'`（向后兼容 + 精确化）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkUnknownSessionError) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert isinstance(exc_info.value, ZeroLinkCallError)  # 子类关系（graceful_step 仍兜住）
+    assert exc_info.value.tool == "zero.step"
+
+
+async def test_step_generic_error_not_unknown_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判别性：普通 isError（非 marker）→ 抛基类，**不是** unknown-session 子类。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, "boom", is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkCallError) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+
+
+async def test_step_config_error_not_unknown_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判别性：含「session_id」中文的 Zero 其它错误（如 config 校验）不被误判为 unknown-session。
+
+    证明区分走机读前缀而非脆弱中文匹配——回执明言「靠字符串匹配脆弱」正是要规避的。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, "session_id 须为非空字符串，实际为 ''", is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkCallError) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+
+
+async def test_graceful_step_unknown_session_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """零回归：graceful_step 对 unknown-session 仍降级返回 None（子类被既有 catch 兜住）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    result = await client.graceful_step("sid-1", stimulus)
+
+    assert result is None
+
+
+async def test_unknown_session_only_for_step_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判别性（code-review W1）：unknown-session 子类语义**只对 zero.step 成立**。
+
+    open_session 即便返回带机读前缀的 isError（未来 Zero 内部路由变化的假想场景），也只抛基类
+    ZeroLinkCallError，不误升级为 ZeroLinkUnknownSessionError——保子类语义与触发路径严格对齐。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
+
+    with pytest.raises(ZeroLinkCallError) as exc_info:
+        await client._call_tool("zero.open_session", {})
+
+    assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+    assert exc_info.value.tool == "zero.open_session"

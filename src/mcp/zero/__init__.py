@@ -11,7 +11,7 @@
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 - external_priors 接线（Q3，EXTERNAL_PRIOR_SCHEMA_VERSION / build_external_priors_override）
-- Zero MCP Client（Task 1-4，ZeroLinkClient + 三个自定义异常）
+- Zero MCP Client（Task 1-4，ZeroLinkClient + 四个自定义异常，含 unknown-session 机读判定）
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ from src.mcp.zero.client import (
     ZeroLinkClient,
     ZeroLinkConnectionError,
     ZeroLinkDisabledError,
+    ZeroLinkUnknownSessionError,
 )
 
 # -- 表达消费通路 -------------------------------------------------------------
@@ -161,4 +162,5 @@ __all__ = [
     "ZeroLinkDisabledError",
     "ZeroLinkConnectionError",
     "ZeroLinkCallError",
+    "ZeroLinkUnknownSessionError",
 ]

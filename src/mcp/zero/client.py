@@ -38,6 +38,13 @@ from src.mcp.zero.external_priors import build_external_priors_override
 
 logger = logging.getLogger(__name__)
 
+# Zero 侧 unknown-session **机读标记**（zero-link T6·②）：与 Zero server
+# `src/mcp_server/server.py::_UNKNOWN_SESSION_MARKER` 逐字对齐。step 命中未知/过期 session_id
+# 时，Zero 抛的 ToolError 文本以此前缀打头（`f"{_UNKNOWN_SESSION_MARKER}: 未知 session_id=…"`）。
+# 用机读前缀而非中文文本判定 → 抗 Zero 侧文案漂移（回执明言「靠字符串匹配脆弱」）；
+# 两仓须同步改本常量，漂移由 `tests/mcp/test_zero_contract_crosscheck.py` 跨仓回归拦截。
+_UNKNOWN_SESSION_MARKER = "unknown-session"
+
 # ── 自定义异常 ─────────────────────────────────────────────────────────────────
 
 
@@ -65,6 +72,18 @@ class ZeroLinkCallError(RuntimeError):
     def __init__(self, tool: str, message: str) -> None:
         super().__init__(f"[{tool}] {message}")
         self.tool = tool
+
+
+class ZeroLinkUnknownSessionError(ZeroLinkCallError):
+    """step 命中 Zero 侧**未知/过期 session_id**（server 重启或会话已 close）。
+
+    是 `ZeroLinkCallError` 子类（zero-link T6·②）：
+    - `graceful_step` 仍按既有分支降级返回 `None`（零回归），但日志显式区分为「可 resume 续会话」；
+    - 直接调 `step()` 的编排层可 **catch 本子类** → 用同 id `open_session(session_id=…)` 重开
+      续会话再重试（配合 Zero resume-by-id，T6·④），区别于连接失败/畸形响应（不可 resume）。
+
+    判定走机读前缀 `_UNKNOWN_SESSION_MARKER`（非中文文本），抗 Zero 侧文案漂移。
+    """
 
 
 # ── 内部辅助 ───────────────────────────────────────────────────────────────────
@@ -145,17 +164,34 @@ def _build_http_client(token: str) -> httpx.AsyncClient | None:
     return httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
 
 
+def _is_unknown_session_text(text: str) -> bool:
+    """按 Zero 侧机读前缀判定 unknown-session（zero-link T6·②）。
+
+    Zero 的 step ToolError 文本形如 ``"unknown-session: 未知 session_id=…"``——用**前缀**判定
+    而非「未知 session」等中文子串，抗 Zero 侧文案改动。容忍前导空白（防未来包裹换行/缩进）。
+    仅前缀命中才算，避免把恰好含 "unknown-session" 子串的其它消息误判（判别性）。
+    """
+    return text.lstrip().startswith(_UNKNOWN_SESSION_MARKER)
+
+
 def _extract_text(result: Any, tool_name: str) -> str:
     """从 CallToolResult 中提取文本内容。
 
-    result.isError=True 时抛 ZeroLinkCallError。
+    result.isError=True 时抛 ZeroLinkCallError；错误文本带 unknown-session 机读前缀时
+    抛更精确的 ZeroLinkUnknownSessionError 子类（zero-link T6·②，供上层 resume 判定）。
     content 为空或首元素无 text 属性时也抛错。
     """
     if result.isError:
         err_text = ""
         if result.content and isinstance(result.content[0], TextContent):
             err_text = result.content[0].text
-        raise ZeroLinkCallError(tool_name, err_text or "server 返回 isError=True")
+        message = err_text or "server 返回 isError=True"
+        # unknown-session 机读标记语义**只对 zero.step 成立**（会话不存在 → 可用同 id resume）；
+        # open/close_session 即便文本恰好带前缀也不升级为该子类，保子类语义与触发路径严格对齐
+        # （code-review W1）。工具名沿用调用处字面量口径（无常量层）。
+        if tool_name == "zero.step" and _is_unknown_session_text(err_text):
+            raise ZeroLinkUnknownSessionError(tool_name, message)
+        raise ZeroLinkCallError(tool_name, message)
 
     if not result.content:
         raise ZeroLinkCallError(tool_name, "server 返回空 content")
@@ -424,6 +460,8 @@ class ZeroLinkClient:
         - ZERO_LINK_ENABLED=false（未启用）。
         - session_id 为 None（会话未建立）。
         - ZeroLinkCallError / ZeroLinkConnectionError / McpError（连接/调用失败）。
+        - ZeroLinkUnknownSessionError（unknown-session 子类，session 未知/过期）：同降级返回 None，
+          但日志显式标明「可用同 id resume」，便于上层据此触发 resume（zero-link T6·②·④）。
 
         Args:
             session_id: Zero 会话 ID（None 时立即返回 None）。
@@ -444,6 +482,16 @@ class ZeroLinkClient:
             return None
         try:
             return await self.step(session_id, stimulus, priors)
+        except ZeroLinkUnknownSessionError:
+            # 机读标记命中 Zero 侧未知/过期 session（server 重启 / 会话已 close）：这是「可用同 id
+            # resume 重开续会话」的可恢复态，区别于连接/畸形失败。graceful 契约仍返回 None，
+            # 但日志显式区分（零回归），便于上层据此触发 resume（T6·②·④）而非当作不可恢复失败。
+            logger.warning(
+                "graceful_step 降级（session=%s）：Zero unknown-session（未知/过期）；"
+                "上层可用同 id resume 重开续会话。",
+                session_id,
+            )
+            return None
         except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
             logger.warning(
                 "graceful_step 降级（session=%s, exc=%s）：%s",

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -474,3 +475,54 @@ def _run_subprocess_with_script(script: str) -> dict[str, Any]:
             f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
         )
     return json.loads(result.stdout)  # type: ignore[no-any-return]
+
+
+# ---------------------------------------------------------------------------
+# T6·② unknown-session 机读标记跨仓一致性（防 marker 静默漂移）
+#
+# Zero server 与本仓 client 各自持有 `_UNKNOWN_SESSION_MARKER` 常量；step 命中未知/过期
+# session_id 时 Zero 用它作 ToolError 前缀，本仓 client 用它判定并抛 ZeroLinkUnknownSessionError。
+# 两侧任一改动而另一侧未跟 → unknown-session 判定静默失效（回执点名的「脆弱字符串匹配」风险的
+# 机读版）。此回归以正则从 Zero 源码直读该常量（不 import，避开 FastMCP/torch 重依赖），断言与
+# 本仓一致。D:\Zero 不在位 → skip。
+# ---------------------------------------------------------------------------
+
+# Zero server 定义 unknown-session marker 的源文件（相对 D:\Zero）
+_ZERO_SERVER_PY = _ZERO_SRC / "mcp_server" / "server.py"
+# 匹配 `_UNKNOWN_SESSION_MARKER = "unknown-session"`（单/双引号皆容）
+_MARKER_ASSIGN_RE = re.compile(
+    r"""^_UNKNOWN_SESSION_MARKER\s*=\s*["']([^"']+)["']""",
+    re.MULTILINE,
+)
+
+
+@pytest.mark.zerorepo
+class TestUnknownSessionMarkerCrosscheck:
+    """T6·② 跨仓 marker 一致性——本仓 client 与 Zero server 的 `_UNKNOWN_SESSION_MARKER` 相等。
+
+    D:\\Zero 或 server.py 不在位 → skip（不拖红）。
+    """
+
+    def test_unknown_session_marker_matches_zero(self) -> None:
+        """本仓 `_UNKNOWN_SESSION_MARKER` == Zero server 侧同名常量（正则直读源码，不 import）。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过 marker 跨仓断言")
+        if not _ZERO_SERVER_PY.is_file():
+            pytest.skip(f"Zero server.py 不存在（路径 {_ZERO_SERVER_PY}），跳过 marker 跨仓断言")
+
+        source = _ZERO_SERVER_PY.read_text(encoding="utf-8")
+        match = _MARKER_ASSIGN_RE.search(source)
+        if match is None:
+            pytest.skip(
+                f'Zero server.py 未找到 `_UNKNOWN_SESSION_MARKER = "..."` 定义'
+                f"（{_ZERO_SERVER_PY}）——可能 Zero 侧尚未接线或改了命名，跳过"
+            )
+
+        from src.mcp.zero.client import _UNKNOWN_SESSION_MARKER
+
+        zero_marker = match.group(1)
+        assert zero_marker == _UNKNOWN_SESSION_MARKER, (
+            f"T6·② unknown-session marker 跨仓漂移：Zero server="
+            f"{zero_marker!r}，本仓 client={_UNKNOWN_SESSION_MARKER!r}。"
+            "两仓须协调同步——否则 unknown-session 判定静默失效。"
+        )
