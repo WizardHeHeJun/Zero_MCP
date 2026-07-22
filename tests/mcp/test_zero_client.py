@@ -34,6 +34,7 @@ from src.mcp.zero.client import (
     ZeroLinkClient,
     ZeroLinkConnectionError,
     ZeroLinkDisabledError,
+    _build_http_client,
     _build_transport_params,
     _is_enabled,
 )
@@ -435,6 +436,26 @@ def test_build_transport_params_http_no_token(monkeypatch: pytest.MonkeyPatch) -
     endpoint, token = params
     assert endpoint == "http://localhost:9090/mcp"
     assert token == ""
+
+
+# ---------------------------------------------------------------------------
+# T5 HTTP 鉴权：_build_http_client 构造 Bearer 头（客户端侧已就绪，锁定行为）
+# ---------------------------------------------------------------------------
+
+
+async def test_build_http_client_sets_bearer_header() -> None:
+    """有 token → httpx.AsyncClient 预置 `Authorization: Bearer <token>`（RFC 6750）。"""
+    client = _build_http_client("test-token-abc")
+    assert client is not None
+    try:
+        assert client.headers["Authorization"] == "Bearer test-token-abc"
+    finally:
+        await client.aclose()
+
+
+def test_build_http_client_no_token_returns_none() -> None:
+    """无 token（空串）→ 返回 None（不鉴权，默认本地场景零回归）。"""
+    assert _build_http_client("") is None
 
 
 # ---------------------------------------------------------------------------

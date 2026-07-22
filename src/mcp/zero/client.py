@@ -131,6 +131,20 @@ def _build_transport_params() -> tuple[str, Any]:
     return ("http", (endpoint, token))
 
 
+def _build_http_client(token: str) -> httpx.AsyncClient | None:
+    """http 传输的鉴权客户端：有 token 则预置 ``Authorization: Bearer <token>`` 头的
+    ``httpx.AsyncClient``（新 SDK ``streamable_http_client`` 不直收 headers，须经 ``http_client``
+    注入）；无 token 返回 ``None``（不鉴权——默认 127.0.0.1 本地场景零回归）。
+
+    ⚠ Bearer 是标准方案（RFC 6750 ``Authorization: Bearer <token>``），与 Zero server 侧
+    对齐的只是**共享 token 值**（两侧 .env），格式无歧义。抽成独立函数以便单测 header 构造
+    （连接路径难在单测里跑，构造逻辑可）。
+    """
+    if not token:
+        return None
+    return httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
+
+
 def _extract_text(result: Any, tool_name: str) -> str:
     """从 CallToolResult 中提取文本内容。
 
@@ -214,11 +228,9 @@ class ZeroLinkClient:
                 # http 传输：streamable_http_client(url, *, http_client) yield 三元组。
                 # 新 API 不直接收 headers——Bearer token 经预置 httpx.AsyncClient 注入。
                 endpoint, token = transport_params
-                http_client: httpx.AsyncClient | None = None
-                if token:
-                    http_client = await stack.enter_async_context(
-                        httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
-                    )
+                http_client = _build_http_client(token)
+                if http_client is not None:
+                    await stack.enter_async_context(http_client)
                 read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                     streamable_http_client(endpoint, http_client=http_client)
                 )
