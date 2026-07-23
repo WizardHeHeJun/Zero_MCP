@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
+import secrets
 import sys
 import types
 from typing import Any
@@ -205,6 +207,16 @@ def _extract_text(result: Any, tool_name: str) -> str:
     return first.text
 
 
+def generate_session_id() -> str:
+    """生成**不可猜**的会话 id（zero-link T6·④），供调用方传给 `open_session(session_id=…)`。
+
+    session_id 既是 resume 键、也是**运行态访问凭据**（回执信任模型）——多用户/对外场景须配 T5
+    Bearer 鉴权，且 id **不可枚举**。用 `secrets.token_hex(16)`（128-bit CSPRNG，等价 uuid4 熵、
+    十六进制无歧义）而非序号/时间戳。单机单用户可直接用 Zero 默认 uuid4（不传 session_id）。
+    """
+    return secrets.token_hex(16)
+
+
 # ── 主类 ───────────────────────────────────────────────────────────────────────
 
 
@@ -305,6 +317,29 @@ class ZeroLinkClient:
                 f"Zero Link 连接失败（transport={transport_kind}）：{exc}",
                 stderr="",
             ) from exc
+        except asyncio.CancelledError as exc:
+            # streamable-http 传输在 HTTP 层被拒（如 T5 Bearer 401 鉴权失败）时，其内部 anyio task
+            # group 取消，向上抛 CancelledError——它是 **BaseException 非 Exception**，故上面
+            # `except Exception` 接不住会穿透。用 Task.cancelling() 区分：>0=本任务被**外部**取消
+            # （尊重取消语义、原样重抛）；==0=传输内部因连接被拒而取消 → 归**连接失败**
+            # （ZeroLinkConnectionError·连接层，符合回执「401 走连接层不走 graceful_step」）。
+            # aclose 在取消态可能再抛（含 anyio「exit cancel scope in different task」），尽力吞。
+            if self.exit_stack is None:
+                try:
+                    await stack.aclose()
+                except BaseException:  # noqa: BLE001 - 取消态清理尽力而为，二次异常不掩盖首因
+                    pass
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise
+            # from exc 保留原始 CancelledError 作 __cause__（供诊断非鉴权类的内部取消根因，
+            # code-review W2）——CancelledError 出现在 ZeroLinkConnectionError 链里是正常异常链。
+            raise ZeroLinkConnectionError(
+                f"Zero Link 连接被传输层取消（transport={transport_kind}）——"
+                "HTTP 可能为 401 鉴权失败或连接被拒；请核对 ZERO_HTTP_TOKEN 与 Zero "
+                "ZERO_MCP_HTTP_TOKEN 是否同值。",
+                stderr="",
+            ) from exc
 
         return self
 
@@ -358,17 +393,24 @@ class ZeroLinkClient:
         *,
         persona: str | None = None,
         config: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> str:
-        """在 Zero 侧创建一个新会话，返回 session_id。
+        """在 Zero 侧创建或 **resume** 一个会话，返回 session_id。
 
         生命周期失败须明确报错（不 graceful），上层须显式处理异常。
 
         Args:
             persona: 可选人格标识（传给 Zero zero.open_session 工具）。
             config:  可选配置字典（传给 Zero zero.open_session 工具）。
+            session_id: 可选会话 id（zero-link T6·④ resume-by-id）：传了 → Zero 以此 id 重开
+                （已活跃则幂等返回同 id；否则新建绑该 thread_id，运行态是否真续取决于 Zero
+                `ZERO_CHECKPOINT_BACKEND=sqlite`——memory 后端重开=全新会话、不报错）。不传 →
+                Zero 新铸 uuid4。⚠ SessionConfig 不进 checkpoint，resume 须**再供同一 config**。
+                ⚠ 信任模型：session_id = 运行态访问凭据；多用户须配 T5 鉴权 + 用
+                `generate_session_id()` 生成不可猜 id（勿用可枚举序号）。
 
         Returns:
-            Zero 分配的 session_id 字符串。
+            Zero 侧的 session_id 字符串（resume 时 == 传入的 session_id）。
 
         Raises:
             ZeroLinkCallError:      工具调用失败（server 返回 isError=True 或协议错误）。
@@ -379,15 +421,17 @@ class ZeroLinkClient:
             args["persona"] = persona
         if config is not None:
             args["config"] = config
+        if session_id is not None:
+            args["session_id"] = session_id
         text = await self._call_tool("zero.open_session", args)
         # 响应解析防御：畸形 JSON / 缺 session_id 键统一封装为 ZeroLinkCallError，
         # 不让原始 JSONDecodeError/KeyError 穿透异常封装边界（调用方只预期 ZeroLink* 异常）。
         try:
             data: dict[str, Any] = json.loads(text)
-            session_id: str = data["session_id"]
+            returned_id: str = data["session_id"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ZeroLinkCallError("zero.open_session", f"响应格式非预期：{exc}") from exc
-        return session_id
+        return returned_id
 
     async def step(
         self,
@@ -452,6 +496,8 @@ class ZeroLinkClient:
         session_id: str | None,
         stimulus: AffectStimulus,
         priors: list[ModalityPrior] | None = None,
+        *,
+        resume_config: dict[str, Any] | None = None,
     ) -> ExpressionBundle | None:
         """容错版单步调用，供编排层在「非关键路径」降级使用。
 
@@ -460,13 +506,20 @@ class ZeroLinkClient:
         - ZERO_LINK_ENABLED=false（未启用）。
         - session_id 为 None（会话未建立）。
         - ZeroLinkCallError / ZeroLinkConnectionError / McpError（连接/调用失败）。
-        - ZeroLinkUnknownSessionError（unknown-session 子类，session 未知/过期）：同降级返回 None，
-          但日志显式标明「可用同 id resume」，便于上层据此触发 resume（zero-link T6·②·④）。
+
+        **unknown-session resume 重试（zero-link T6·④）**：step 命中 Zero 侧未知/过期 session
+        （`ZeroLinkUnknownSessionError`，server 重启 / 会话已 close）时，用**同一 session_id 重开
+        （+再供 `resume_config`）后重试一次 step**——Zero `ZERO_CHECKPOINT_BACKEND=sqlite` 时按
+        thread_id 自动续运行态，memory 后端则重开=全新会话（不报错）。重开或重试再失败 → 降级 None
+        （只重试一次、不递归）。⚠ SessionConfig 不进 checkpoint，未供 `resume_config` 则 resume 会话
+        走 Zero env 默认门控（非原会话 config）；须续原门控时调用方应传原 config。
 
         Args:
-            session_id: Zero 会话 ID（None 时立即返回 None）。
-            stimulus:   情感刺激。
-            priors:     可选多模态先验列表。
+            session_id:    Zero 会话 ID（None 时立即返回 None）。
+            stimulus:      情感刺激。
+            priors:        可选多模态先验列表。
+            resume_config: unknown-session resume 重开时**再供的会话 config**（应与原 open_session
+                           一致）；None → resume 会话走 Zero env 默认门控。
 
         Returns:
             ExpressionBundle 或 None（降级时）。
@@ -483,15 +536,26 @@ class ZeroLinkClient:
         try:
             return await self.step(session_id, stimulus, priors)
         except ZeroLinkUnknownSessionError:
-            # 机读标记命中 Zero 侧未知/过期 session（server 重启 / 会话已 close）：这是「可用同 id
-            # resume 重开续会话」的可恢复态，区别于连接/畸形失败。graceful 契约仍返回 None，
-            # 但日志显式区分（零回归），便于上层据此触发 resume（T6·②·④）而非当作不可恢复失败。
+            # 机读标记命中 Zero 侧未知/过期 session（server 重启 / 会话已 close）：据 Zero 回执
+            # （T6·④）用**同一 session_id 重开(+再供 config)后重试一次** step。重试的 step 若再抛
+            # ZeroLinkUnknownSessionError（是 ZeroLinkCallError 子类）会被**内层** except
+            # (ZeroLinkCallError, …) 兜住 → None，故不递归、至多重试一次。
             logger.warning(
-                "graceful_step 降级（session=%s）：Zero unknown-session（未知/过期）；"
-                "上层可用同 id resume 重开续会话。",
+                "graceful_step: session=%s 未知/过期（Zero unknown-session）；"
+                "用同 id resume 重开续会话并重试一次。",
                 session_id,
             )
-            return None
+            try:
+                await self.open_session(session_id=session_id, config=resume_config)
+                return await self.step(session_id, stimulus, priors)
+            except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
+                logger.warning(
+                    "graceful_step: session=%s resume 重试仍失败（exc=%s）：%s；降级 None。",
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
         except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
             logger.warning(
                 "graceful_step 降级（session=%s, exc=%s）：%s",

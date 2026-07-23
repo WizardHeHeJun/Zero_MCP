@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -39,6 +40,7 @@ from src.mcp.zero.client import (
     _build_transport_params,
     _is_enabled,
     _is_unknown_session_text,
+    generate_session_id,
 )
 
 # ---------------------------------------------------------------------------
@@ -631,15 +633,33 @@ async def test_step_config_error_not_unknown_session(monkeypatch: pytest.MonkeyP
     assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
 
 
-async def test_graceful_step_unknown_session_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """零回归：graceful_step 对 unknown-session 仍降级返回 None（子类被既有 catch 兜住）。"""
+async def test_graceful_step_resume_retry_unknown_again_no_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不递归守卫（code-review W4）：resume 后重试 step **再次** unknown-session → 降级 None。
+
+    序列：step(unknown-session) → open_session(ok) → step(unknown-session 再现)。重试的 step 抛的
+    ZeroLinkUnknownSessionError 是 ZeroLinkCallError 子类 → 被内层 except (ZeroLinkCallError,…) 兜住
+    → None，**不再触发第二次 resume**（至多重试一次）。断言 call_count==3 锁定不递归。
+    """
     client, mock_session = _build_client_with_session(monkeypatch)
-    _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(json.dumps({"session_id": "sid-1"})),
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+    ]
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)
 
     result = await client.graceful_step("sid-1", stimulus)
 
     assert result is None
+    # step → open_session → step，恰好三次；不因第二次 unknown-session 再 resume（不递归）
+    assert mock_session.call_tool.call_count == 3
+    assert [c.args[0] for c in mock_session.call_tool.call_args_list] == [
+        "zero.step",
+        "zero.open_session",
+        "zero.step",
+    ]
 
 
 async def test_unknown_session_only_for_step_tool(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -656,3 +676,135 @@ async def test_unknown_session_only_for_step_tool(monkeypatch: pytest.MonkeyPatc
 
     assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
     assert exc_info.value.tool == "zero.open_session"
+
+
+# ---------------------------------------------------------------------------
+# Task 5.19 T6 resume-by-id（zero-link T6·④）
+#
+# open_session 加可选 session_id（resume 入口）；graceful_step 命中 unknown-session → 用同 id
+# 重开(+再供 config)后重试一次；generate_session_id 产不可猜 id（运行态访问凭据）。
+# ---------------------------------------------------------------------------
+
+
+async def test_open_session_passes_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """open_session(session_id=…) → 载荷含 session_id 键（resume 入口）+ config 一并透传。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, json.dumps({"session_id": "resumed-sid"}))
+
+    sid = await client.open_session(session_id="resumed-sid", config={"x": 1})
+
+    assert sid == "resumed-sid"
+    _tool, arguments = mock_session.call_tool.call_args.args
+    assert arguments["session_id"] == "resumed-sid"
+    assert arguments["config"] == {"x": 1}
+
+
+async def test_open_session_no_session_id_omits_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不传 session_id → 载荷无该键（Zero 新铸 uuid4，零回归）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, json.dumps({"session_id": "fresh"}))
+
+    await client.open_session()
+
+    _tool, arguments = mock_session.call_tool.call_args.args
+    assert "session_id" not in arguments
+
+
+async def test_graceful_step_resume_retry_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """unknown-session → 用同 id 重开(+再供 config)后重试 step 成功 → 返回 ExpressionBundle。
+
+    调用序列：step(unknown-session) → open_session(ok) → step(ok)。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(json.dumps({"session_id": "sid-1"})),
+        _make_call_result(_make_expression_json()),
+    ]
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    result = await client.graceful_step("sid-1", stimulus, resume_config={"a": 1})
+
+    assert isinstance(result, ExpressionBundle)
+    calls = mock_session.call_tool.call_args_list
+    assert [c.args[0] for c in calls] == ["zero.step", "zero.open_session", "zero.step"]
+    # resume 用同 id 重开 + 再供 config
+    assert calls[1].args[1]["session_id"] == "sid-1"
+    assert calls[1].args[1]["config"] == {"a": 1}
+
+
+async def test_graceful_step_resume_retry_fails_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """unknown-session → 重开成功但重试 step 再失败 → 降级 None（只重试一次，不递归）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(json.dumps({"session_id": "sid-1"})),
+        _make_call_result("boom", is_error=True),
+    ]
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    result = await client.graceful_step("sid-1", stimulus)
+
+    assert result is None
+    # step → open_session → step，恰好三次（不再递归重试）
+    assert mock_session.call_tool.call_count == 3
+
+
+async def test_graceful_step_generic_error_no_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """判别性：普通 isError（非 unknown-session）→ 不触发 resume，直接降级 None（不调 open）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, "boom", is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    result = await client.graceful_step("sid-1", stimulus)
+
+    assert result is None
+    assert mock_session.call_tool.call_count == 1  # 只调 step，无 resume 的 open_session
+    assert mock_session.call_tool.call_args.args[0] == "zero.step"
+
+
+def test_generate_session_id_unguessable_and_unique() -> None:
+    """generate_session_id 产 128-bit hex（32 字符）不可猜 id，两次调用不同（唯一）。"""
+    a = generate_session_id()
+    b = generate_session_id()
+
+    assert a != b  # 唯一（CSPRNG）
+    assert len(a) == 32  # 16 字节 → 32 hex 字符
+    assert all(ch in "0123456789abcdef" for ch in a)  # 纯十六进制、无歧义
+
+
+# ---------------------------------------------------------------------------
+# Task 5.20 T5 连接层 CancelledError → ZeroLinkConnectionError（HTTP 401 传输层拒绝）
+#
+# streamable-http 401 时传输内部 anyio task group 取消 → 抛 CancelledError（BaseException，
+# 非 Exception，__aenter__ 的 except Exception 接不住）。__aenter__ 用 Task.cancelling() 区分
+# 外部取消（重抛）vs 传输内部取消（转 ZeroLinkConnectionError·连接层，符合回执 T5）。
+# ---------------------------------------------------------------------------
+
+
+async def test_aenter_transport_cancelled_becomes_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """传输建立期抛 CancelledError（非外部取消）→ 转 ZeroLinkConnectionError（T5 401）。"""
+    monkeypatch.setenv("ZERO_LINK_ENABLED", "true")
+    monkeypatch.setenv("ZERO_LINK_TRANSPORT", "stdio")
+
+    class _CancelOnEnter:
+        """模拟传输 CM：__aenter__ 抛 CancelledError（如 streamable-http 401 内部取消）。"""
+
+        async def __aenter__(self) -> object:
+            raise asyncio.CancelledError("模拟传输内部因连接被拒取消（401）")
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    # patch stdio_client 返回上述 CM（本任务未被外部 cancel，cancelling()==0 → 应转连接错）
+    monkeypatch.setattr("src.mcp.zero.client.stdio_client", lambda *a, **k: _CancelOnEnter())
+
+    with pytest.raises(ZeroLinkConnectionError) as exc_info:
+        await ZeroLinkClient().__aenter__()
+
+    # W2：原始 CancelledError 保留为 __cause__（诊断非鉴权类内部取消根因）
+    assert isinstance(exc_info.value.__cause__, asyncio.CancelledError)

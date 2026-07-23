@@ -35,11 +35,14 @@ from src.agents.models.zero_affect import (
     ModalityPrior,
 )
 from src.mcp.zero.client import ZeroLinkCallError, ZeroLinkClient, ZeroLinkConnectionError
+from src.mcp.zero.mappers import LinearProsodyMapper, ProsodyParams
 
 _ZERO_SERVER = Path("D:/Zero/src/mcp_server/server.py")
 _VALID_FACS = frozenset(FACS_KEYS_EXT)
 # 真 13-AU 权重（Zero artifacts；缺失/无 torch → 真权重用例 skip，占位路径不受影响）
 _FACS_WEIGHT_V2 = Path("D:/Zero/artifacts/facs_decoder_ext_v2.pt")
+# 真 prosody 解码器权重（Zero artifacts；T4 normalized 上线，缺失/无 torch → skip）
+_PROSODY_WEIGHT = Path("D:/Zero/artifacts/prosody_decoder.pt")
 _TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 _UVICORN_AVAILABLE = importlib.util.find_spec("uvicorn") is not None
 
@@ -48,6 +51,9 @@ _HTTP_HOST = "127.0.0.1"
 _HTTP_PORT = 8000
 _HTTP_PATH = "/mcp"
 _HTTP_ENDPOINT = f"http://{_HTTP_HOST}:{_HTTP_PORT}{_HTTP_PATH}"
+# T5 Bearer 鉴权用独立端口（避与无鉴权 HTTP 用例串扰）
+_HTTP_PORT_AUTH = 8001
+_HTTP_ENDPOINT_AUTH = f"http://{_HTTP_HOST}:{_HTTP_PORT_AUTH}{_HTTP_PATH}"
 
 
 def _port_is_free(host: str, port: int) -> bool:
@@ -207,6 +213,53 @@ class TestZeroClientE2E:
         finally:
             await client.__aexit__(None, None, None)
 
+    async def test_real_prosody_weights_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """T4 上线：设 ZERO_PROSODY_MODEL_PATH → prosody_scale=="normalized" + 三值∈[0,1]。
+
+        Zero 回执（commit 64b8482）：接真 prosody 模型后 `prosody_scale=="normalized"`，
+        `prosody={speech_rate,pitch,energy}` sigmoid∈[0,1]（Zero 侧打 tag 前 [0,1] fail-fast，
+        越界不以 normalized 放行）。本仓 mapper 的 normalized 分支据此**转 live**——用真接线值真跑
+        `LinearProsodyMapper.map()`（normalized 分支）验产有效 ProsodyParams。缺 torch/权重即 skip。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        if not _TORCH_AVAILABLE:
+            pytest.skip("torch 未安装，跳过真 prosody 权重路径")
+        if not _PROSODY_WEIGHT.is_file():
+            pytest.skip(f"真 prosody 权重缺失（{_PROSODY_WEIGHT}）")
+        _set_stdio_env(monkeypatch)
+        monkeypatch.setenv("ZERO_PROSODY_MODEL_PATH", str(_PROSODY_WEIGHT))
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server（真 prosody 权重 import torch/加载失败？）：{exc}")
+        try:
+            sid = await client.open_session()
+            bundle = await client.step(sid, AffectStimulus(valence=0.6, arousal=0.4))
+            # T4 上线断言：接真 prosody 模型 → prosody_scale 翻 normalized（FACS-only 则仍 ratio）
+            assert bundle.prosody_scale == "normalized", (
+                f"设 ZERO_PROSODY_MODEL_PATH 后 prosody_scale 应翻 'normalized'，"
+                f"实际 {bundle.prosody_scale!r}"
+            )
+            for head_name in ("spontaneous", "voluntary"):
+                head = getattr(bundle, head_name)
+                assert head.prosody_scale == "normalized", (
+                    f"{head_name}.prosody_scale 应 normalized"
+                )
+                for field in ("speech_rate", "pitch", "energy"):
+                    val = getattr(head.prosody, field)
+                    assert isinstance(val, float) and 0.0 <= val <= 1.0, (
+                        f"{head_name}.prosody.{field}={val} 非 [0,1] float（normalized 契约）"
+                    )
+            # mapper normalized 分支现 live：用真接线值真跑，确认产有效 ProsodyParams（消费路径通）
+            params = await LinearProsodyMapper().map(bundle.spontaneous)
+            assert isinstance(params, ProsodyParams)
+            await client.close_session(sid)
+        finally:
+            await client.__aexit__(None, None, None)
+
     async def test_http_transport_full_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """HTTP（streamable-http）传输端到端：测试起 Zero 真 http server（uvicorn 子进程），
         client 的 http 分支连 endpoint 跑全契约，验证与 stdio 逐字一致。
@@ -273,6 +326,87 @@ class TestZeroClientE2E:
                 await client.close_session(sid)
             finally:
                 await client.__aexit__(None, None, None)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+@pytest.mark.zerorepo
+class TestZeroClientHttpBearerAuth:
+    """T5 · HTTP Bearer 端到端真鉴权（Zero server 设 ZERO_MCP_HTTP_TOKEN → 强制 401）。
+
+    对齐 Zero 回执（commit 0e219c1）：设 `ZERO_MCP_HTTP_TOKEN` 后 /mcp 强制
+    `Authorization: Bearer <token>`；缺/错 token → **传输层 HTTP 401**（纯 ASGI 中间件·先于 MCP
+    会话），本仓 client `__aenter__` 包成 `ZeroLinkConnectionError`（连接层，不走 graceful_step）。
+    env 名映射：本仓 `ZERO_HTTP_TOKEN` ↔ Zero `ZERO_MCP_HTTP_TOKEN`，两侧同值即通。
+    server/uvicorn 缺失/端口占用/起不来 → skip（不拖红）。
+    """
+
+    async def test_bearer_401_and_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """错 token/缺 token → 401 → ZeroLinkConnectionError；对 token（两侧同值）→ 成功跑契约。"""
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        if not _UVICORN_AVAILABLE:
+            pytest.skip("uvicorn 未安装，跳过 HTTP Bearer 鉴权端到端")
+        if not _port_is_free(_HTTP_HOST, _HTTP_PORT_AUTH):
+            pytest.skip(f"端口 {_HTTP_PORT_AUTH} 被占用，跳过（避免误连/flaky）")
+
+        token = "e2e-secret-0123456789abcdef"  # 纯 ASCII 非空（Zero auth.py 要求，否则 fail-fast）
+        server_env = dict(os.environ)
+        server_env.update(
+            {
+                "ZERO_MCP_TRANSPORT": "http",
+                "ZERO_MCP_HTTP_HOST": _HTTP_HOST,
+                "ZERO_MCP_HTTP_PORT": str(_HTTP_PORT_AUTH),
+                "ZERO_MCP_HTTP_PATH": _HTTP_PATH,
+                "ZERO_MCP_HTTP_TOKEN": token,  # Zero 侧强制鉴权
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "src.mcp_server"],
+            cwd=r"D:\Zero",
+            env=server_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            if not _wait_port(_HTTP_HOST, _HTTP_PORT_AUTH, timeout=40.0):
+                pytest.skip(f"Zero http(auth) server 端口 {_HTTP_PORT_AUTH} 未在 40s 内就绪，跳过")
+
+            monkeypatch.setenv("ZERO_LINK_ENABLED", "true")
+            monkeypatch.setenv("ZERO_LINK_TRANSPORT", "http")
+            monkeypatch.setenv("ZERO_HTTP_ENDPOINT", _HTTP_ENDPOINT_AUTH)
+
+            # A. 错 token → 传输层 401 → ZeroLinkConnectionError（连接失败，不是 ZeroLinkCallError）
+            monkeypatch.setenv("ZERO_HTTP_TOKEN", "wrong-token-xxxx")
+            with pytest.raises(ZeroLinkConnectionError):
+                await ZeroLinkClient().__aenter__()
+
+            # B. 缺 token（Bearer 头缺失）→ 401 → ZeroLinkConnectionError
+            monkeypatch.delenv("ZERO_HTTP_TOKEN", raising=False)
+            with pytest.raises(ZeroLinkConnectionError):
+                await ZeroLinkClient().__aenter__()
+
+            # C. 对 token（本仓 ZERO_HTTP_TOKEN == Zero ZERO_MCP_HTTP_TOKEN）→ 鉴权通过跑全契约
+            monkeypatch.setenv("ZERO_HTTP_TOKEN", token)
+            client_ok = ZeroLinkClient()
+            try:
+                await client_ok.__aenter__()
+            except ZeroLinkConnectionError as exc:
+                pytest.skip(f"对 token 仍连不上（环境问题？）：{exc}")
+            try:
+                sid = await client_ok.open_session(persona="http-auth-e2e")
+                assert isinstance(sid, str) and sid
+                bundle = await client_ok.step(sid, AffectStimulus(valence=0.3, arousal=0.4))
+                assert isinstance(bundle, ExpressionBundle)
+                _assert_valid_head(bundle.voluntary, "http_auth.step.voluntary")
+                await client_ok.close_session(sid)
+            finally:
+                await client_ok.__aexit__(None, None, None)
         finally:
             proc.terminate()
             try:

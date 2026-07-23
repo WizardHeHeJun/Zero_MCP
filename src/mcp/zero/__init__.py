@@ -47,6 +47,7 @@ from src.mcp.zero.client import (
     ZeroLinkConnectionError,
     ZeroLinkDisabledError,
     ZeroLinkUnknownSessionError,
+    generate_session_id,
 )
 
 # -- 表达消费通路 -------------------------------------------------------------
@@ -163,4 +164,5 @@ __all__ = [
     "ZeroLinkConnectionError",
     "ZeroLinkCallError",
     "ZeroLinkUnknownSessionError",
+    "generate_session_id",
 ]
