@@ -1,0 +1,715 @@
+"""RenderingExpressionSink / RenderFrame 单测（zero-link T2）。
+
+覆盖：
+  1. isinstance(RenderingExpressionSink(), ExpressionSink) 为 True。
+  2. VOLUNTARY_ONLY：render 后 frames 长度 1、frame.head=="voluntary"、is_micro False。
+  3. SPONTANEOUS_ONLY：1 帧、head=="spontaneous"、is_micro False。
+  4. DUAL：2 帧——主帧 head=="voluntary" is_micro False + 微帧 head=="spontaneous" is_micro True。
+  5. 无 prosody_mapper：frame.prosody is None。
+  6. 带 LinearProsodyMapper()：frame.prosody 是 ProsodyParams 且值与直接调 mapper.map(head) 一致。
+  7. facs_au/physiology 原样透传（frame.facs_au == head.facs_au dict、physiology == model_dump()）。
+  8. text_label 透传。
+  9. 多次 render 累积 frames。
+  10. RenderFrame extra=forbid（非法字段抛 ValidationError）。
+  11. 带 facs_mapper=ArkitFacsMapper() 时 RenderFrame.facs_mapped 为 dict 且等于直接 map(head)。
+  12. 无 facs_mapper 时 facs_mapped is None（零回归——既有测试不改语义）。
+  13. facs_au 原样透传字段与 facs_mapped 并存（两字段共存不冲突）。
+  14. facs_mapper=None 为默认值（零回归保证）。
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from src.agents.models.zero_affect import ExpressionBundle, ExpressionHead
+from src.mcp.zero.expression_sink import ExpressionSink, HeadPolicy
+from src.mcp.zero.mappers.facs import ArkitFacsMapper
+from src.mcp.zero.mappers.physiology import LinearPhysiologyMapper, PhysiologyParams
+from src.mcp.zero.mappers.prosody import LinearProsodyMapper, ProsodyParams
+from src.mcp.zero.sinks import RenderFrame, RenderingExpressionSink
+
+# ---------------------------------------------------------------------------
+# 辅助构造函数
+# ---------------------------------------------------------------------------
+
+
+def _make_expression_head(
+    facs_au: dict[str, float] | None = None,
+    text_label: str = "content",
+    prosody_scale: str | None = "ratio",
+) -> ExpressionHead:
+    """构造合法 ExpressionHead 实例（默认 legacy 3 键 + ratio 量纲）。"""
+    return ExpressionHead(
+        facs_au=facs_au or {"AU12": 0.8, "AU06": 0.6, "intensity": 0.7},
+        text_label=text_label,
+        physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+        prosody={"speech_rate": 1.0, "pitch": 1.0, "energy": 0.7},
+        prosody_scale=prosody_scale,
+    )
+
+
+def _make_expression_bundle(
+    voluntary_label: str = "content",
+    spontaneous_label: str = "excited",
+    prosody_scale: str | None = "ratio",
+) -> ExpressionBundle:
+    """构造合法 ExpressionBundle 实例。"""
+    return ExpressionBundle(
+        valence_arousal=(0.5, 0.3),
+        voluntary=_make_expression_head(text_label=voluntary_label, prosody_scale=prosody_scale),
+        spontaneous=_make_expression_head(
+            text_label=spontaneous_label, prosody_scale=prosody_scale
+        ),
+        prosody_scale=prosody_scale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. ExpressionSink 协议符合性
+# ---------------------------------------------------------------------------
+
+
+class TestRenderingExpressionSinkProtocol:
+    """RenderingExpressionSink 满足 ExpressionSink Protocol（runtime_checkable）。"""
+
+    def test_isinstance_expression_sink(self) -> None:
+        """isinstance(RenderingExpressionSink(), ExpressionSink) 为 True。"""
+        sink = RenderingExpressionSink()
+        assert isinstance(sink, ExpressionSink)
+
+    def test_has_render_method(self) -> None:
+        """RenderingExpressionSink 实例具有 render 方法。"""
+        sink = RenderingExpressionSink()
+        assert callable(sink.render)
+
+    def test_initial_frames_empty(self) -> None:
+        """构造后 frames 列表初始为空。"""
+        sink = RenderingExpressionSink()
+        assert sink.frames == []
+
+    def test_prosody_mapper_none_by_default(self) -> None:
+        """默认 prosody_mapper 为 None。"""
+        sink = RenderingExpressionSink()
+        assert sink.prosody_mapper is None
+
+
+# ---------------------------------------------------------------------------
+# 2. HeadPolicy 三档渲染行为
+# ---------------------------------------------------------------------------
+
+
+class TestRenderHeadPolicy:
+    """render() 按 HeadPolicy 正确取头、构造帧。"""
+
+    async def test_voluntary_only_one_frame(self) -> None:
+        """VOLUNTARY_ONLY：render 后 frames 长度为 1。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert len(sink.frames) == 1
+
+    async def test_voluntary_only_head_name(self) -> None:
+        """VOLUNTARY_ONLY：frame.head == "voluntary"。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].head == "voluntary"
+
+    async def test_voluntary_only_is_micro_false(self) -> None:
+        """VOLUNTARY_ONLY：frame.is_micro == False。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].is_micro is False
+
+    async def test_spontaneous_only_one_frame(self) -> None:
+        """SPONTANEOUS_ONLY：render 后 frames 长度为 1。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.SPONTANEOUS_ONLY)
+
+        assert len(sink.frames) == 1
+
+    async def test_spontaneous_only_head_name(self) -> None:
+        """SPONTANEOUS_ONLY：frame.head == "spontaneous"。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.SPONTANEOUS_ONLY)
+
+        assert sink.frames[0].head == "spontaneous"
+
+    async def test_spontaneous_only_is_micro_false(self) -> None:
+        """SPONTANEOUS_ONLY：frame.is_micro == False（非微表情泄漏帧）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.SPONTANEOUS_ONLY)
+
+        assert sink.frames[0].is_micro is False
+
+    async def test_dual_two_frames(self) -> None:
+        """DUAL：render 后 frames 长度为 2。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert len(sink.frames) == 2
+
+    async def test_dual_main_frame_voluntary(self) -> None:
+        """DUAL：第 0 帧（主帧）head == "voluntary"、is_micro False。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        main = sink.frames[0]
+        assert main.head == "voluntary"
+        assert main.is_micro is False
+
+    async def test_dual_micro_frame_spontaneous(self) -> None:
+        """DUAL：第 1 帧（微表情泄漏帧）head == "spontaneous"、is_micro True。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        micro = sink.frames[1]
+        assert micro.head == "spontaneous"
+        assert micro.is_micro is True
+
+
+# ---------------------------------------------------------------------------
+# 3. ProsodyMapper 行为
+# ---------------------------------------------------------------------------
+
+
+class TestRenderProsodyMapper:
+    """无 prosody_mapper 时 prosody None；带 LinearProsodyMapper 时值一致。"""
+
+    async def test_no_mapper_prosody_none(self) -> None:
+        """无 prosody_mapper：frame.prosody is None。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].prosody is None
+
+    async def test_with_linear_mapper_prosody_is_params(self) -> None:
+        """带 LinearProsodyMapper：frame.prosody 是 ProsodyParams 实例。"""
+        mapper = LinearProsodyMapper()
+        sink = RenderingExpressionSink(prosody_mapper=mapper)
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert isinstance(sink.frames[0].prosody, ProsodyParams)
+
+    async def test_prosody_values_match_mapper_output(self) -> None:
+        """带 LinearProsodyMapper：frame.prosody 值与直接调 mapper.map(head) 一致。"""
+        mapper = LinearProsodyMapper()
+        sink = RenderingExpressionSink(prosody_mapper=mapper)
+        head = _make_expression_head(prosody_scale="ratio")
+        # 用真实 ExpressionBundle 包装这个 head
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(prosody_scale="ratio"),
+            prosody_scale="ratio",
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected = await mapper.map(head)
+        actual = sink.frames[0].prosody
+        assert actual is not None
+        assert actual.rate_ratio == pytest.approx(expected.rate_ratio)
+        assert actual.pitch_semitones == pytest.approx(expected.pitch_semitones)
+        assert actual.gain_db == pytest.approx(expected.gain_db)
+
+    async def test_rate_ratio_equals_speech_rate_for_ratio_scale(self) -> None:
+        """ratio 量纲下 rate_ratio 应等于 head.prosody.speech_rate（LinearProsodyMapper 约定）。"""
+        mapper = LinearProsodyMapper()
+        sink = RenderingExpressionSink(prosody_mapper=mapper)
+        # speech_rate=1.2 倍率
+        head = ExpressionHead(
+            facs_au={"AU12": 0.8, "AU06": 0.6, "intensity": 0.7},
+            text_label="content",
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody={"speech_rate": 1.2, "pitch": 1.0, "energy": 0.7},
+            prosody_scale="ratio",
+        )
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(prosody_scale="ratio"),
+            prosody_scale="ratio",
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        prosody = sink.frames[0].prosody
+        assert prosody is not None
+        assert prosody.rate_ratio == pytest.approx(1.2)
+
+    async def test_dual_both_frames_have_prosody(self) -> None:
+        """DUAL + mapper：两帧都有 prosody。"""
+        mapper = LinearProsodyMapper()
+        sink = RenderingExpressionSink(prosody_mapper=mapper)
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].prosody is not None
+        assert sink.frames[1].prosody is not None
+
+    async def test_dual_no_mapper_both_frames_prosody_none(self) -> None:
+        """DUAL 无 mapper：两帧 prosody 均为 None。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].prosody is None
+        assert sink.frames[1].prosody is None
+
+
+# ---------------------------------------------------------------------------
+# 4. facs_au / physiology / text_label 原样透传
+# ---------------------------------------------------------------------------
+
+
+class TestRenderFramePassthrough:
+    """facs_au / physiology / text_label 原样透传到 RenderFrame。"""
+
+    async def test_facs_au_passthrough(self) -> None:
+        """frame.facs_au == dict(head.facs_au)，原样透传。"""
+        facs = {"AU12": 0.9, "AU06": 0.5, "intensity": 0.6}
+        sink = RenderingExpressionSink()
+        head = _make_expression_head(facs_au=facs)
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].facs_au == facs
+
+    async def test_physiology_passthrough(self) -> None:
+        """frame.physiology == head.physiology.model_dump()，原样透传。"""
+        sink = RenderingExpressionSink()
+        head = _make_expression_head()
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected_physiology = head.physiology.model_dump()
+        assert sink.frames[0].physiology == expected_physiology
+
+    async def test_text_label_passthrough(self) -> None:
+        """frame.text_label == head.text_label，原样透传。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle(voluntary_label="excited")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].text_label == "excited"
+
+    async def test_spontaneous_facs_passthrough(self) -> None:
+        """SPONTANEOUS_ONLY：spontaneous 头的 facs_au 透传正确。"""
+        facs = {"AU04": 0.7, "AU15": 0.5, "intensity": 0.4}
+        sink = RenderingExpressionSink()
+        spont_head = _make_expression_head(facs_au=facs, text_label="angry")
+        bundle = ExpressionBundle(
+            valence_arousal=(-0.3, 0.5),
+            voluntary=_make_expression_head(),
+            spontaneous=spont_head,
+        )
+        await sink.render(bundle, policy=HeadPolicy.SPONTANEOUS_ONLY)
+
+        assert sink.frames[0].facs_au == facs
+        assert sink.frames[0].text_label == "angry"
+
+    async def test_dual_voluntary_and_spontaneous_labels(self) -> None:
+        """DUAL：主帧取 voluntary 的 text_label，微帧取 spontaneous 的 text_label。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle(voluntary_label="content", spontaneous_label="excited")
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].text_label == "content"
+        assert sink.frames[1].text_label == "excited"
+
+
+# ---------------------------------------------------------------------------
+# 5. 多次 render 累积 frames
+# ---------------------------------------------------------------------------
+
+
+class TestRenderFrameAccumulation:
+    """多次 render 调用累积 frames 到同一列表。"""
+
+    async def test_two_renders_accumulate_frames(self) -> None:
+        """VOLUNTARY_ONLY 调用两次，frames 累积为 2 条。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert len(sink.frames) == 2
+
+    async def test_mixed_policy_renders_accumulate(self) -> None:
+        """VOLUNTARY_ONLY + DUAL 各调一次，frames 累积为 1+2=3 条。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert len(sink.frames) == 3
+
+    async def test_frames_are_same_list_object(self) -> None:
+        """frames 引用在多次 render 后始终是同一列表对象。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        original_frames = sink.frames
+
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames is original_frames
+
+    async def test_clear_empties_frames(self) -> None:
+        """clear() 清空已收集帧，供多轮复用时防无界增长。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+        assert len(sink.frames) == 2
+
+        sink.clear()
+
+        assert sink.frames == []
+        # 清空后仍可继续累积
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+        assert len(sink.frames) == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. RenderFrame 模型约束
+# ---------------------------------------------------------------------------
+
+
+class TestRenderFrameModel:
+    """RenderFrame extra=forbid 约束及字段校验。"""
+
+    def test_render_frame_extra_forbid(self) -> None:
+        """RenderFrame 拒绝非法的额外字段（extra="forbid"）。"""
+        with pytest.raises(ValidationError):
+            RenderFrame(
+                head="voluntary",
+                is_micro=False,
+                text_label="content",
+                facs_au={"AU12": 0.8},
+                physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+                prosody=None,
+                unknown_field="forbidden",  # type: ignore[call-arg]
+            )
+
+    def test_render_frame_valid_construction(self) -> None:
+        """合法字段可以直接构造 RenderFrame。"""
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8, "AU06": 0.6},
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.head == "voluntary"
+        assert frame.is_micro is False
+        assert frame.prosody is None
+
+    def test_render_frame_is_micro_default_false(self) -> None:
+        """RenderFrame.is_micro 默认值为 False。"""
+        frame = RenderFrame(
+            head="spontaneous",
+            text_label="excited",
+            facs_au={"AU12": 0.5},
+            physiology={"heart_rate_bpm": 75.0, "skin_conductance": 0.3, "pupil_mm": 3.5},
+            prosody=None,
+        )
+        assert frame.is_micro is False
+
+    def test_render_frame_head_literal_constraint(self) -> None:
+        """RenderFrame.head 只接受 'spontaneous' / 'voluntary'（Literal 约束）。"""
+        with pytest.raises(ValidationError):
+            RenderFrame(
+                head="unknown",  # type: ignore[arg-type]
+                is_micro=False,
+                text_label="content",
+                facs_au={"AU12": 0.8},
+                physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+                prosody=None,
+            )
+
+
+# ---------------------------------------------------------------------------
+# 7. 顶层包导出验证
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelExport:
+    """RenderFrame 与 RenderingExpressionSink 通过 src.mcp.zero 顶层包可访问。"""
+
+    def test_render_frame_exported(self) -> None:
+        """从 src.mcp.zero 顶层导入 RenderFrame 成功。"""
+        from src.mcp.zero import RenderFrame as RF  # noqa: PLC0415
+
+        assert RF is RenderFrame
+
+    def test_rendering_sink_exported(self) -> None:
+        """从 src.mcp.zero 顶层导入 RenderingExpressionSink 成功。"""
+        from src.mcp.zero import RenderingExpressionSink as RES  # noqa: PLC0415
+
+        assert RES is RenderingExpressionSink
+
+
+# ---------------------------------------------------------------------------
+# 8. FacsMapper 接入：facs_mapped 字段
+# ---------------------------------------------------------------------------
+
+
+class TestRenderFacsMapper:
+    """facs_mapper 接入：facs_mapped 字段行为验证（零回归 + 新增）。"""
+
+    def test_facs_mapper_none_by_default(self) -> None:
+        """默认 facs_mapper=None（零回归保证）。"""
+        sink = RenderingExpressionSink()
+        assert sink.facs_mapper is None
+
+    async def test_no_facs_mapper_facs_mapped_is_none(self) -> None:
+        """无 facs_mapper：frame.facs_mapped is None（零回归——既有行为不变）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].facs_mapped is None
+
+    async def test_with_arkit_facs_mapper_facs_mapped_is_dict(self) -> None:
+        """带 facs_mapper=ArkitFacsMapper()：frame.facs_mapped 为 dict 实例。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert isinstance(sink.frames[0].facs_mapped, dict)
+
+    async def test_facs_mapped_equals_direct_mapper_output(self) -> None:
+        """带 ArkitFacsMapper：frame.facs_mapped 等于直接调 mapper.map(head) 的返回值。"""
+        facs_mapper = ArkitFacsMapper()
+        sink = RenderingExpressionSink(facs_mapper=facs_mapper)
+        head = _make_expression_head(facs_au={"AU12": 0.8, "AU06": 0.6, "intensity": 0.7})
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected = await facs_mapper.map(head)
+        actual = sink.frames[0].facs_mapped
+        assert actual == expected
+
+    async def test_facs_au_and_facs_mapped_coexist(self) -> None:
+        """带 facs_mapper：facs_au 原样透传字段与 facs_mapped ARKit 输出并存不冲突。"""
+        facs = {"AU12": 0.8, "AU06": 0.6, "intensity": 0.7}
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        head = _make_expression_head(facs_au=facs)
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        # facs_au 原样透传
+        assert frame.facs_au == facs
+        # facs_mapped 为 ARKit 输出（非 None、非同一对象）
+        assert frame.facs_mapped is not None
+        assert isinstance(frame.facs_mapped, dict)
+        # 两字段键集不重叠（facs_au 含 AU* 键，facs_mapped 含 blendshape 名）
+        assert not (set(frame.facs_au.keys()) & set(frame.facs_mapped.keys()))
+
+    async def test_dual_both_frames_have_facs_mapped(self) -> None:
+        """DUAL + facs_mapper：两帧 facs_mapped 均非 None。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].facs_mapped is not None
+        assert sink.frames[1].facs_mapped is not None
+
+    async def test_dual_no_facs_mapper_both_frames_facs_mapped_none(self) -> None:
+        """DUAL 无 facs_mapper：两帧 facs_mapped 均为 None（零回归）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].facs_mapped is None
+        assert sink.frames[1].facs_mapped is None
+
+    async def test_facs_mapped_values_are_floats_in_unit_range(self) -> None:
+        """带 ArkitFacsMapper：facs_mapped 所有值在 [0.0, 1.0] 内（clamp 保证）。"""
+        sink = RenderingExpressionSink(facs_mapper=ArkitFacsMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        facs_mapped = sink.frames[0].facs_mapped
+        assert facs_mapped is not None
+        for bs_name, coeff in facs_mapped.items():
+            assert 0.0 <= coeff <= 1.0, f"blendshape {bs_name!r} 系数 {coeff} 超出 [0,1]"
+
+    async def test_prosody_and_facs_mapper_combined(self) -> None:
+        """同时带 prosody_mapper 和 facs_mapper：帧同时包含 prosody 和 facs_mapped。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+        )
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        assert isinstance(frame.prosody, ProsodyParams)
+        assert isinstance(frame.facs_mapped, dict)
+        assert frame.facs_mapped is not None
+
+    async def test_render_frame_facs_mapped_default_none(self) -> None:
+        """直接构造 RenderFrame 时 facs_mapped 默认值为 None。"""
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.facs_mapped is None
+
+    async def test_render_frame_facs_mapped_explicit_dict(self) -> None:
+        """直接构造 RenderFrame 时可传入 facs_mapped dict。"""
+        mapped = {"mouthSmileLeft": 0.8, "mouthSmileRight": 0.8}
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            facs_mapped=mapped,
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.facs_mapped == mapped
+
+
+# ---------------------------------------------------------------------------
+# 9. PhysiologyMapper 接入：physiology_mapped 字段
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPhysiologyMapper:
+    """physiology_mapper 接入：physiology_mapped 字段行为验证（零回归 + 新增）。"""
+
+    def test_physiology_mapper_none_by_default(self) -> None:
+        """默认 physiology_mapper=None（零回归保证）。"""
+        sink = RenderingExpressionSink()
+        assert sink.physiology_mapper is None
+
+    async def test_no_physiology_mapper_physiology_mapped_is_none(self) -> None:
+        """无 physiology_mapper：frame.physiology_mapped is None（零回归——既有行为不变）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert sink.frames[0].physiology_mapped is None
+
+    async def test_with_mapper_physiology_mapped_is_params(self) -> None:
+        """带 LinearPhysiologyMapper：frame.physiology_mapped 是 PhysiologyParams 实例。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        assert isinstance(sink.frames[0].physiology_mapped, PhysiologyParams)
+
+    async def test_physiology_mapped_equals_direct_mapper_output(self) -> None:
+        """带 mapper：frame.physiology_mapped 等于直接调 mapper.map(head) 的返回值。"""
+        mapper = LinearPhysiologyMapper()
+        sink = RenderingExpressionSink(physiology_mapper=mapper)
+        head = _make_expression_head()
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        expected = await mapper.map(head)
+        assert sink.frames[0].physiology_mapped == expected
+
+    async def test_physiology_raw_and_mapped_coexist(self) -> None:
+        """带 mapper：physiology 原样透传 dict 与 physiology_mapped PhysiologyParams 并存不冲突。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        head = _make_expression_head()
+        bundle = ExpressionBundle(
+            valence_arousal=(0.5, 0.3),
+            voluntary=head,
+            spontaneous=_make_expression_head(),
+        )
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        # physiology 原样透传（dict）
+        assert frame.physiology == head.physiology.model_dump()
+        # physiology_mapped 为映射结果（PhysiologyParams，非 None）
+        assert frame.physiology_mapped is not None
+        assert isinstance(frame.physiology_mapped, PhysiologyParams)
+
+    async def test_dual_both_frames_have_physiology_mapped(self) -> None:
+        """DUAL + physiology_mapper：两帧 physiology_mapped 均非 None。"""
+        sink = RenderingExpressionSink(physiology_mapper=LinearPhysiologyMapper())
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].physiology_mapped is not None
+        assert sink.frames[1].physiology_mapped is not None
+
+    async def test_dual_no_physiology_mapper_both_frames_none(self) -> None:
+        """DUAL 无 physiology_mapper：两帧 physiology_mapped 均为 None（零回归）。"""
+        sink = RenderingExpressionSink()
+        bundle = _make_expression_bundle()
+        await sink.render(bundle, policy=HeadPolicy.DUAL)
+
+        assert sink.frames[0].physiology_mapped is None
+        assert sink.frames[1].physiology_mapped is None
+
+    async def test_render_frame_physiology_mapped_default_none(self) -> None:
+        """直接构造 RenderFrame 时 physiology_mapped 默认值为 None。"""
+        frame = RenderFrame(
+            head="voluntary",
+            is_micro=False,
+            text_label="content",
+            facs_au={"AU12": 0.8},
+            physiology={"heart_rate_bpm": 80.0, "skin_conductance": 0.5, "pupil_mm": 4.0},
+            prosody=None,
+        )
+        assert frame.physiology_mapped is None
+
+    async def test_all_three_mappers_combined(self) -> None:
+        """同时带三 mapper：帧同时含 prosody、facs_mapped、physiology_mapped。"""
+        sink = RenderingExpressionSink(
+            prosody_mapper=LinearProsodyMapper(),
+            facs_mapper=ArkitFacsMapper(),
+            physiology_mapper=LinearPhysiologyMapper(),
+        )
+        bundle = _make_expression_bundle(prosody_scale="ratio")
+        await sink.render(bundle, policy=HeadPolicy.VOLUNTARY_ONLY)
+
+        frame = sink.frames[0]
+        assert isinstance(frame.prosody, ProsodyParams)
+        assert isinstance(frame.facs_mapped, dict)
+        assert isinstance(frame.physiology_mapped, PhysiologyParams)
