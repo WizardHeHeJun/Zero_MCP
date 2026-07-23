@@ -417,6 +417,46 @@ class TestPhysiologyParamsModel:
 
 
 # ---------------------------------------------------------------------------
+# 8.5 legacy 口径消费标度差（code-review W6·zero-link physiology）
+#
+# mapper 按 canonical μS 标定：canonical sc=μS[0,20] 用默认 skin_conductance_max_us=20 归一正确；
+# 但 Zero 门关无真模型出的 legacy sc 已是 [0,1]（clamp(|arousal|)），默认 μS 归一会再除 20 →
+# 系统性欠标度 ~20×，且不报错（超集契约只保证解析、不保证消费标度）。本节**锁定**该行为差异：
+# 默认 mapper 误标度 legacy sc（防未来静默改变），max_us=1.0 时 legacy 标度正确（接线指引）。
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyScaleConsumptionGap:
+    """legacy sc（[0,1]）经默认 μS mapper 欠标度 ~20×；配 max_us=1.0 则标度正确（W6）。"""
+
+    async def test_legacy_sc_underscaled_by_default_mapper(self) -> None:
+        """legacy sc=1.0（[0,1] 最大）经默认 mapper → level≈0.05（欠标度 20×·已知消费差）。"""
+        head = _make_expression_head(
+            {"heart_rate_bpm": 80.0, "skin_conductance": 1.0, "pupil_mm": 4.0}
+        )
+        result = await LinearPhysiologyMapper().map(head)
+        assert result.skin_conductance_level == pytest.approx(0.05), (
+            "默认 μS mapper 把 legacy [0,1] sc 再除 20——锁定此已知欠标度（消费方须配 max_us=1.0）"
+        )
+
+    async def test_legacy_sc_correct_with_unit_max(self) -> None:
+        """接线指引：legacy 配 skin_conductance_max_us=1.0 → sc=1.0 归一 level=1.0（标度正确）。"""
+        head = _make_expression_head(
+            {"heart_rate_bpm": 80.0, "skin_conductance": 1.0, "pupil_mm": 4.0}
+        )
+        result = await LinearPhysiologyMapper(skin_conductance_max_us=1.0).map(head)
+        assert result.skin_conductance_level == pytest.approx(1.0)
+
+    async def test_canonical_sc_correct_with_default_mapper(self) -> None:
+        """对照：canonical sc=10μS 经默认 mapper → level=0.5（μS 标定对 canonical 口径正确）。"""
+        head = _make_expression_head(
+            {"heart_rate_bpm": 80.0, "skin_conductance": 10.0, "temperature_c": 35.0}
+        )
+        result = await LinearPhysiologyMapper().map(head)
+        assert result.skin_conductance_level == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
 # 9. 顶层包导出
 # ---------------------------------------------------------------------------
 

@@ -101,6 +101,15 @@ class LinearPhysiologyMapper:
     静息 HR:呼吸 ≈ 4:1、WESAD EDA 上界 ~20μS、皮肤温 30–40°C、瞳孔常态 3–5mm 的工程经验取值），
     消费方可按目标模型/绑定覆盖。（遵 agent-framework-rules：无据选择显式标工程假设。）
 
+    ⚠⚠ **本 mapper 按 canonical μS 标定——legacy 口径须显式配 `skin_conductance_max_us=1.0`**
+    （code-review W6）：Zero 门开/真模型出 canonical `skin_conductance`=μS[0,20]，默认上界 20 归一
+    正确；但 Zero **门关无真模型**出的 legacy sc 已是 [0,1]（`clamp(|arousal|)`），默认 μS 归一会再
+    除 20 → **系统性欠标度 ~20×**（legacy sc=1.0→level≈0.05），且**不报错**（超集只保证解析、不保
+    证消费标度）。physiology 通道**无量纲兄弟键**（不同 prosody `prosody_scale`），mapper 无法自识
+    别口径。消费方接线**须知所连 Zero 口径**：canonical→默认；legacy→配 `max_us=1.0`。
+    判据：`temperature_c` 出现≈canonical(μS)、`pupil_mm` 出现且无 temp≈legacy([0,1])。行为差异见
+    test_zero_physiology_mapper.py::TestLegacyScaleConsumptionGap。
+
     ⚠ **保护策略有意不对称**（code-review W3）：作**除数**的 cardio_respiratory_ratio/
     skin_conductance_max_us 在 `__init__` 即 fail-fast（≤0 → ValueError，防 ZeroDivisionError）；作
     **归一范围** temperature_range/pupil_mm_range 退化（span≤0）**不构造期 raise**，而 map() 优雅

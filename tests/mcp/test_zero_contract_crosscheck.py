@@ -176,6 +176,63 @@ print(json.dumps({
 
 
 # ---------------------------------------------------------------------------
+# ② canonical 占位口径采样脚本（decode_channels(canonical_physiology=True)）
+#
+# Zero ② 落地（commit b503990+432f8d9）：decode_channels 新增 canonical_physiology 参数
+# （门 = ZERO_PHYSIOLOGY_CANONICAL_PLACEHOLDER）。门开 → physiology 出 canonical 占位
+# {hr, sc(μS), temperature_c}（无 pupil_mm）；门关（默认）→ legacy {hr, sc[0,1], pupil_mm}。
+# 本脚本同一组 (v,a) 各跑门开/门关两路，供上层断言「两形状分野」+「超集同解析」+ 议会占位公式。
+# decode_channels 无 canonical_physiology 参数（旧 Zero，② 未落地）→ skip（不拖红）。
+# ---------------------------------------------------------------------------
+
+_DECODE_CANONICAL_PHYSIO_SCRIPT = """
+import sys
+import json
+
+sys.path.insert(0, sys.argv[1])
+
+try:
+    from src.agents.affect_math import decode_channels
+except ImportError as e:
+    print(json.dumps({"skip": True, "reason": f"import src.agents.affect_math 失败: {e}"}))
+    sys.exit(0)
+
+import inspect
+if "canonical_physiology" not in inspect.signature(decode_channels).parameters:
+    print(json.dumps({
+        "skip": True,
+        "reason": "decode_channels 无 canonical_physiology 参数（Zero 侧尚未落地 ② 门控）",
+    }))
+    sys.exit(0)
+
+# 直接以已知 (v,a) 调 decode_channels（非过 affect core，故议会占位公式可逐值核验）。
+# 关键点位：(0,0) 验 sc 中点偏置=0μS·temp=36；(±0.4, 0.5) 非饱和同 |a| 验 temp 无 valence
+# （不与饱和抹平混淆）；(±0.8, 1.0) 饱和边界。
+samples = [
+    (0.0, 0.0),
+    (0.6, 0.4),
+    (-0.5, 0.6),
+    (0.3, -0.6),
+    (0.4, 0.5),
+    (-0.4, 0.5),
+    (0.8, 1.0),
+    (-0.8, 1.0),
+]
+
+results = []
+for v, a in samples:
+    try:
+        canon = decode_channels((v, a), canonical_physiology=True)
+        legacy = decode_channels((v, a), canonical_physiology=False)
+        results.append({"v": v, "a": a, "canonical": canon, "legacy": legacy, "error": None})
+    except Exception as exc:
+        results.append({"v": v, "a": a, "canonical": None, "legacy": None, "error": str(exc)})
+
+print(json.dumps({"skip": False, "results": results}))
+"""
+
+
+# ---------------------------------------------------------------------------
 # 测试类
 # ---------------------------------------------------------------------------
 
@@ -586,3 +643,124 @@ class TestPhysiologyDecoderContractCrosscheck:
         required = {"heart_rate_bpm", "skin_conductance"}
         missing = required - decoder_keys
         assert not missing, f"Zero decoder 未产必填字段 {sorted(missing)}（PhysiologyChannel 必填）"
+
+
+# ---------------------------------------------------------------------------
+# ② canonical 占位口径跨仓一致（decode_channels(canonical_physiology=True) 真跑）
+#
+# 上面 TestPhysiologyDecoderContractCrosscheck 走**真 decoder 源码**（① 路径·正则读 return 键）。
+# 本类走**占位路径运行时**（② 路径·真跑 decode_channels 门开/门关）——验证：
+#   (a) 门开 canonical 形状 = {hr, sc(μS), temperature_c}（无 pupil）；门关 legacy 含 pupil；
+#   (b) 本仓**超集契约**（ExpressionHead / PhysiologyChannel）无损解析两形状（=保超集决策依据）；
+#   (c) 议会 2026-07-23 占位公式逐值：sc 中点偏置（arousal=0→0μS）、temp 无 valence（同 |a| 同温）、
+#       各值落 canonical 域（hr[50,120]/sc[0,20]μS/temp[33,36]°C）。
+# ⚠ sc 中点偏置：占位 arousal=0→0μS，真 decoder 中立态~10μS——本类仅在**占位路径内**核对，
+#   不与真 decoder 跨路径绝对比较（禁跨路径比较，Zero 简报 §2）。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.zerorepo
+class TestCanonicalPhysiologyPlaceholderCrosscheck:
+    """② canonical 占位路径跨仓一致——门开/门关两形状 + 超集解析 + 议会占位公式逐值核验。
+
+    D:\\Zero 不可用 / decode_channels 无 canonical_physiology 参数（② 未落地）→ skip（不拖红）。
+    """
+
+    def _fetch_or_skip(self) -> list[dict[str, Any]]:
+        """运行 canonical 采样子进程，任何失败 / ② 未落地 → skip；返回 results 列表。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过 canonical 占位跨仓断言")
+        try:
+            data = _run_subprocess_with_script(_DECODE_CANONICAL_PHYSIO_SCRIPT)
+        except subprocess.TimeoutExpired:
+            pytest.skip("子进程超时，跳过 canonical 占位跨仓断言")
+        except RuntimeError as exc:
+            pytest.skip(f"子进程非零退出，跳过: {exc}")
+        except json.JSONDecodeError as exc:
+            pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
+        if data.get("skip"):
+            pytest.skip(data.get("reason", "canonical 占位路径不可用，跳过"))
+        results: list[dict[str, Any]] = data["results"]
+        # decode_channels 运行时异常（如 torch 缺失触发某路径）→ skip 整类
+        for item in results:
+            if item["error"] is not None:
+                pytest.skip(f"decode_channels(canonical) 抛异常: {item['error']}")
+        assert results, "canonical 采样结果为空，无法断言"
+        return results
+
+    def test_gate_on_canonical_shape_no_pupil(self) -> None:
+        """门开 → physiology 键恰 {hr, sc, temperature_c}（无 pupil）；门关 → 含 pupil 无 temp。"""
+        results = self._fetch_or_skip()
+        canonical_fields = {"heart_rate_bpm", "skin_conductance", "temperature_c"}
+        for item in results:
+            v, a = item["v"], item["a"]
+            canon_phys = item["canonical"]["physiology"]
+            assert set(canon_phys) == canonical_fields, (
+                f"(v={v}, a={a}) canonical physiology 键漂移：期望 {sorted(canonical_fields)}，"
+                f"实际 {sorted(canon_phys)}（应删 pupil_mm、含 temperature_c）"
+            )
+            assert "pupil_mm" not in canon_phys, f"(v={v}, a={a}) canonical 占位仍出 pupil_mm"
+            legacy_phys = item["legacy"]["physiology"]
+            assert "pupil_mm" in legacy_phys, f"(v={v}, a={a}) legacy 占位缺 pupil_mm（零回归破坏）"
+            assert "temperature_c" not in legacy_phys, (
+                f"(v={v}, a={a}) legacy 占位不应出 temperature_c"
+            )
+
+    def test_superset_contract_parses_both_shapes(self) -> None:
+        """本仓超集契约无损解析门开 canonical 与门关 legacy 两形状（保超集决策的运行时依据）。"""
+        results = self._fetch_or_skip()
+        from src.agents.models.zero_affect import ExpressionHead, PhysiologyChannel
+
+        errors: list[str] = []
+        for item in results:
+            v, a = item["v"], item["a"]
+            for tag in ("canonical", "legacy"):
+                try:
+                    ExpressionHead.model_validate(item[tag])
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"(v={v}, a={a}) {tag} 无法被 ExpressionHead 解析: {exc}")
+            # PhysiologyChannel 直解：canonical→temp 非 None·无 pupil；legacy→有 pupil·temp None
+            canon_ch = PhysiologyChannel.model_validate(item["canonical"]["physiology"])
+            assert canon_ch.temperature_c is not None and canon_ch.pupil_mm is None, (
+                f"(v={v}, a={a}) canonical PhysiologyChannel 应 temp 非 None、pupil None"
+            )
+            legacy_ch = PhysiologyChannel.model_validate(item["legacy"]["physiology"])
+            assert legacy_ch.pupil_mm is not None and legacy_ch.temperature_c is None, (
+                f"(v={v}, a={a}) legacy PhysiologyChannel 应 pupil 非 None、temp None"
+            )
+        assert not errors, "\n".join(errors)
+
+    def test_council_formula_domains_and_bias(self) -> None:
+        """议会占位公式**逐值** pin：确定性 (v,a) 直调 → hr/sc/temp 精确值（标度/斜率漂移即 fail）。
+
+        入参确定 + Zero 公式固定（hr=50+70·clamp(0.5(1+a))、sc=20·clamp|a|、temp=36−3·clamp|a|），
+        故可逐值 pin（非仅域成员）——sc 20→10 或 hr 斜率变即 hard fail。含中点偏置（a=0→sc=0μS）
+        + temp 无 valence（**非饱和**同 |a|=0.5、±valence → 同温，不与饱和抹平混淆）。
+        """
+        results = self._fetch_or_skip()
+        by_key = {(item["v"], item["a"]): item["canonical"]["physiology"] for item in results}
+
+        # 逐值 pin：Zero 占位公式对确定性 (v,a) 的精确输出（(hr, sc(μS), temp°C)）
+        expected = {
+            (0.0, 0.0): (85.0, 0.0, 36.0),
+            (0.6, 0.4): (99.0, 8.0, 34.8),
+            (-0.5, 0.6): (106.0, 12.0, 34.2),
+            (0.3, -0.6): (64.0, 12.0, 34.2),
+            (0.4, 0.5): (102.5, 10.0, 34.5),
+            (-0.4, 0.5): (102.5, 10.0, 34.5),
+            (0.8, 1.0): (120.0, 20.0, 33.0),
+            (-0.8, 1.0): (120.0, 20.0, 33.0),
+        }
+        for (v, a), (hr, sc, temp) in expected.items():
+            phys = by_key[(v, a)]
+            assert phys["heart_rate_bpm"] == pytest.approx(hr), f"(v={v},a={a}) hr 漂移 {phys}"
+            assert phys["skin_conductance"] == pytest.approx(sc), f"(v={v},a={a}) sc 漂移 {phys}"
+            assert phys["temperature_c"] == pytest.approx(temp), f"(v={v},a={a}) temp 漂移 {phys}"
+
+        # sc 中点偏置命名断言：arousal=0 → sc=0μS（禁与真 decoder 中立态~10μS 跨路径比较）
+        assert by_key[(0.0, 0.0)]["skin_conductance"] == pytest.approx(0.0)
+
+        # temp 无 valence（非饱和隔离）：同 |a|=0.5、valence 相反 → 同温 34.5（分野属 coping）
+        assert by_key[(0.4, 0.5)]["temperature_c"] == pytest.approx(
+            by_key[(-0.4, 0.5)]["temperature_c"]
+        ), "temp 无 valence：非饱和同 |a| 不同 valence 应同温"
