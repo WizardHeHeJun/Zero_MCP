@@ -28,6 +28,7 @@ from src.agents.models.zero_affect import (
     ExpressionHead,
     LanguageOutput,
     ModalityPrior,
+    PhysiologyChannel,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,12 @@ def _make_physiology(
     skin_conductance: float = 0.5,
     pupil_mm: float = 4.0,
 ) -> dict[str, Any]:
-    """构造合法 PhysiologyChannel dict。"""
+    """构造合法 PhysiologyChannel dict（**legacy avatar 口径**：sc 是旧 [0,1] 单位、非 μS）。
+
+    ⚠ canonical=WESAD 的 sc 是 μS（[0,20]），mapper 按 μS 归一——此 helper 默认值仅供「解析零回归」
+    类断言（不涉 mapper 值语义）；测 WESAD canonical 值语义见 TestPhysiologyChannelContract 与
+    test_zero_physiology_mapper.py 的字面量（code-review W2）。
+    """
     return {
         "heart_rate_bpm": heart_rate_bpm,
         "skin_conductance": skin_conductance,
@@ -386,6 +392,53 @@ class TestProsodyScale:
         data["prosody_scale"] = "ratio"
         bundle = ExpressionBundle(**data)
         assert bundle.prosody_scale == "ratio"
+
+
+# ---------------------------------------------------------------------------
+# 4.5 PhysiologyChannel canonical=WESAD 契约（physiology 对称接线 2026-07-23）
+# ---------------------------------------------------------------------------
+
+
+class TestPhysiologyChannelContract:
+    """PhysiologyChannel canonical=WESAD {hr, sc(μS), temperature_c}；temp/pupil_mm 过渡期可选。
+
+    跨仓迁移不原子：本模型须**同时**接受 canonical WESAD 形状与旧 avatar 占位形状（零回归），
+    hr+sc 必填，temp/pupil 可选。extra=forbid 拒未知键。
+    """
+
+    def test_accepts_wesad_canonical_shape(self) -> None:
+        """canonical WESAD {hr, sc(μS), temperature_c} → 解析、pupil_mm 缺省 None。"""
+        ch = PhysiologyChannel(heart_rate_bpm=85.0, skin_conductance=10.0, temperature_c=35.0)
+        assert ch.temperature_c == pytest.approx(35.0)
+        assert ch.pupil_mm is None
+
+    def test_accepts_legacy_placeholder_shape(self) -> None:
+        """旧 avatar 占位 {hr, sc, pupil_mm} → 解析、temperature_c 缺省 None（零回归）。"""
+        ch = PhysiologyChannel(heart_rate_bpm=80.0, skin_conductance=0.5, pupil_mm=4.0)
+        assert ch.pupil_mm == pytest.approx(4.0)
+        assert ch.temperature_c is None
+
+    def test_accepts_minimal_required_only(self) -> None:
+        """仅 hr+sc（必填）→ 解析，temp/pupil 皆 None。"""
+        ch = PhysiologyChannel(heart_rate_bpm=80.0, skin_conductance=10.0)
+        assert ch.temperature_c is None and ch.pupil_mm is None
+
+    def test_rejects_missing_required(self) -> None:
+        """缺 heart_rate_bpm 或 skin_conductance（必填）→ ValidationError。"""
+        with pytest.raises(ValidationError):
+            PhysiologyChannel(skin_conductance=10.0, temperature_c=35.0)  # type: ignore[call-arg]
+        with pytest.raises(ValidationError):
+            PhysiologyChannel(heart_rate_bpm=80.0, temperature_c=35.0)  # type: ignore[call-arg]
+
+    def test_rejects_extra_key(self) -> None:
+        """extra=forbid——未知键（如 respiration）→ ValidationError（防跨仓漂移悄悄塞新字段）。"""
+        with pytest.raises(ValidationError):
+            PhysiologyChannel(
+                heart_rate_bpm=80.0,
+                skin_conductance=10.0,
+                temperature_c=35.0,
+                respiration=0.5,  # type: ignore[call-arg]
+            )
 
 
 # ---------------------------------------------------------------------------

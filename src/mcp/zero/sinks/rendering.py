@@ -70,7 +70,9 @@ class RenderFrame(BaseModel):
     text_label: str
     facs_au: dict[str, float]
     facs_mapped: dict[str, float] | None = None
-    physiology: dict[str, float]
+    # physiology 原样透传 model_dump()——canonical=WESAD 后 temperature_c/pupil_mm 可选（可 None），
+    # 故值类型放宽为 float | None（透传保真，不吞 None）。
+    physiology: dict[str, float | None]
     physiology_mapped: PhysiologyParams | None = None
     prosody: ProsodyParams | None
 

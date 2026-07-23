@@ -144,18 +144,25 @@ class ProsodyChannel(BaseModel):
 class PhysiologyChannel(BaseModel):
     """生理通道（Zero → MCP 方向）。
 
-    参考值范围（expression 形状 §2）：
-    - heart_rate_bpm: [70, 110]
-    - skin_conductance: [0, 1]
-    - pupil_mm: [3, 5]
-    当前契约不硬卡，消费方按实际引擎范围自行处理。
+    **canonical = WESAD 真 physiology_decoder 输出口径**（zero-link physiology 对称接线，
+    2026-07-23 拍板采 WESAD 真信号，见 notes/2026-07-23-zero-link-physiology-*）：
+    - heart_rate_bpm:   心率 bpm，参考 [50, 120]（decoder 反归一化）。
+    - skin_conductance: 皮肤电导 **μS**（微西门子物理单位，非 [0,1]），参考 [0, 20]（EDA）。
+    - temperature_c:    皮肤温度 °C，参考 [30, 40]（decoder 反归一化）。
+
+    ⚠ **过渡期兼容**：`temperature_c` 与 `pupil_mm` 均**可选**（默认 None）以支持跨仓迁移不原子——
+    Zero 占位路径当前仍出旧 avatar 形状 `{hr, sc, pupil_mm}`（无 temp），本模型两字段皆可选故两种
+    形状都解析（零回归）。**canonical 目标**：`temperature_c` 出现、`pupil_mm` 弃用移除——待 Zero
+    占位迁移到 `{hr, sc(μS), temp}` + 接线真 decoder 后，收窄 temperature_c 为必填并删 pupil_mm。
+    契约不硬卡数值范围，消费方（mapper）按实际引擎范围归一。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     heart_rate_bpm: float
     skin_conductance: float
-    pupil_mm: float
+    temperature_c: float | None = None
+    pupil_mm: float | None = None
 
 
 class ExpressionHead(BaseModel):

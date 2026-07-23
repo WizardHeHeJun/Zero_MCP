@@ -526,3 +526,63 @@ class TestUnknownSessionMarkerCrosscheck:
             f"{zero_marker!r}，本仓 client={_UNKNOWN_SESSION_MARKER!r}。"
             "两仓须协调同步——否则 unknown-session 判定静默失效。"
         )
+
+
+# ---------------------------------------------------------------------------
+# physiology 对称接线：Zero physiology_decoder 输出键与本仓 PhysiologyChannel 契约一致
+#
+# canonical=WESAD（2026-07-23 拍板）：Zero 真 physiology_decoder.predict_physiology 输出
+# {heart_rate_bpm, skin_conductance(μS), temperature_c}。本仓 PhysiologyChannel（extra=forbid）
+# 须能无 ValidationError 解析该形状——decoder 输出键须 ⊆ 契约字段集，且含必填 hr+sc。任一漂移
+# （decoder 加本仓不认的键，或 rename）→ Zero 接线后 MCP 侧每步 ValidationError。此回归以正则从
+# Zero decoder 源码直读输出键（不 import，避 torch），断言契约对齐。D:\Zero 不在位 → skip。
+# ---------------------------------------------------------------------------
+
+# Zero physiology decoder 源文件 + 提取 predict_physiology 返回 dict 的字符串键
+_ZERO_PHYSIO_DECODER_PY = _ZERO_SRC / "agents" / "models" / "physiology_decoder.py"
+# 从 predict_physiology 起截取其 return dict 块 `{...}`（非贪婪到首个 `}`；该 dict 无嵌套花括号），
+# 仅在块内提键——避免正则扫到函数外的 `"key":`（其它方法/日志/注解）而误纳/误漏（code-review W1）。
+_RETURN_DICT_RE = re.compile(r"return\s*\{(.*?)\}", re.DOTALL)
+_PHYSIO_KEY_RE = re.compile(r'"([a-z_]+)"\s*:')
+
+
+@pytest.mark.zerorepo
+class TestPhysiologyDecoderContractCrosscheck:
+    """physiology 对称接线跨仓一致——Zero decoder 输出键 ⊆ 本仓 PhysiologyChannel 字段。
+
+    D:\\Zero 或 physiology_decoder.py 不在位 → skip（不拖红）。
+    """
+
+    def test_physiology_decoder_keys_subset_of_channel(self) -> None:
+        """Zero predict_physiology 输出键 ⊆ PhysiologyChannel 字段，且含必填 hr+sc。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过 physiology 契约跨仓断言")
+        if not _ZERO_PHYSIO_DECODER_PY.is_file():
+            pytest.skip(f"Zero physiology_decoder.py 不存在（{_ZERO_PHYSIO_DECODER_PY}），跳过")
+
+        source = _ZERO_PHYSIO_DECODER_PY.read_text(encoding="utf-8")
+        # 定位 predict_physiology → 仅在其 return dict 块内提键（约束范围，防扫到函数外，W1）
+        marker = "def predict_physiology"
+        idx = source.find(marker)
+        if idx < 0:
+            pytest.skip("Zero physiology_decoder.py 未见 predict_physiology，可能改了命名，跳过")
+        block = _RETURN_DICT_RE.search(source[idx:])
+        if block is None:
+            pytest.skip("predict_physiology 未见 `return {...}` 块，可能改了结构，跳过")
+        decoder_keys = set(_PHYSIO_KEY_RE.findall(block.group(1)))
+        if not decoder_keys:
+            pytest.skip("未从 return dict 提到输出键，正则可能需更新，跳过")
+
+        from src.agents.models.zero_affect import PhysiologyChannel
+
+        channel_fields = set(PhysiologyChannel.model_fields)
+        unknown = decoder_keys - channel_fields
+        assert not unknown, (
+            f"physiology 契约漂移：Zero decoder 输出键 {sorted(unknown)} 不在本仓 "
+            f"PhysiologyChannel 字段 {sorted(channel_fields)}——Zero 接线后每步会 ValidationError。"
+            "两仓须协调同步 canonical 契约。"
+        )
+        # 必填字段（hr+sc）decoder 须产出（否则解析缺字段）
+        required = {"heart_rate_bpm", "skin_conductance"}
+        missing = required - decoder_keys
+        assert not missing, f"Zero decoder 未产必填字段 {sorted(missing)}（PhysiologyChannel 必填）"
