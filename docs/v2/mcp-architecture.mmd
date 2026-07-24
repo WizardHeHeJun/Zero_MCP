@@ -1,0 +1,27 @@
+flowchart TB
+  subgraph layers["三层单向依赖（只能自上而下）"]
+    orch["🧩 编排层 src/orchestration + src/agents<br/>LangGraph StateGraph · Supervisor · 安全门（白名单/TOCTOU/注入过滤）"]:::client
+    mem["🧠 记忆层 src/memory<br/>长期记忆·图谱读写封装（当前 MemoryAPI Protocol 打桩）"]:::memory
+    sto["🗄️ 存储层 src/storage<br/>Postgres / Neo4j / Redis（待建）"]:::storage
+    orch -->|"只能向下调用"| mem
+    mem -->|"只能向下调用"| sto
+  end
+
+  subgraph mcp["🔌 MCP 互操作边界（横切 · 不是新的一层反向依赖）"]
+    py["src/mcp · Python 内部能力封装<br/>官方 mcp python-sdk · stdio / Streamable HTTP"]:::proto
+    zl["src/mcp/zero · zero-link 第二阶段<br/>契约层 · ZeroLinkClient · 三模态感知 · 表达映射"]:::proto
+    ts["mcp-server/ · TypeScript 对外聚合层<br/>向 Zero host 暴露能力（暂未用）"]:::note
+    py --- zl
+  end
+
+  zero["Zero 情感内核 · 外部服务<br/>不 import Zero 代码库"]:::engine
+
+  orch -.->|"经 MCP 封装/调用能力"| py
+  zl ==>|"把 Zero 当外部服务经 MCP 调用"| zero
+
+  classDef client fill:#F0F4FC,stroke:#5178C6,color:#1F2329
+  classDef memory fill:#DFF5E5,stroke:#509863,color:#1F2329
+  classDef storage fill:#EAE2FE,stroke:#8569CB,color:#1F2329
+  classDef proto fill:#FEF1CE,stroke:#D4B45B,color:#1F2329
+  classDef engine fill:#FEE3E2,stroke:#D25D5A,color:#1F2329
+  classDef note fill:#FFF9E6,stroke:#D4B45B,color:#8A6D1B

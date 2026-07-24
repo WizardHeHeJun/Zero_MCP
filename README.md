@@ -2,7 +2,7 @@
 
 经 **MCP（[Model Context Protocol](https://modelcontextprotocol.io)）**，给情感引擎驱动的 AI 数字人项目 **Zero** 扩展新的 **Agent 能力模块**。Zero_MCP 与 Zero 相对独立：把 Zero 当作**外部服务**经 MCP 调用，不直接耦合其代码库。
 
-已落地两条能力线：**「桌面屏幕感知 + 电脑操控」**（Task 1-14 收口，真实桌面端到端标定）与 **「Zero↔MCP 情感对接（zero-link）」**（第二阶段核心通路打通：契约层 + client 真连 + 三模态感知真接入 + 表达映射器）。后续能力沿同一架构扩展。
+已落地两条能力线：**「桌面屏幕感知 + 电脑操控」**（Task 1-14 收口，真实桌面端到端标定）与 **「Zero↔MCP 情感对接（zero-link）」**（第二阶段已落地并并入 `main`：契约层 + client 真连 + 三模态感知真接入 + 真采集 I/O 适配层 + 表达映射器 + physiology 消费门控）。后续能力沿同一架构扩展。
 
 ## 能力一：桌面屏幕感知 + 操控
 
@@ -23,26 +23,25 @@
 - **边界契约层**：跨层数据形状唯一真相 `src/agents/models/zero_affect.py`（pydantic，字段/量纲逐条对 Zero 源码现场核验）——`(v,a)[+coping]` 刺激、多模态**独立先验流**（禁均值，竞争融合归内核）、`spontaneous`/`voluntary` 双通路 × 4 通道 expression（13 维 FACS〔12 AU + intensity 强度标量〕/ 韵律 / 生理 / 标签）。
 - **Zero MCP client**（`ZeroLinkClient`）：会话句柄三段式 `zero.open_session / step / close_session` + `graceful_step` 优雅回退；stdio（本地子进程）与 Streamable HTTP（远程）双传输经 `.env` 切换。**已与 `D:\Zero` 真 MCP server 端到端联调通过**（stdio + HTTP + 真 13 维 FACS 权重全契约验证）。
 - **三模态感知真接入**（算法团队文献门选型，全程可点击引文）：生理 NeuroKit2（EDA SCR / HRV RMSSD → arousal，对 valence 盲）· 语音 audeering w2v2 维度 SER · 视觉 EmotiEffLib **ONNX 后端**（零 timm，不动共用 conda 环境）。全部 pip 直装、CPU 可跑、零自训；缺库/缺模型/无输入一律 warning + 单通道降级，不拖垮整体。
-- **表达映射器**（引擎无关）：`ArkitFacsMapper`（12 AU + intensity 增益→ARKit 52 blendshape 系数，稀疏输出）· `LinearProsodyMapper`（韵律→倍率/半音/dB，可出 SSML `<prosody>`）· `LinearPhysiologyMapper`（心率/呼吸/瞳孔/皮肤电导）；经 `RenderingExpressionSink` 产出 `RenderFrame`（`DUAL` 策略含 spontaneous 微表情泄漏帧——"真笑/假笑"表现力来源）。
+- **真采集 I/O 适配层**（T3，`io_adapters/`）：把本地文件 / 合成信号包装成 async `signal_source` 注入四通道——`make_audio_file_source`（librosa 16kHz mono）· `make_vision_file_source`（FaceDetectorYN 人脸裁剪，BGR→RGB）· `make_synthetic_eda/hrv_source`（NeuroKit2）；真硬件（mic / camera / 可穿戴）留打桩（`_hardware_stubs`，`NotImplementedError` 占位）。适配层经构造器注入、**不进 Channel 核心**、脱硬件可测、零新增依赖。
+- **表达映射器**（引擎无关）：`ArkitFacsMapper`（12 AU + intensity 增益→ARKit 52 blendshape 系数，稀疏输出）· `LinearProsodyMapper`（韵律→倍率/半音/dB，可出 SSML `<prosody>`）· `LinearPhysiologyMapper`（**WESAD canonical**：心率/呼吸 + 皮肤电导 μS 归一 + 体温 °C，温度/瞳孔过渡期可空）；经 `RenderingExpressionSink` 产出 `RenderFrame`（`DUAL` 策略含 spontaneous 微表情泄漏帧——"真笑/假笑"表现力来源）。
+- **physiology 契约 = WESAD 真信号**（07-23 对称接线拍板 + 消费门控落地，PR #2 → `main`）：canonical 三键 `{heart_rate_bpm, skin_conductance(μS[0,20]), temperature_c(°C)}`。跨仓迁移不原子，**保超集不收窄**（`hr`+`sc` 必填，`temperature_c`/`pupil_mm` 皆可选）——收到 Zero 的 legacy 或 canonical 两形状都不 `ValidationError`。⚠ **保超集 = 解析层零回归 ≠ 消费标度正确**：mapper 按 μS 标定，连 legacy 门关 Zero（sc∈[0,1]）须显式配 `skin_conductance_max_us=1.0`，否则默认再除 20 → 静默欠标度 ~20×（对抗审查揪出的 W6）。
 - **external_priors 注入**（Q3 收口）：多流逐维 `(Πv,Πa)` 精度载荷 + 客户端 fail-fast（M3 精度上界 / M6 流数上界，与 Zero 两仓同名旋钮对齐）+ M5 schema 版本跨仓断言（`zerorepo` 测试期）。
 - **默认关零回归**：`ZERO_LINK_ENABLED` 与三个感知通道 flag 全部默认 `false`，不影响既有能力。
+
+zero-link 一轮数据流（感知先验注入 → Zero 确定性计算 → 表达消费驱动渲染）：
+
+<img src="docs/v2/zero-link-dataflow.png" alt="zero-link 一轮数据流：三模态感知先验（physio/audio/vision）→ PerceptionHub 多流独立 → external_priors → ZeroLinkClient → Zero 确定性情感计算 → ExpressionRouter 双通路 → 三映射器 → RenderFrame" width="860">
+
+> 图源 [`docs/v2/zero-link-dataflow.mmd`](docs/v2/zero-link-dataflow.mmd)（mermaid，飞书画板渲染）。
 
 ## 架构
 
 三层单向依赖，叠加 MCP 互操作边界（依赖只能自上而下）：
 
-```text
-编排层  src/orchestration, src/agents   （LangGraph StateGraph / Supervisor / 安全门）
-   ↓
-记忆层  src/memory                       （长期记忆 / 图谱读写封装；当前 Protocol 打桩）
-   ↓
-存储层  src/storage                      （Postgres / Neo4j / Redis；待建）
+<img src="docs/v2/mcp-architecture.png" alt="三层单向依赖 + MCP 互操作边界：编排层→记忆层→存储层只能自上而下调用；MCP 边界（src/mcp Python 内部封装 + zero-link，mcp-server/ TS 对外聚合）把 Zero 当外部服务经 MCP 调用，不 import 其代码库" width="720">
 
-MCP 互操作边界（横切）
-  · src/mcp        Python MCP server + client：内部能力封装（官方 mcp python-sdk，stdio / Streamable HTTP）
-      └ zero/      Zero↔MCP 情感对接（zero-link 第二阶段）：契约层 + ZeroLinkClient + 三模态感知通道 + 表达映射（不 import Zero）
-  · mcp-server/    TypeScript MCP 服务层：对外聚合层，向 Zero host 等外部方暴露能力（暂未用）
-```
+> 图源 [`docs/v2/mcp-architecture.mmd`](docs/v2/mcp-architecture.mmd)（mermaid，飞书画板渲染）。
 
 - **运行态**（LangGraph Checkpointer）与**长期记忆**分离存储。
 - **MCP 传输层不塞业务逻辑**：server 只注册工具 + 转发原语，感知/agent 业务逻辑留在 Python `src/*`。
@@ -93,12 +92,14 @@ Zero_MCP/
 │   │       ├── external_priors.py          #     external_priors 载荷构造 + M3/M6 fail-fast + 各模态推荐精度
 │   │       ├── protocols.py                #     Zero 协议结构化镜像（runtime_checkable，挂 path:line 证据）
 │   │       ├── channels/                   #     感知通道：physio(NeuroKit2) / audio(audeering w2v2) / vision(EmotiEffLib ONNX) / callable
-│   │       ├── mappers/                    #     表达映射：facs(12 AU→ARKit 52) / prosody(→SSML) / physiology（引擎无关）
+│   │       ├── io_adapters/                #     真采集 I/O 适配层（T3）：文件/合成 signal_source 工厂 + 硬件打桩（mic/camera/wearable）
+│   │       ├── mappers/                    #     表达映射：facs(12 AU→ARKit 52) / prosody(→SSML) / physiology(WESAD μS/°C，引擎无关)
 │   │       └── sinks/                      #     rendering.py：RenderingExpressionSink → RenderFrame（DUAL 含微表情泄漏帧）
 │   ├── memory/                     # 记忆层（骨架：编排层经 MemoryAPI Protocol 打桩，待实现）
 │   └── storage/                    # 存储层（骨架：Postgres / Neo4j / Redis，待建）
 ├── mcp-server/                     # TS MCP 对外聚合层（@modelcontextprotocol/sdk，独立 package.json，暂未用）
-├── tests/                          # 995 用例：agents/mcp/orchestration/safety/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归）
+├── docs/v2/                        # 架构图：*.mmd（mermaid 源）+ *.png（飞书画板渲染，随仓提交，README 内嵌）
+├── tests/                          # 1069 用例：agents/mcp/orchestration/safety/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归）
 ├── evals/                          # 53 条 agent 行为级 evals（感知/操控/停滞）
 ├── ai-docs/                        # 知识库：模块三件套 + catalog + pitfalls（本地维护，不入库）
 ├── notes/                          # 设计纪要 / 实测报告 / 工程实施记录（本地，不入库）
@@ -132,14 +133,17 @@ cd mcp-server && npm install && npm run typecheck
 - ✅ **Task 14 异常现场上报**：`FileIncidentReporter` 落盘现场包，feature-flag `INCIDENT_DIR` 默认关零回归。
 - ⬜ **Task 15 录制→回放**：有意缓做，触发条件 = 接入 Zero 后出现高频重复任务。
 
-**zero-link（第二阶段核心通路已打通）**：
+**zero-link（第二阶段已落地，PR #1 / #2 已并入 `main`）**：
 
 - ✅ **第一阶段（07-14）**：边界契约层——`zero_affect.py` 契约唯一真相 + 感知/表达骨架 + `zerorepo` 跨仓活体回归；Q1-Q4 契约接点与 Zero 窗口往返拍板。
 - ✅ **第二阶段核心通路（07-15/16）**：三款引擎无关 mapper + `RenderingExpressionSink` + external_priors Q3 收口（M3/M5/M6）+ `ZeroLinkClient` 落地，与 `D:\Zero` 真 MCP server **stdio + Streamable HTTP 双传输、真 13 维 FACS 权重端到端联调全绿**。
 - ✅ **§5.1 三模态感知真接入（07-18/20）**：physio（NeuroKit2）→ audio（audeering w2v2）→ vision（EmotiEffLib ONNX）逐路接真，mock 单测锁映射不反转 + gated 真判别性 eval。
-- ⬜ **后续**：HTTP 对外鉴权 token（0.0.0.0 暴露前必须）；真 prosody 模型（`prosody_scale=normalized`）；跨重启会话持久（Zero checkpointer 现 in-memory）；真采集硬件（mic/camera/可穿戴）I/O 适配层；多模态冲突仲裁（另立 PRP）。
+- ✅ **T3 真采集 I/O 适配层（07-23）**：`io_adapters/` 文件/合成信号源工厂注入四通道，硬件（mic/camera/wearable）打桩；适配层不进 Channel 核心、脱硬件可测、零新增依赖。
+- ✅ **T4/T5/T6 MCP 侧收尾（07-22/23，对齐 Zero 已上线）**：T4 prosody `normalized` 防御性 clamp + live E2E；**T5 HTTP Bearer 鉴权**（client `_build_http_client` 注入，401→连接层处理，不走 graceful_step）；T6 unknown-session 机读子类 + 跨重启 resume（`open_session(session_id=)` + `graceful_step` 自动重开重试 + `generate_session_id`）。
+- ✅ **physiology 对称接线 + 消费门控落地（07-23，PR #2 → `main`）**：canonical 收窄为 WESAD 真 `{hr, sc(μS), temp}`；**保超集不收窄**（无法保证所连 Zero 满足「真模型 或 gate on」）；canonical crosscheck 逐值 pin + gate-on / 真模型 E2E live；对抗审查揪出 W6 legacy sc 静默欠标度 ~20×（消费须配 `skin_conductance_max_us=1.0`）。
+- ⬜ **后续**：真 prosody 模型接线（`prosody_scale=normalized` 通路已就绪待模型）；跨重启会话持久（Zero sqlite 后端 resume 已通，memory 后端仍单会话）；真采集硬件（mic/camera/可穿戴）驱动（现为打桩）；多模态冲突仲裁（另立 PRP）；HTTP `0.0.0.0` 对外暴露的部署加固。
 
-**测试**：全套 995 用例，`pytest -m "not realenv"` **989 全绿**（2026-07-21 实跑，56.7s，含 13 条 `zerorepo` 跨仓回归真跑）+ 53 行为 evals；ruff + mypy strict 通过。
+**测试**：`pytest -m "not realenv"` **1069 全绿 / 6 deselected**（2026-07-24 实跑，79.4s，含 `zerorepo` 跨仓回归真跑，`D:\Zero` 在位）+ 53 行为 evals；ruff + mypy strict 通过。
 
 **memory / storage 层**：当前 Protocol 打桩，待随记忆/存储模块实现落地。
 
@@ -148,6 +152,7 @@ cd mcp-server && npm install && npm run typecheck
 - 桌面能力设计蓝图：[notes/2026-07-10-screen-capability-blueprint.md](notes/2026-07-10-screen-capability-blueprint.md) · 实施记录：[notes/2026-07-10-task1-11-implementation-log.md](notes/2026-07-10-task1-11-implementation-log.md) · e2e 标定（含「Win32 状态不可信链」）：[notes/e2e-desktop-task-results.md](notes/e2e-desktop-task-results.md)
 - zero-link 契约蓝图：[notes/2026-07-14-zero-link-contract-blueprint.md](notes/2026-07-14-zero-link-contract-blueprint.md) · 运行时边界拍板：[notes/2026-07-15-zero-answers-boundary-decision.md](notes/2026-07-15-zero-answers-boundary-decision.md) · 续接手册：[notes/2026-07-16-zero-link-continuation-handoff.md](notes/2026-07-16-zero-link-continuation-handoff.md)
 - zero-link 感知选型文献门：[notes/2026-07-16-zero-link-perception-litreview.md](notes/2026-07-16-zero-link-perception-litreview.md) · 三模态真接入纪要：[notes/2026-07-20-zero-link-audio-vision-real-integration.md](notes/2026-07-20-zero-link-audio-vision-real-integration.md)
+- physiology 对称接线契约：[notes/2026-07-23-zero-link-physiology-symmetric-wesad.md](notes/2026-07-23-zero-link-physiology-symmetric-wesad.md) · 消费门控落地（保超集不收窄 + W6）：[notes/2026-07-23-zero-link-physiology-consume-gate-landed.md](notes/2026-07-23-zero-link-physiology-consume-gate-landed.md) · 阶段快照 + 架构图刷新：[notes/2026-07-24-status-snapshot-and-diagrams.md](notes/2026-07-24-status-snapshot-and-diagrams.md)
 - 模块文档（编辑前必读）：[ai-docs/docs/modules/](ai-docs/docs/modules/)（mcp / orchestration / agents / zero-link / memory 五组三件套）
 - 知识总目录：[ai-docs/docs/catalog.md](ai-docs/docs/catalog.md) · 踩坑记录：[ai-docs/pitfalls.md](ai-docs/pitfalls.md)
 

@@ -1,0 +1,37 @@
+flowchart LR
+  subgraph sense["📥 感知输入（MCP → Zero）"]
+    direction TB
+    ph["physio · NeuroKit2<br/>EDA/HRV → arousal（对 valence 盲）"]:::client
+    au["audio · audeering w2v2<br/>维度 SER → (v,a)"]:::client
+    vi["vision · EmotiEffLib ONNX<br/>表情 → (v,a)"]:::client
+    hub["PerceptionHub<br/>多流独立 · 禁均值"]:::client
+    ep["external_priors<br/>逐维精度 · M3/M6 fail-fast"]:::client
+    ph --> hub
+    au --> hub
+    vi --> hub
+    hub --> ep
+  end
+
+  client{{"🔌 ZeroLinkClient<br/>open / step / close<br/>stdio｜HTTP · Bearer · resume"}}:::proto
+  zero(["🧠 Zero 内核<br/>确定性情感计算<br/>外部服务 · 不 import"]):::engine
+
+  subgraph express["📤 表达消费（Zero → MCP）"]
+    direction TB
+    router["ExpressionRouter<br/>spontaneous / voluntary 双通路"]:::sink
+    fmap["ArkitFacsMapper<br/>12 AU → ARKit 52 blendshape"]:::sink
+    pmap["LinearProsodyMapper<br/>→ SSML prosody"]:::sink
+    ymap["LinearPhysiologyMapper<br/>WESAD μS/°C → 动画维"]:::sink
+    frame["RenderFrame<br/>DUAL：含 spontaneous 微表情泄漏帧"]:::sink
+    router --> fmap --> frame
+    router --> pmap --> frame
+    router --> ymap --> frame
+  end
+
+  ep -->|"先验流注入"| client
+  client ==>|"step 注入刺激 (v,a)[+coping]"| zero
+  zero ==>|"expression 字典"| router
+
+  classDef client fill:#F0F4FC,stroke:#5178C6,color:#1F2329
+  classDef proto fill:#FEF1CE,stroke:#D4B45B,color:#1F2329
+  classDef engine fill:#FEE3E2,stroke:#D25D5A,color:#1F2329
+  classDef sink fill:#DFF5E5,stroke:#509863,color:#1F2329
