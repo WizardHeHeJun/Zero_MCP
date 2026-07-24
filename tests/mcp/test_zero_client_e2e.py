@@ -35,7 +35,7 @@ from src.agents.models.zero_affect import (
     ModalityPrior,
 )
 from src.mcp.zero.client import ZeroLinkCallError, ZeroLinkClient, ZeroLinkConnectionError
-from src.mcp.zero.mappers import LinearProsodyMapper, ProsodyParams
+from src.mcp.zero.mappers import LinearPhysiologyMapper, LinearProsodyMapper, ProsodyParams
 
 _ZERO_SERVER = Path("D:/Zero/src/mcp_server/server.py")
 _VALID_FACS = frozenset(FACS_KEYS_EXT)
@@ -43,6 +43,8 @@ _VALID_FACS = frozenset(FACS_KEYS_EXT)
 _FACS_WEIGHT_V2 = Path("D:/Zero/artifacts/facs_decoder_ext_v2.pt")
 # 真 prosody 解码器权重（Zero artifacts；T4 normalized 上线，缺失/无 torch → skip）
 _PROSODY_WEIGHT = Path("D:/Zero/artifacts/prosody_decoder.pt")
+# 真 physiology 解码器权重（Zero artifacts；① WESAD 接线，缺失/无 torch → skip）
+_PHYSIO_WEIGHT = Path("D:/Zero/artifacts/physiology_decoder.pt")
 _TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 _UVICORN_AVAILABLE = importlib.util.find_spec("uvicorn") is not None
 
@@ -123,6 +125,15 @@ class TestZeroClientE2E:
             _assert_valid_head(bundle.spontaneous, "step裸.spontaneous")
             _assert_valid_head(bundle.voluntary, "step裸.voluntary")
             assert bundle.prosody_scale in ("ratio", "normalized", None)
+            # physiology 默认门关（无 canonical env·无真模型）→ legacy 形状 {hr, sc, pupil_mm}
+            # （零回归基线；canonical 门开/真模型形状分别见 test_canonical_placeholder_physiology_
+            # gate_on / test_real_physiology_weights_canonical）。
+            assert bundle.spontaneous.physiology.pupil_mm is not None, (
+                "默认路径（门关无真模型）应出 legacy pupil_mm"
+            )
+            assert bundle.spontaneous.physiology.temperature_c is None, (
+                "默认路径不应出 canonical temperature_c"
+            )
 
             # 3. step 带 external_priors（含 physio eda/sc 流 → server M2 覆写 Πv）→ 被接受
             priors = [
@@ -256,6 +267,116 @@ class TestZeroClientE2E:
             # mapper normalized 分支现 live：用真接线值真跑，确认产有效 ProsodyParams（消费路径通）
             params = await LinearProsodyMapper().map(bundle.spontaneous)
             assert isinstance(params, ProsodyParams)
+            await client.close_session(sid)
+        finally:
+            await client.__aexit__(None, None, None)
+
+    async def test_canonical_placeholder_physiology_gate_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """② 上线：设 ZERO_PHYSIOLOGY_CANONICAL_PLACEHOLDER=true（无真模型）→ 占位出 canonical
+        physiology `{heart_rate_bpm, skin_conductance(μS), temperature_c}`（删 pupil_mm）。
+
+        对齐 Zero 回执（commit b503990+432f8d9）：门 = ZERO_PHYSIOLOGY_CANONICAL_PLACEHOLDER，
+        门开且无真模型 → canonical 占位（议会 2026-07-23 公式）。**纯占位路径无需 torch/权重**——
+        故本用例只要 server 起得来即 live 跑（不 skip on torch）。真跑本仓 mapper 验消费路径通：
+        temperature_c 驱动 skin_temperature_level（非 None）、pupil_dilation=None（无 pupil）。
+        ⚠ sc 中点偏置：占位 arousal=0→0μS，真 decoder 中立态~10μS，**禁跨路径绝对比较**——本用例
+        仅断言 sc 落 μS 域 [0,20]，不断言绝对值。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        _set_stdio_env(monkeypatch)
+        monkeypatch.setenv("ZERO_PHYSIOLOGY_CANONICAL_PLACEHOLDER", "true")
+        # 纯 canonical 占位路径：确保无真 physiology 模型（真模型另有专测）
+        monkeypatch.delenv("ZERO_PHYSIOLOGY_MODEL_PATH", raising=False)
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server：{exc}")
+        try:
+            sid = await client.open_session(persona="physio-canonical-e2e")
+            bundle = await client.step(sid, AffectStimulus(valence=0.6, arousal=0.4))
+            for head_name in ("spontaneous", "voluntary"):
+                head = getattr(bundle, head_name)
+                phys = head.physiology
+                assert phys.temperature_c is not None, (
+                    f"{head_name}: canonical 门开应出 temperature_c，实际 None"
+                )
+                assert phys.pupil_mm is None, (
+                    f"{head_name}: canonical 门开应删 pupil_mm，实际 {phys.pupil_mm}"
+                )
+                assert 50.0 <= phys.heart_rate_bpm <= 120.0, (
+                    f"{head_name}: hr={phys.heart_rate_bpm} 越 canonical 域 [50,120]"
+                )
+                assert 0.0 <= phys.skin_conductance <= 20.0, (
+                    f"{head_name}: sc={phys.skin_conductance} 须 μS 域 [0,20]（禁跨路径比较）"
+                )
+                assert 33.0 <= phys.temperature_c <= 36.0, (
+                    f"{head_name}: temp={phys.temperature_c} 越占位域 [33,36]"
+                )
+            # mapper 真跑：temperature_c 驱动 skin_temperature_level（非 None）、pupil_dilation=None
+            params = await LinearPhysiologyMapper().map(bundle.spontaneous)
+            assert params.skin_temperature_level is not None, (
+                "canonical 有 temperature_c，skin_temperature_level 不应为 None"
+            )
+            assert params.pupil_dilation is None, "canonical 无 pupil_mm，pupil_dilation 应 None"
+            assert 0.0 <= params.skin_conductance_level <= 1.0
+            await client.close_session(sid)
+        finally:
+            await client.__aexit__(None, None, None)
+
+    async def test_real_physiology_weights_canonical(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """① 上线：设 ZERO_PHYSIOLOGY_MODEL_PATH → 真 WESAD decoder 出 canonical physiology
+        `{heart_rate_bpm, skin_conductance(μS), temperature_c}`∈decoder 域（无 pupil_mm）。
+
+        对齐 Zero 回执（① 已实现·`2026-07-23-zero-link-physiology-implemented.md`）：设真模型
+        env → 恒 canonical（gate 不影响真模型路径）。真跑本仓 mapper 验 μS/°C 归一消费路径通。
+        缺 torch/权重即 skip。⚠ 真 decoder 中立态 sc~10μS（sigmoid≈0.5），禁与占位路径跨路径比较——
+        本用例仅断言落 decoder 域 sc[0,20]/temp[30,40]，不断言绝对值。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")
+        if not _TORCH_AVAILABLE:
+            pytest.skip("torch 未安装，跳过真 physiology 权重路径")
+        if not _PHYSIO_WEIGHT.is_file():
+            pytest.skip(f"真 physiology 权重缺失（{_PHYSIO_WEIGHT}）")
+        _set_stdio_env(monkeypatch)
+        monkeypatch.setenv("ZERO_PHYSIOLOGY_MODEL_PATH", str(_PHYSIO_WEIGHT))
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server（真 physiology 权重 import torch/加载失败？）：{exc}")
+        try:
+            sid = await client.open_session(persona="physio-real-e2e")
+            bundle = await client.step(sid, AffectStimulus(valence=0.6, arousal=0.4))
+            for head_name in ("spontaneous", "voluntary"):
+                head = getattr(bundle, head_name)
+                phys = head.physiology
+                assert phys.temperature_c is not None, (
+                    f"{head_name}: 真 decoder 应出 temperature_c，实际 None"
+                )
+                assert phys.pupil_mm is None, (
+                    f"{head_name}: canonical WESAD 无 pupil_mm，实际 {phys.pupil_mm}"
+                )
+                assert 50.0 <= phys.heart_rate_bpm <= 120.0, (
+                    f"{head_name}: hr={phys.heart_rate_bpm} 越 decoder 域 [50,120]"
+                )
+                assert 0.0 <= phys.skin_conductance <= 20.0, (
+                    f"{head_name}: sc={phys.skin_conductance} 越 μS 域 [0,20]"
+                )
+                assert 30.0 <= phys.temperature_c <= 40.0, (
+                    f"{head_name}: temp={phys.temperature_c} 越 decoder 域 [30,40]"
+                )
+            # mapper 真跑：μS/°C 归一，temperature_c 驱动 tlevel、pupil_dilation=None
+            params = await LinearPhysiologyMapper().map(bundle.spontaneous)
+            assert params.skin_temperature_level is not None
+            assert params.pupil_dilation is None
+            assert 0.0 <= params.skin_conductance_level <= 1.0
             await client.close_session(sid)
         finally:
             await client.__aexit__(None, None, None)
