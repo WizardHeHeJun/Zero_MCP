@@ -10,11 +10,11 @@
 
 - **感知栈三层降级**：L1 UIA 系统接口（窗口级定位）· L2 RapidOCR（文本主通道）· L3 视觉（OpenCV 模板匹配 / 可选 OmniParser，**当前占位待扩展**，仅探测不跑推理）。**零训练**（不自训任何模型），**GPU 可选**（CPU 全功能兜底，ONNX EP 自适应 CUDA>DirectML>CPU）。
 - **定向后台感知**：`screen_snapshot(window_handle=)` 指定目标窗口，经 `PrintWindow(PW_RENDERFULLCONTENT)` 直取窗口自身 DWM 渲染面——**被遮挡/无焦点/压 z 序底均可感知，不打扰正在用机的用户**；坐标恒为屏幕绝对（可直接驱动点击）。
-- **关键实证**：微信 4.x（mmui 自绘）与钉钉 7.x 的 UIA 内容树实测覆盖率均 **≈0%**（钉钉 7/7 界面 hollow）——故感知默认 OCR 主通道、操控主路径为坐标点击，逐窗口探测 `uia_hollow` 自动切 OCR（[微信 PoC](notes/poc-uia-coverage-result.md) · [钉钉 e2e 标定](notes/e2e-desktop-task-results.md)）。
+- **关键实证**：微信 4.x（mmui 自绘）与钉钉 7.x 的 UIA 内容树实测覆盖率均 **≈0%**（钉钉 7/7 界面 hollow）——故感知默认 OCR 主通道、操控主路径为坐标点击，逐窗口探测 `uia_hollow` 自动切 OCR。
 - **LangGraph 编排**：Supervisor / StateGraph，高危动作经 `interrupt` 人工确认门，停滞检测 + 断点续跑（Checkpointer）。
 - **安全护栏在编排层**：三级白名单 + TOCTOU 二次截图比对（目标局部裁剪口径）+ 屏幕文字注入过滤（含 23 条中文越权词表，实测 FP=0/159；不依赖模型层防御）。
 
-交付门禁（Task 12 收口时点）：422 单测 + 53 行为 evals 全绿，ruff + mypy strict 通过，独立 code-reviewer 审查 PASS；真实钉钉桌面端到端标定（感知成功率 7/7，OCR conf 均值 0.954，快照延迟 ~1.2s）。实施全程见 [Task 1-11 实施记录](notes/2026-07-10-task1-11-implementation-log.md) · [Task 12 e2e 标定](notes/e2e-desktop-task-results.md)。
+交付质量：单测 + 53 行为 evals 全绿，ruff + mypy strict 通过，独立 code-reviewer 审查 PASS；真实钉钉桌面端到端标定——感知成功率 7/7，OCR conf 均值 0.954，快照延迟 ~1.2s。
 
 ## 能力二：Zero↔MCP 情感对接（zero-link）
 
@@ -45,7 +45,7 @@ zero-link 一轮数据流（感知先验注入 → Zero 确定性计算 → 表�
 
 - **运行态**（LangGraph Checkpointer）与**长期记忆**分离存储。
 - **MCP 传输层不塞业务逻辑**：server 只注册工具 + 转发原语，感知/agent 业务逻辑留在 Python `src/*`。
-- **MCP 层语言判据**：TS = 对外互操作边界；Python = 内部能力封装。感知库（pywinauto/mss/RapidOCR/NeuroKit2 等）是 Python 原语，故内部能力 server/client 用 Python 直连自建，不加 TS 桥（决策依据见 [CLAUDE.md](CLAUDE.md) MCP 层语言澄清）。
+- **MCP 层语言判据**：TS = 对外互操作边界；Python = 内部能力封装。感知库（pywinauto/mss/RapidOCR/NeuroKit2 等）是 Python 原语，故内部能力 server/client 用 Python 直连自建，不加 TS 桥。
 
 ## 技术栈
 
@@ -122,38 +122,5 @@ cd mcp-server && npm install && npm run typecheck
 ```
 
 配置与密钥走 `.env`（复制 `.env.example` 填值，已 gitignore 不入库）。所有能力默认关零回归：屏幕能力 `SCREEN_CAPABILITY_ENABLED=false`、Zero 对接 `ZERO_LINK_ENABLED=false`、三感知通道 `ZERO_{PHYSIO,AUDIO,VISION}_CHANNEL_ENABLED=false`；zero-link 传输/模型/精度旋钮全走 `.env`（见 `.env.example` 注释）。
-
-## 状态
-
-**桌面能力（收口）**：
-
-- ✅ **Task 1-11**：屏幕感知/操控 MCP 层 + agents + LangGraph 编排 + 安全门（code-reviewer PASS）。
-- ✅ **Task 12 端到端标定**：真实钉钉桌面标定全部 gap，修复 3 个 e2e 独有 bug，新增 PrintWindow 定向后台感知。
-- ✅ **Task 13 DPI/多显示器**：双屏 × 双感知路径 × 12 点 PoC 全过（11 点 0.0px），mss 全虚拟屏修复消除副屏盲区。
-- ✅ **Task 14 异常现场上报**：`FileIncidentReporter` 落盘现场包，feature-flag `INCIDENT_DIR` 默认关零回归。
-- ⬜ **Task 15 录制→回放**：有意缓做，触发条件 = 接入 Zero 后出现高频重复任务。
-
-**zero-link（第二阶段已落地，PR #1 / #2 已并入 `main`）**：
-
-- ✅ **第一阶段（07-14）**：边界契约层——`zero_affect.py` 契约唯一真相 + 感知/表达骨架 + `zerorepo` 跨仓活体回归；Q1-Q4 契约接点与 Zero 窗口往返拍板。
-- ✅ **第二阶段核心通路（07-15/16）**：三款引擎无关 mapper + `RenderingExpressionSink` + external_priors Q3 收口（M3/M5/M6）+ `ZeroLinkClient` 落地，与 `D:\Zero` 真 MCP server **stdio + Streamable HTTP 双传输、真 13 维 FACS 权重端到端联调全绿**。
-- ✅ **§5.1 三模态感知真接入（07-18/20）**：physio（NeuroKit2）→ audio（audeering w2v2）→ vision（EmotiEffLib ONNX）逐路接真，mock 单测锁映射不反转 + gated 真判别性 eval。
-- ✅ **T3 真采集 I/O 适配层（07-23）**：`io_adapters/` 文件/合成信号源工厂注入四通道，硬件（mic/camera/wearable）打桩；适配层不进 Channel 核心、脱硬件可测、零新增依赖。
-- ✅ **T4/T5/T6 MCP 侧收尾（07-22/23，对齐 Zero 已上线）**：T4 prosody `normalized` 防御性 clamp + live E2E；**T5 HTTP Bearer 鉴权**（client `_build_http_client` 注入，401→连接层处理，不走 graceful_step）；T6 unknown-session 机读子类 + 跨重启 resume（`open_session(session_id=)` + `graceful_step` 自动重开重试 + `generate_session_id`）。
-- ✅ **physiology 对称接线 + 消费门控落地（07-23，PR #2 → `main`）**：canonical 收窄为 WESAD 真 `{hr, sc(μS), temp}`；**保超集不收窄**（无法保证所连 Zero 满足「真模型 或 gate on」）；canonical crosscheck 逐值 pin + gate-on / 真模型 E2E live；对抗审查揪出 W6 legacy sc 静默欠标度 ~20×（消费须配 `skin_conductance_max_us=1.0`）。
-- ⬜ **后续**：真 prosody 模型接线（`prosody_scale=normalized` 通路已就绪待模型）；跨重启会话持久（Zero sqlite 后端 resume 已通，memory 后端仍单会话）；真采集硬件（mic/camera/可穿戴）驱动（现为打桩）；多模态冲突仲裁（另立 PRP）；HTTP `0.0.0.0` 对外暴露的部署加固。
-
-**测试**：`pytest -m "not realenv"` **1069 全绿 / 6 deselected**（2026-07-24 实跑，79.4s，含 `zerorepo` 跨仓回归真跑，`D:\Zero` 在位）+ 53 行为 evals；ruff + mypy strict 通过。
-
-**memory / storage 层**：当前 Protocol 打桩，待随记忆/存储模块实现落地。
-
-## 深入阅读
-
-- 桌面能力设计蓝图：[notes/2026-07-10-screen-capability-blueprint.md](notes/2026-07-10-screen-capability-blueprint.md) · 实施记录：[notes/2026-07-10-task1-11-implementation-log.md](notes/2026-07-10-task1-11-implementation-log.md) · e2e 标定（含「Win32 状态不可信链」）：[notes/e2e-desktop-task-results.md](notes/e2e-desktop-task-results.md)
-- zero-link 契约蓝图：[notes/2026-07-14-zero-link-contract-blueprint.md](notes/2026-07-14-zero-link-contract-blueprint.md) · 运行时边界拍板：[notes/2026-07-15-zero-answers-boundary-decision.md](notes/2026-07-15-zero-answers-boundary-decision.md) · 续接手册：[notes/2026-07-16-zero-link-continuation-handoff.md](notes/2026-07-16-zero-link-continuation-handoff.md)
-- zero-link 感知选型文献门：[notes/2026-07-16-zero-link-perception-litreview.md](notes/2026-07-16-zero-link-perception-litreview.md) · 三模态真接入纪要：[notes/2026-07-20-zero-link-audio-vision-real-integration.md](notes/2026-07-20-zero-link-audio-vision-real-integration.md)
-- physiology 对称接线契约：[notes/2026-07-23-zero-link-physiology-symmetric-wesad.md](notes/2026-07-23-zero-link-physiology-symmetric-wesad.md) · 消费门控落地（保超集不收窄 + W6）：[notes/2026-07-23-zero-link-physiology-consume-gate-landed.md](notes/2026-07-23-zero-link-physiology-consume-gate-landed.md) · 阶段快照 + 架构图刷新：[notes/2026-07-24-status-snapshot-and-diagrams.md](notes/2026-07-24-status-snapshot-and-diagrams.md)
-- 模块文档（编辑前必读）：[ai-docs/docs/modules/](ai-docs/docs/modules/)（mcp / orchestration / agents / zero-link / memory 五组三件套）
-- 知识总目录：[ai-docs/docs/catalog.md](ai-docs/docs/catalog.md) · 踩坑记录：[ai-docs/pitfalls.md](ai-docs/pitfalls.md)
 
 > 说明：本仓库仅跟踪 Zero_MCP 工程代码（`src/` · `tests/` · 配置）。项目自用的 Claude Code harness（`.claude/` · `CLAUDE.md`）、知识库（`ai-docs/`）、设计纪要（`notes/`）、PRP 工作区（`PRP/` · `ai-shared/`）、行为 evals（`evals/`）与交接文档（`HANDOFF.md`）经 `.git/info/exclude` 本地排除，不随本仓库提交，仅在本地开发环境维护。
