@@ -798,3 +798,173 @@ class TestPhysioChannelNaNGuard:
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# 秒制化参数（window_seconds / cold_start_seconds）—— 采样率无关的窗口推导
+# ---------------------------------------------------------------------------
+
+
+class TestEdaChannelSecondsParameterization:
+    """percentile 滚动窗从「样本数硬编码」改为「秒 × 构造期采样率」推导（采样率无关）。
+
+    修 footgun：固定 window=60 在 4Hz=15s、但 256Hz 仅 0.23s（窗口塌缩「崩」）。秒制化后同一
+    window_seconds 在任意采样率下都覆盖等长时间历史。显式样本数覆盖
+    （percentile_window/percentile_cold_start 非 None）优先——保既有调用零回归。
+    """
+
+    def test_default_seconds_derive_legacy_sample_defaults(self) -> None:
+        """默认 window_seconds=15 / cold_start_seconds=10 @ 4Hz → 60 / 40（与旧样本默认等价）。"""
+        ch = EdaChannel(sampling_rate=4, normalization="percentile")
+        assert ch.percentile_window == 60
+        assert ch.percentile_cold_start == 40
+        assert ch._amplitude_history["highpass"].maxlen == 60
+        assert ch._amplitude_history["cvxEDA"].maxlen == 60
+
+    def test_window_seconds_is_sampling_rate_invariant(self) -> None:
+        """同一 window_seconds=15 在 4/8/256Hz 下 deque maxlen 随采样率成比例（footgun 修复）。"""
+        assert EdaChannel(sampling_rate=4, normalization="percentile").percentile_window == 60
+        assert EdaChannel(sampling_rate=8, normalization="percentile").percentile_window == 120
+        assert EdaChannel(sampling_rate=256, normalization="percentile").percentile_window == 3840
+
+    def test_cold_start_seconds_is_sampling_rate_invariant(self) -> None:
+        """cold_start_seconds=10 在 4/8Hz 下 → 40 / 80 样本（随采样率成比例）。"""
+        assert EdaChannel(sampling_rate=4, normalization="percentile").percentile_cold_start == 40
+        assert EdaChannel(sampling_rate=8, normalization="percentile").percentile_cold_start == 80
+
+    def test_custom_window_seconds_derives_maxlen_with_round(self) -> None:
+        """自定义 window_seconds 经 round(seconds×rate) 推导 maxlen（含小数积 round）。"""
+        ch = EdaChannel(sampling_rate=8, normalization="percentile", window_seconds=5.0)
+        assert ch.percentile_window == 40
+        assert ch._amplitude_history["highpass"].maxlen == 40
+        # 小数积 round：7Hz × 2.4s = 16.8 → 17
+        ch2 = EdaChannel(sampling_rate=7, normalization="percentile", window_seconds=2.4)
+        assert ch2.percentile_window == 17
+
+    def test_explicit_sample_override_wins_over_seconds(self) -> None:
+        """显式样本数覆盖（percentile_window/percentile_cold_start）优先于秒制参数。"""
+        ch = EdaChannel(
+            sampling_rate=8,
+            normalization="percentile",
+            window_seconds=999.0,  # 若被采用 → 7992；断言其被样本数覆盖
+            cold_start_seconds=999.0,
+            percentile_window=20,
+            percentile_cold_start=5,
+        )
+        assert ch.percentile_window == 20
+        assert ch.percentile_cold_start == 5
+        assert ch._amplitude_history["highpass"].maxlen == 20
+
+    def test_legacy_style_construction_unchanged(self) -> None:
+        """旧式构造（只传样本数）解析值与旧默认完全一致——零回归。"""
+        ch = EdaChannel(
+            sampling_rate=8,
+            normalization="percentile",
+            percentile_window=60,
+            percentile_cold_start=40,
+        )
+        assert ch.percentile_window == 60
+        assert ch.percentile_cold_start == 40
+
+    def test_nonpositive_window_seconds_floored_to_one(self) -> None:
+        """window_seconds≤0 退化输入被 max(1,…) 兜底，不产 maxlen=0 死 deque。"""
+        ch = EdaChannel(sampling_rate=4, normalization="percentile", window_seconds=0.0)
+        assert ch.percentile_window == 1
+        assert ch._amplitude_history["highpass"].maxlen == 1
+
+    def test_nonpositive_cold_start_seconds_floored_to_one(self) -> None:
+        """cold_start_seconds≤0 退化输入被 max(1,…) 兜底（与 window 侧对称）。"""
+        ch = EdaChannel(sampling_rate=4, normalization="percentile", cold_start_seconds=0.0)
+        assert ch.percentile_cold_start == 1
+
+    def test_explicit_window_zero_floored_to_one(self) -> None:
+        """显式 percentile_window=0/cold_start=0（笔误）被 max(1,…) 兜底，不产死 deque。"""
+        ch = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            percentile_window=0,
+            percentile_cold_start=0,
+        )
+        assert ch.percentile_window == 1
+        assert ch.percentile_cold_start == 1
+        assert ch._amplitude_history["highpass"].maxlen == 1
+
+    def test_cold_start_gt_window_warns_in_percentile(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """percentile 模式下 cold_start > window → 构造期告警（恒退化 linear 的真条件）。"""
+        with caplog.at_level(logging.WARNING):
+            EdaChannel(
+                sampling_rate=4,
+                normalization="percentile",
+                percentile_window=10,
+                percentile_cold_start=11,
+            )
+        assert any("恒退化为 linear" in r.getMessage() for r in caplog.records)
+
+    def test_cold_start_seconds_gt_window_seconds_warns_via_derivation(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """秒制推导路径 footgun：cold_start_seconds > window_seconds → 推导 cold>window → 告警。
+
+        window_seconds=15 / cold_start_seconds=20 @4Hz → 推导 window=60、cold_start=80（80>60）。
+        守卫此路径——重构新增暴露面，勿只经显式样本数覆盖路径触发告警。
+        """
+        with caplog.at_level(logging.WARNING):
+            ch = EdaChannel(
+                sampling_rate=4,
+                normalization="percentile",
+                window_seconds=15.0,
+                cold_start_seconds=20.0,
+            )
+        assert ch.percentile_window == 60
+        assert ch.percentile_cold_start == 80
+        assert any("恒退化为 linear" in r.getMessage() for r in caplog.records)
+
+    def test_cold_start_equals_window_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """cold_start == window 是满窗后激活的边界（功能仍可用）→ 严格 > 条件下**不**告警。"""
+        with caplog.at_level(logging.WARNING):
+            EdaChannel(
+                sampling_rate=4,
+                normalization="percentile",
+                percentile_window=10,
+                percentile_cold_start=10,
+            )
+        assert not any("恒退化为 linear" in r.getMessage() for r in caplog.records)
+
+    def test_cold_start_gt_window_silent_in_linear(self, caplog: pytest.LogCaptureFixture) -> None:
+        """linear 模式（percentile 参数无关）即便 cold_start > window 也不告警。"""
+        with caplog.at_level(logging.WARNING):
+            EdaChannel(
+                sampling_rate=4,
+                normalization="linear",
+                percentile_window=10,
+                percentile_cold_start=11,
+            )
+        assert not any("恒退化为 linear" in r.getMessage() for r in caplog.records)
+
+    async def test_seconds_derived_cold_start_gates_warmup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """经 cold_start_seconds 推导的暖机阈值真正门控冷启动：未达阈值时 == linear。
+
+        sampling_rate=4, cold_start_seconds=1.25 → round(1.25×4)=5；喂 4 次（<5）应恒等 linear。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch_pct = EdaChannel(
+            sampling_rate=4,
+            normalization="percentile",
+            cold_start_seconds=1.25,  # → cold_start=5
+        )
+        assert ch_pct.percentile_cold_start == 5
+        phasic_values = [0.1, 0.3, 0.5, 0.2]  # 4 次 < 5，全程冷启动
+        for phasic_val in phasic_values:
+            ch_lin = EdaChannel(sampling_rate=4, normalization="linear")
+            nk_pct = _make_nk_mock(phasic_value=phasic_val)
+            nk_lin = _make_nk_mock(phasic_value=phasic_val)
+            with patch.dict("sys.modules", {"neurokit2": nk_pct}):
+                result_pct = await ch_pct.sense(signal=_make_eda_signal(rate=4))
+            with patch.dict("sys.modules", {"neurokit2": nk_lin}):
+                result_lin = await ch_lin.sense(signal=_make_eda_signal(rate=4))
+            assert result_pct is not None and result_lin is not None
+            assert result_pct.mu[1] == pytest.approx(result_lin.mu[1], abs=1e-9)

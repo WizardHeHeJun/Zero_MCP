@@ -117,20 +117,27 @@ class EdaChannel:
         normalization:        归一化策略：``"linear"``（默认）或 ``"percentile"``（有状态自适应）。
         signal_source:        async callable → dict | None；PerceptionHub 无参调 sense()
                               时由此获取信号；测试可直接向 sense(signal=...) 传 dict 绕过。
-        percentile_window:    滚动历史最大长度（工程假设，接真被试数据再校）。默认 60。
-                              单位=样本数；4Hz=15s（落文献 5–20s 区间），8Hz=7.5s，
-                              256Hz=0.23s（崩）。高采样率接入时应按秒换算覆盖此参数；
-                              「按秒参数化(window_seconds×sampling_rate)」列为真数据到位
-                              后的重构 TODO。
-        percentile_cold_start: 未达此样本数时走冷启动回退（工程假设，接真被试数据再校）。
-                              默认 40（4Hz 下约 10s，落 Matesanz 5–20s 区间；折中安全下界）。
+        window_seconds:       滚动历史时间跨度（秒，**采样率无关的主参数**）。默认 15.0（落文献
+                              5–20s 区间）。样本数经 ``round(window_seconds × sampling_rate)``
+                              推导：4Hz→60、8Hz→120、256Hz→3840——同一时间跨度在任意采样率下
+                              覆盖等长历史（修 sample-count 硬编码 footgun：固定 60 在 4Hz=15s、
+                              256Hz 仅 0.23s「崩」）。⚠ 按构造期 sampling_rate 解析；per-call 覆盖
+                              sampling_rate 只改 SCR 提取，不改 deque maxlen（窗固定于构造）。
+        cold_start_seconds:   冷启动暖机时长（秒，采样率无关）。默认 10.0（4Hz→40 样本，落 Matesanz
+                              5–20s 区间；折中安全下界）。样本数经 ``round(cold_start_seconds ×
+                              构造期 sampling_rate)`` 推导，未达前回退 linear（零回归过渡）。
                               依据：Lahlou 2022 [PMC9197539] N<20 时 P5/P95 尾分位不可靠
                               （90%CI 需≥175）；Oliveira 2019 [PMC6294150] 偏态数据尾分位
-                              建议≥120–300 样本；此处 40 仍工程假设，真数据再校。
-                              ⚠ percentile 适配的是 SCR 事件密度历史（非原始幅度，
-                              standardize 已消幅度差）。
-                              ⚠ 须 < percentile_window，否则 deque(maxlen=window) 永达不到
-                              阈值、**静默恒退 linear**（扫描实证 cold_start=80/window=60→Δ=0）。
+                              建议≥120–300 样本；秒数与阈值仍工程假设，真被试数据再校。
+                              ⚠ percentile 适配的是 SCR 事件密度历史（非原始幅度，standardize 已消
+                              幅度差）。⚠ 解析后 cold_start > window 时 deque(maxlen=window) 永达
+                              不到暖机阈值、percentile 恒退化 linear——构造时**告警**（不再静默）；
+                              cold_start==window 为满窗后激活的边界（功能仍可用、不告警）。
+        percentile_window:    **样本数显式覆盖**（int，None=由 window_seconds 推导）。默认 None。
+                              传非 None 时直接作 deque maxlen、优先于 window_seconds——保精确控制与
+                              既有调用零回归。解析后 max(1,…) 兜底：0/负 → 1，不产死 deque。
+        percentile_cold_start: **样本数显式覆盖**（int，None=由 cold_start_seconds 推导）。默认
+                              None。传非 None 时优先于 cold_start_seconds。
         percentile_range:     分位范围 (q_low, q_high)（工程假设，接真被试数据再校）。
                               默认 (5, 95)。P5/P95 Winsorization 有文献背书、优于 min/max
                               （Lykken 原典 min/max 对伪迹不鲁棒）；样本量不足时可退 (10,90)，
@@ -144,21 +151,53 @@ class EdaChannel:
         sampling_rate: int = 4,
         normalization: Literal["linear", "percentile"] = "linear",
         signal_source: Any | None = None,
-        percentile_window: int = 60,
-        percentile_cold_start: int = 40,
+        window_seconds: float = 15.0,
+        cold_start_seconds: float = 10.0,
+        percentile_window: int | None = None,
+        percentile_cold_start: int | None = None,
         percentile_range: tuple[int, int] = (5, 95),
     ) -> None:
         self.sampling_rate = sampling_rate
         self.normalization = normalization
         self.signal_source = signal_source
-        self.percentile_window = percentile_window
-        self.percentile_cold_start = percentile_cold_start
+        self.window_seconds = window_seconds
+        self.cold_start_seconds = cold_start_seconds
         self.percentile_range = percentile_range
+
+        # 秒制化解析：窗/冷启动 = round(秒 × 构造期 sampling_rate)，采样率无关（修固定 60 在
+        # 256Hz=0.23s「崩」的 footgun）。显式样本数覆盖（非 None）优先——保精确控制与既有调用零回归。
+        # max(1,…) 对推导+覆盖两路兜底：window_seconds≤0 或误传 percentile_window=0 均不产死 deque。
+        resolved_window = (
+            percentile_window
+            if percentile_window is not None
+            else round(window_seconds * sampling_rate)
+        )
+        resolved_cold_start = (
+            percentile_cold_start
+            if percentile_cold_start is not None
+            else round(cold_start_seconds * sampling_rate)
+        )
+        self.percentile_window = max(1, resolved_window)
+        self.percentile_cold_start = max(1, resolved_cold_start)
+        # cold_start > window 时 deque(maxlen=window) 永达不到暖机阈值 → percentile 恒退化 linear
+        # （原静默 footgun）。== 边界满窗后仍激活、功能可用，不在此列（门控是 size<cold_start）。
+        # 不 raise（保优雅回退），仅 percentile 模式告警。
+        if (
+            self.normalization == "percentile"
+            and self.percentile_cold_start > self.percentile_window
+        ):
+            logger.warning(
+                "EdaChannel percentile：cold_start(%d) > window(%d)，deque 永达不到暖机阈值，"
+                "percentile 恒退化为 linear。请增大 window_seconds 或减小 cold_start_seconds。",
+                self.percentile_cold_start,
+                self.percentile_window,
+            )
+
         # 按 method 分桶的滚动幅度历史（逐实例状态，非全局）
         # key: "cvxEDA" | "highpass"；value: 最近 percentile_window 个 scr_amplitude 值
         self._amplitude_history: dict[str, collections.deque[float]] = {
-            "cvxEDA": collections.deque(maxlen=percentile_window),
-            "highpass": collections.deque(maxlen=percentile_window),
+            "cvxEDA": collections.deque(maxlen=self.percentile_window),
+            "highpass": collections.deque(maxlen=self.percentile_window),
         }
         # 保护 _amplitude_history 的读改写：_process 现经 asyncio.to_thread 在线程池执行
         # （对齐 audio/vision，不阻塞事件循环），同实例并发 collect 时多线程会并发读改同一
