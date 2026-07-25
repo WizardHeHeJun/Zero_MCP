@@ -150,10 +150,12 @@ class PhysiologyChannel(BaseModel):
     - skin_conductance: 皮肤电导 **μS**（微西门子物理单位，非 [0,1]），参考 [0, 20]（EDA）。
     - temperature_c:    皮肤温度 °C，参考 [30, 40]（decoder 反归一化）。
 
-    ⚠ **过渡期兼容**：`temperature_c` 与 `pupil_mm` 均**可选**（默认 None）以支持跨仓迁移不原子——
-    Zero 占位路径当前仍出旧 avatar 形状 `{hr, sc, pupil_mm}`（无 temp），本模型两字段皆可选故两种
-    形状都解析（零回归）。**canonical 目标**：`temperature_c` 出现、`pupil_mm` 弃用移除——待 Zero
-    占位迁移到 `{hr, sc(μS), temp}` + 接线真 decoder 后，收窄 temperature_c 为必填并删 pupil_mm。
+    ⚠ **保超集，不收窄（2026-07-23 定论，非过渡态）**：`temperature_c` 与 `pupil_mm` 均**可选**
+    （默认 None），两种形状都解析。Zero 侧迁移**已落地**（真 decoder + `ZERO_PHYSIOLOGY_CANONICAL_
+    PLACEHOLDER` 门），但 canonical 的充要条件是「真模型 **或** gate on」，而两仓独立部署、该门默认
+    关 → 本仓无法保证所连 Zero 实例满足条件，收到 legacy `{hr, sc, pupil_mm}` 仍须不报错。
+    **故「收窄 temperature_c 为必填 + 删 pupil_mm」不是待办**，仅在部署侧能保证充要条件时才可议；
+    依据见 notes/2026-07-23-zero-link-physiology-consume-gate-landed.md §1。
     契约不硬卡数值范围，消费方（mapper）按实际引擎范围归一。
     """
 

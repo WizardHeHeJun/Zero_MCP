@@ -144,6 +144,26 @@ async def _run_resume_across_restart(session_id: str) -> tuple[float, float]:
     return va
 
 
+async def _assert_readout_deterministic(va_reference: tuple[float, float]) -> None:
+    """确定性 canary：同 `_RESUME_CONFIG` 再跑一次全新 1 步，应与 `va_reference` **逐字一致**。
+
+    分离两种失败：**读出非确定** vs **resume 失效**。`affect_readout="map"` 是 `SessionConfig`
+    字段，经 `open_session(config=)` 传入；Zero `server.py:97-104` 对**未命中允许键的 override
+    静默丢弃、零日志**（非门控字段也走同一过滤器），一旦键名/白名单漂移就回落默认 `"sample"` +
+    `rng_seed=None`（`runner.py:49-51`）→ 每步新建 `random.Random()` 采样，噪声 σ≈O(0.1) 远大于
+    `_RESUME_TRANSPARENCY_TOL`。彼时下方 transparency 断言会以「运行态未跨重启恢复（sqlite/
+    resume-by-id 失效？）」的文案报红，把排障整轮带偏——故先用本 canary 报出真正的病因。
+    """
+    va_again = await _run_strong_steps(1)
+    assert _va_maxdiff(va_again, va_reference) < _RESUME_TRANSPARENCY_TOL, (
+        f"确定性 canary 失败：同 config 两次全新 1 步 {va_reference} vs {va_again}"
+        f"（差 {_va_maxdiff(va_again, va_reference):.2e}，应 < {_RESUME_TRANSPARENCY_TOL:.0e}）。"
+        f"读出已非确定 → config override {_RESUME_CONFIG!r} 很可能被 Zero server 的 config "
+        f"过滤器**静默丢弃**（回落 'sample' 随机读出）。**先查 Zero 允许键白名单，再怀疑 "
+        f"resume/sqlite**——下方 transparency/state-margin 断言在此前提下均不可信。"
+    )
+
+
 def _assert_valid_head(head: object, ctx: str) -> None:
     """对抗核验单个 ExpressionHead：facs_au 键 ⊆ 全集、值 [0,1]、text_label 合法。"""
     facs_au: dict[str, float] = head.facs_au  # type: ignore[attr-defined]
@@ -634,6 +654,8 @@ class TestZeroClientResumeAcrossRestart:
         except ZeroLinkConnectionError as exc:
             pytest.skip(f"连不上 Zero server（是否在 affective-expression 环境跑？）：{exc}")
         va_fresh1 = await _run_strong_steps(1)
+        # 确定性 canary：先排除「config override 被静默丢弃 → 随机读出」，再谈 resume 是否失效
+        await _assert_readout_deterministic(va_fresh1)
 
         # 跨重启 split：PRE 步 → 杀 server → 重启 resume → 第 PRE+1 步
         va_resumed = await _run_resume_across_restart(generate_session_id())
@@ -675,6 +697,8 @@ class TestZeroClientResumeAcrossRestart:
             va_fresh1 = await _run_strong_steps(1)
         except ZeroLinkConnectionError as exc:
             pytest.skip(f"连不上 Zero server（是否在 affective-expression 环境跑？）：{exc}")
+        # 同 canary：本用例的等值断言（tol 1e-6）同样只有在读出确定时才有意义
+        await _assert_readout_deterministic(va_fresh1)
         va_mem_resumed = await _run_resume_across_restart(generate_session_id())
 
         # memory 后端：重启后 resume 拿不到旧 checkpoint → 第 PRE+1 步退化为全新第 1 步
