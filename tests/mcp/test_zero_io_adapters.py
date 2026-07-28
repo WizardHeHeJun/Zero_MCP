@@ -36,13 +36,11 @@ import soundfile as sf
 
 from src.mcp.zero.io_adapters import (
     make_audio_file_source,
+    make_camera_source,
+    make_mic_source,
     make_synthetic_eda_source,
     make_synthetic_hrv_source,
     make_vision_file_source,
-)
-from src.mcp.zero.io_adapters._hardware_stubs import (
-    make_camera_source,
-    make_mic_source,
     make_wearable_source,
 )
 
@@ -428,24 +426,120 @@ class TestVisionFileInjectionSmoke:
 
 
 # ---------------------------------------------------------------------------
-# S1-S3：硬件桩 → NotImplementedError
+# H1-H8：真硬件适配器（mic / camera / wearable）
+#
+# 核心契约（脱设备可测的关键）：**构造工厂永不抛**；缺库 / 无设备 / 读取失败一律由返回的
+# callable 产 None，交 Channel 走既有「本轮无证据」优雅回退。故本组全部在无硬件环境下运行。
 # ---------------------------------------------------------------------------
 
 
-class TestHardwareStubs:
-    """硬件桩工厂函数均抛 NotImplementedError（T3 桩）。"""
+def _hide_module(name: str) -> Any:
+    """patch.dict 上下文：让 `import <name>` 抛 ImportError（模拟缺库）。"""
+    return patch.dict("sys.modules", {name: None})
 
-    def test_make_mic_source_raises(self) -> None:
-        """S1：make_mic_source() → NotImplementedError。"""
-        with pytest.raises(NotImplementedError):
-            make_mic_source()
 
-    def test_make_camera_source_raises(self) -> None:
-        """S2：make_camera_source() → NotImplementedError。"""
-        with pytest.raises(NotImplementedError):
-            make_camera_source()
+class TestHardwareAdapters:
+    """真硬件信号源工厂：构造不抛、缺库/失败优雅回退 None、成功路径形状正确。"""
 
-    def test_make_wearable_source_raises(self) -> None:
-        """S3：make_wearable_source() → NotImplementedError。"""
-        with pytest.raises(NotImplementedError):
-            make_wearable_source()
+    def test_factories_never_raise_on_construction(self) -> None:
+        """H1：三个工厂在无任何硬件/库的环境下**构造均不抛**（替代旧的 NotImplementedError 桩）。"""
+        assert callable(make_mic_source())
+        assert callable(make_camera_source())
+        assert callable(make_wearable_source())
+
+    async def test_mic_missing_lib_returns_none(self) -> None:
+        """H2：缺 sounddevice → 返回 None（不抛），Channel 侧按无证据处理。"""
+        source = make_mic_source()
+        with _hide_module("sounddevice"):
+            assert await source() is None
+
+    async def test_mic_success_shape(self) -> None:
+        """H3：录音成功 → 1-D float32 帧，长度 = sample_rate × chunk_duration_s。"""
+        fake_sd = MagicMock()
+        fake_sd.rec.return_value = np.zeros((800, 1), dtype=np.float32)
+        source = make_mic_source(sample_rate=400, chunk_duration_s=2.0)
+        with patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            frame = await source()
+        assert frame is not None
+        assert frame.dtype == np.float32 and frame.ndim == 1 and frame.size == 800
+        assert fake_sd.rec.call_args.args[0] == 800  # frames = 400×2.0
+        fake_sd.wait.assert_called_once()  # 必须等录制完成，否则拿到未填充缓冲
+
+    async def test_mic_device_error_returns_none(self) -> None:
+        """H4：sounddevice 抛库内异常（无输入设备等）→ None，不外泄异常。"""
+        fake_sd = MagicMock()
+        fake_sd.rec.side_effect = RuntimeError("PortAudio: no input device")
+        source = make_mic_source()
+        with patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            assert await source() is None
+
+    async def test_camera_cannot_open_returns_none(self) -> None:
+        """H5：摄像头打不开 → None，且**必须 release**（否则设备被长期占用）。"""
+        fake_cv2 = MagicMock()
+        cap = MagicMock()
+        cap.isOpened.return_value = False
+        fake_cv2.VideoCapture.return_value = cap
+        source = make_camera_source(device=3)
+        with patch.dict("sys.modules", {"cv2": fake_cv2}):
+            assert await source() is None
+        cap.release.assert_called_once()
+
+    async def test_camera_success_returns_rgb_uint8(self) -> None:
+        """H6：抓帧成功 → RGB uint8 帧；无 YuNet 路径时返回整帧且已 BGR→RGB。"""
+        fake_cv2 = MagicMock()
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.return_value = (True, np.zeros((4, 5, 3), dtype=np.uint8))
+        fake_cv2.VideoCapture.return_value = cap
+        fake_cv2.cvtColor.return_value = np.ones((4, 5, 3), dtype=np.uint8)
+        source = make_camera_source()
+        with patch.dict("sys.modules", {"cv2": fake_cv2}):
+            frame = await source()
+        assert frame is not None and frame.dtype == np.uint8 and frame.shape == (4, 5, 3)
+        fake_cv2.cvtColor.assert_called()  # BGR→RGB 转换必须发生
+        cap.release.assert_called_once()
+
+    async def test_wearable_missing_lib_returns_none(self) -> None:
+        """H7：缺 pyserial → None（不抛）。"""
+        source = make_wearable_source()
+        with _hide_module("serial"):
+            assert await source() is None
+
+    async def test_wearable_insufficient_samples_returns_none(self) -> None:
+        """H8：样本不足 → None（宁可判无证据，也不产会让 RMSSD 不可靠的短信号）。
+
+        判别性：同一 mock 下把 duration 调到样本够用即应成功——证明 None 来自「样本不足」
+        这一条判定，而非串口路径整体不通。
+        """
+        fake_serial = MagicMock()
+        port = MagicMock()
+        # 只吐 5 个样本后返回空字节（设备停止输出）
+        port.readline.side_effect = [b"0.1\n", b"0.2\n", b"0.3\n", b"0.4\n", b"0.5\n", b""]
+        fake_serial.Serial.return_value.__enter__.return_value = port
+        fake_mod = MagicMock()
+        fake_mod.Serial = fake_serial.Serial
+        fake_tools = MagicMock()
+        fake_tools.comports.return_value = [MagicMock(device="COM9")]
+
+        mods = {
+            "serial": fake_mod,
+            "serial.tools": MagicMock(),
+            "serial.tools.list_ports": fake_tools,
+        }
+        fake_mod.tools = MagicMock()
+
+        # 需要 10 个样本但只有 5 个 → None
+        source = make_wearable_source(port="COM9", sampling_rate=10, duration_s=1.0)
+        with patch.dict("sys.modules", mods):
+            with patch("serial.tools.list_ports", fake_tools, create=True):
+                assert await source() is None
+
+        # 判别性对照：需要 5 个样本 → 成功且形状正确
+        port.readline.side_effect = [b"0.1\n", b"0.2\n", b"0.3\n", b"0.4\n", b"0.5\n"]
+        source_ok = make_wearable_source(port="COM9", sampling_rate=5, duration_s=1.0)
+        with patch.dict("sys.modules", mods):
+            with patch("serial.tools.list_ports", fake_tools, create=True):
+                result = await source_ok()
+        assert result is not None
+        assert result["sampling_rate"] == 5
+        assert result["ecg_or_ppg"].shape == (5,)
