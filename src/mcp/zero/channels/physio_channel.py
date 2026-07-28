@@ -92,6 +92,22 @@ class EdaChannel:
     从注入的 EDA 信号提取 SCR 幅度，归一化为 arousal 分量。
     valence 恒 0.0（EDA 对 valence 盲，Kreibig 2010）。
 
+    🔴 **已知失效（2026-07-28 WESAD 真被试实测，尚未修复）**：本通道的 arousal 读数
+    **在真数据上与唤醒系统性反相关**，勿作真实唤醒指标消费。
+    实测（`notes/2026-07-28-wesad-eda-metric-invalidation.md`，15 被试中取 5 例）：
+    「stress > baseline」排序正确率**我方 1/5、经典 SCL 4/5**；跨采样率极差中位数 0.68
+    （协议 G1 阈值 0.15）、12 组中 8 组饱和到 ±1.0。
+    根因不在 `_SCR_REF_AMPLITUDE*` 两个常量，而在 `_process` 的 **per-window
+    `nk.standardize`**：z-score 抹掉绝对水平后，`EDA_Phasic.abs().mean()` 实际度量的是
+    「相位成分占窗内总方差的比例」；而真实唤醒的主载体是**缓慢的紧张性上升**（stress 段
+    SCL 斜率 +0.35~+1.78 μS/窗），它在 z-score 后越大越主导方差 → 相位占比反而越小。
+    合成 `nk.eda_simulate` eval 长期全绿，是因为合成信号紧张性平坦、只变 SCR 数——
+    恰好落在该度量唯一成立的区域。
+    修法属**度量重设计**（取消 per-window standardize / 改用 μS 绝对量或 SCL 斜率 /
+    改用 SCR 频次），命中关键设计决策 → 须走 `/algo-team` 文献门，不在工程侧直接改。
+    当前无生产影响：physio 先验在 Zero 点燃门下恒不可点燃（对内核零贡献）；但 Zero 正在
+    修点燃门，**一旦 physio 变为可点燃，此反号读数会真的污染内核**——两者是同一条时间线。
+
     **Protocol 兼容**：结构上满足 PerceptionChannel Protocol（无需继承）：
     - name: str 属性（"eda/sc"）。
     - async sense(signal=None) -> ModalityPrior | None（signal 有默认值=无参可调）。
