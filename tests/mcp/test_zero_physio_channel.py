@@ -265,7 +265,9 @@ class TestPhysioChannelInPerceptionHub:
         eda_ch.signal_source = AsyncMock(return_value=_make_eda_signal(rate=8))
 
         # 构造一个抛异常的 mock 通道
-        bad_ch: Any = MagicMock()
+        # spec 限定：裸 MagicMock 会自动伪造 prepare/reset 等可选协议方法，令 Hub 的鸭子类型
+        # 检测误判（并 await 一个不可等待的 mock）。只暴露 Protocol 真实成员。
+        bad_ch: Any = MagicMock(spec=["name", "sense"])
         bad_ch.name = "bad_channel"
         bad_ch.sense = AsyncMock(side_effect=RuntimeError("设备故障"))
 

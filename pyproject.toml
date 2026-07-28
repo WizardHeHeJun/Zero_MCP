@@ -98,6 +98,7 @@ module = [
     "neurokit2",
     "emotiefflib",
     "emotiefflib.facial_analysis",
+    "onnxruntime",
     "librosa",
 ]
 ignore_missing_imports = true

@@ -196,7 +196,9 @@ class TestAudioChannelInHub:
         from unittest.mock import MagicMock
 
         audio = AudioChannel(signal_source=AsyncMock(return_value=_audio_signal()))
-        bad: Any = MagicMock()
+        # spec 限定：裸 MagicMock 会自动伪造 prepare/reset 等可选协议方法，令 Hub 的鸭子类型
+        # 检测误判（并 await 一个不可等待的 mock）。只暴露 Protocol 真实成员。
+        bad: Any = MagicMock(spec=["name", "sense"])
         bad.name = "bad"
         bad.sense = AsyncMock(side_effect=RuntimeError("设备故障"))
         hub = PerceptionHub([bad, audio])
