@@ -46,6 +46,15 @@ gpu-cuda = [
 gpu-dml = [
     "onnxruntime-directml>=1.18",
 ]
+# 真硬件采集（io_adapters/hardware_adapters.py）——**可选**，默认不装。
+# 缺库时对应工厂返回的 callable 产 None，Channel 走「本轮无证据」优雅回退，故不装也不阻断。
+# 摄像头走 opencv（已随 perception-vision 提供），无需独立 extra。
+hardware-audio = [
+    "sounddevice>=0.4",  # 麦克风实时采集（PortAudio 绑定）
+]
+hardware-wearable = [
+    "pyserial>=3.5",  # 串口可穿戴设备（ECG/EDA 采集板）
+]
 physio = [
     "neurokit2>=0.2",
     "pandas>=2.0",
@@ -100,6 +109,11 @@ module = [
     "emotiefflib.facial_analysis",
     "onnxruntime",
     "librosa",
+    # 真硬件采集库（可选 extra，默认不装；延迟 import + 缺库优雅回退）
+    "sounddevice",
+    "serial",
+    "serial.tools",
+    "serial.tools.list_ports",
 ]
 ignore_missing_imports = true
 
