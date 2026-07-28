@@ -1,16 +1,23 @@
-"""EdaChannel v2（scl_baseline_delta）单测——蓝图任务 6。
+"""EdaChannel 唤醒度量（scl_baseline_delta）单测——蓝图任务 6。
 
-覆盖：默认零回归 · env 解析 · NaN 早于状态写入 · reset 清双份状态 · 冷启动双门 ·
-对称归一化边界 · clock 注入确定性 · 并发下 baseline_history 线程安全 · 不依赖 neurokit2。
+覆盖：冷启动双门 · Δ 语义与跨被试可比 · horizon 裁剪 · NaN 早于状态写入 · reset ·
+对称归一化边界 · clock 注入确定性 · 并发下 baseline_history 线程安全 · 不依赖 neurokit2 ·
+常量与探针选值一致。
+
+⚠ 通道级契约（先验形状、signal_source、Hub 集成、默认关）在
+`tests/mcp/test_zero_physio_channel.py`；本文件只测**度量语义**。
 
 设计与选参依据：`notes/2026-07-28-eda-metric-redesign-blueprint.md` §2.1、
-`notes/2026-07-28-eda-v2-probe-p0-p2-results.md` §10。
+`notes/2026-07-28-eda-v2-probe-p0-p2-results.md` §10/§11。
+旧度量（`scr_amplitude`，已于蓝图任务 9 删除）的失效实证见
+`notes/2026-07-28-wesad-eda-metric-invalidation.md`。
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
 
 import numpy as np
 import pytest
@@ -44,7 +51,6 @@ def _flat_signal(level: float, size: int = 60) -> dict[str, object]:
 
 def _v2_channel(clock: FakeClock, **kwargs: object) -> EdaChannel:
     params: dict[str, object] = {
-        "arousal_metric": "scl_baseline_delta_v2",
         "clock": clock,
         "baseline_horizon_seconds": 1000.0,
         "delta_ref_us": 1.0,
@@ -61,9 +67,8 @@ def _sense(channel: EdaChannel, signal: dict[str, object]):
 
 @pytest.fixture(autouse=True)
 def _enable_channel(monkeypatch: pytest.MonkeyPatch) -> None:
-    """通道 flag 默认关；v2 测试统一开启，并清掉度量 env 避免宿主污染。"""
+    """通道 flag 默认关；本文件统一开启。"""
     monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-    monkeypatch.delenv("ZERO_EDA_AROUSAL_METRIC", raising=False)
 
 
 class TestSymmetricNormalize:
@@ -82,57 +87,36 @@ class TestSymmetricNormalize:
         assert _symmetric_normalize(1.0, 2.0) == pytest.approx(0.5)
 
 
-class TestDefaultIsNowV2:
-    """⚠ **蓝图任务 8 已翻默认值**：默认从 v1 改为 v2。
+class TestSingleMetricAfterV1Retirement:
+    """⚠ **蓝图任务 9 已退役旧度量**：`scr_amplitude` 实现、`arousal_metric` 入参与
+    `ZERO_EDA_AROUSAL_METRIC` env 一并删除，通道只剩本度量一条路径。
 
-    翻转依据见 `_DEFAULT_AROUSAL_METRIC` docstring（验收门全 PASS + 当前爆炸半径为零）。
-    v1 代码路径完整保留，把该常量改回 `"scr_amplitude_v1"` 即一键回滚。
+    这几条断言防的是「悄悄把开关加回来」——多度量共存曾让默认值、env、显式入参三者的优先级
+    成为持续的误配面（旧文件里为此有一整个 env 解析测试类）。
     """
 
-    def test_default_metric_is_v2(self) -> None:
-        assert EdaChannel().arousal_metric == "scl_baseline_delta_v2"
-
-    def test_v1_still_selectable(self) -> None:
-        """v1 未被删除（蓝图任务 9 未执行），显式指定仍可用——回滚路径存在。"""
-        channel = EdaChannel(arousal_metric="scr_amplitude_v1")
-        assert channel.arousal_metric == "scr_amplitude_v1"
-
-    def test_default_construction_allocates_v2_state(self) -> None:
-        """默认构造即分配 v2 状态且为空（冷启动起点）。"""
+    def test_default_construction_allocates_baseline_state(self) -> None:
+        """默认构造即分配基线状态且为空（冷启动起点）。"""
         channel = EdaChannel(sampling_rate=4)
-        assert channel.arousal_metric == "scl_baseline_delta_v2"
         assert len(channel.baseline_history) == 0
 
+    def test_no_metric_switch_parameter(self) -> None:
+        """构造器不再接受度量选择入参（单一路径，无 A/B 分支）。"""
+        with pytest.raises(TypeError):
+            EdaChannel(arousal_metric="scr_amplitude_v1")  # type: ignore[call-arg]
 
-class TestArousalMetricEnvResolution:
-    def test_env_selects_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """env 可把默认（现为 v2）覆盖回 v1——运维层的回滚开关。"""
+    def test_metric_env_no_longer_consulted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """残留的旧 env 不得改变行为（老部署环境里 env 可能还留着）。"""
         monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
-        assert EdaChannel().arousal_metric == "scr_amplitude_v1"
-
-    def test_explicit_argument_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
-        assert (
-            EdaChannel(arousal_metric="scl_baseline_delta_v2").arousal_metric
-            == "scl_baseline_delta_v2"
-        )
-
-    def test_illegal_env_falls_back_to_default_with_warning(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """非法 env 回退**当前默认**（现为 v2），并告警——不 raise，保优雅回退。"""
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v3")
-        with caplog.at_level("WARNING"):
-            assert EdaChannel().arousal_metric == "scl_baseline_delta_v2"
-        assert "ZERO_EDA_AROUSAL_METRIC" in caplog.text
-
-    def test_env_read_once_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """构造期一次性解析：构造后改 env 不得影响已有实例（有状态量不可运行中切换）。"""
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
-        channel = EdaChannel()
-        assert channel.arousal_metric == "scr_amplitude_v1"
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v2")
-        assert channel.arousal_metric == "scr_amplitude_v1"  # 不受运行中变更影响
+        clock = FakeClock()
+        channel = _v2_channel(clock)
+        _sense(channel, _flat_signal(5.0))
+        clock.advance(200.0)
+        _sense(channel, _flat_signal(5.0))
+        clock.advance(200.0)
+        reading = _sense(channel, _flat_signal(6.0))
+        assert reading is not None, "旧 env 不应把通道切回已删除的度量"
+        assert reading.mu[1] == pytest.approx(1.0), "读数应是 Δ 语义（+1.0 μS → 饱和正）"
 
 
 class TestV2ColdStart:
@@ -270,14 +254,26 @@ class TestV2Reset:
         assert len(channel.baseline_history) == 0
         assert _sense(channel, _flat_signal(5.0)) is None  # 回到冷启动
 
-    def test_reset_clears_both_v1_and_v2_state(self) -> None:
-        """reset 须同时清 v1 幅度历史与 v2 基线历史（漏清任一都会造成跨被试污染）。"""
-        channel = EdaChannel(arousal_metric="scl_baseline_delta_v2", clock=FakeClock())
-        channel.baseline_history.append((0.0, 1.0))
-        channel._amplitude_history["highpass"].append(0.5)
+    def test_baseline_history_is_the_only_mutable_state(self) -> None:
+        """基线历史是通道**唯一**的跨调用可变状态——reset 清空它即回到全新实例等价态。
+
+        判别性：若日后新增第二份历史（如滑窗缓存）而 reset 漏清，本例会捕到差异，
+        避免重演「有状态量漏清 → 跨被试污染」（旧实现曾有两份历史需同步清）。
+        """
+        clock = FakeClock()
+        channel = _v2_channel(clock)
+        for _ in range(4):
+            _sense(channel, _flat_signal(5.0))
+            clock.advance(100.0)
         channel.reset()
+
+        mutable = {
+            key: value
+            for key, value in vars(channel).items()
+            if isinstance(value, (list, dict, set, deque))
+        }
+        assert set(mutable) == {"baseline_history"}, f"出现未被 reset 覆盖的可变状态：{mutable}"
         assert len(channel.baseline_history) == 0
-        assert len(channel._amplitude_history["highpass"]) == 0
 
 
 class TestV2DoesNotRequireNeurokit:
