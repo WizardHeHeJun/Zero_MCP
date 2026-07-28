@@ -34,7 +34,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# 与 _hardware_stubs 对齐的信号源类型别名（替换桩体时签名不变）
+# 信号源 callable 的类型别名（与同层文件/合成适配器的返回类型对齐）
 SignalSource = Callable[[], Coroutine[Any, Any, Any]]
 
 
