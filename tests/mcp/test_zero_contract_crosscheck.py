@@ -812,6 +812,12 @@ class TestPhysiologyDecoderOnlineConstantsPin:
 #   `stream_salience` 的函数体；而终裁明令新公式以 **default-off 新增** selector + **新** θ' 常量
 #   落地、`SALIENCE_THRESHOLD=0.18` 与旧式**原样保留**（对标 fuse_independence_correct 先例）
 #   → Zero PRP 落地当天本类**全绿通过**。届时须按新公式重标，而非把绿当作「无事发生」。
+#
+# ⚠ **待重标（Zero 07-28 二轮回执，等最终形态 ping 后动手）**：去地板+注入本仓 wire 载荷实测
+#   D=sqrt(0.175·0.845714²)=0.3538 ≥ θ'=0.28（本仓真 merge_physio_priors 复算一致）→
+#   「physio 恒不可点燃」「兜底分支结构性不可达」两条特征化届时**双双失效**；且归一化从
+#   「推后」改为「与去地板打包必做」（否则 physio 低精度单流独占后验，arousal 被拉到 0.846）。
+#   Zero 将 ping 最终公式+θ'+是否含归一化+建议 pin 项；落地前本节保持现状=特征化旧世界。
 # ---------------------------------------------------------------------------
 
 _ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
@@ -845,6 +851,33 @@ _MU_MAX_NORM = 2.0**0.5  # ModalityPrior 各维 ∈[-1,1] → hypot 上界 √2
 def _mean_precision(precision: tuple[float, float]) -> float:
     """镜像 Zero stream_salience 的精度项：mean(Π)。"""
     return 0.5 * (precision[0] + precision[1])
+
+
+# fast_survival_prior 的 arousal 式，**基线项可选**。Zero 07-28 二轮回执确认去地板
+# （clamp(0.5+0.5|I|) → clamp(0.5|I|)）已列复议终裁必改项，并要求本守卫在其动手当天
+# 变红、勿改宽松。上一版正则硬性要求 `+` 基线，恰好对这条改动 no-match→skip（默认
+# 模式黄灯，仅 STRICT 转红）——守卫承诺的红是它给不出的。现基线缺省按 0.0 进入主
+# 断言 → 去地板落地当天全模式红。
+# ⚠ 必须先切出 fast_survival_prior 函数体再匹配：基线一变可选，全文件 search 会被
+# occ_prior 的多行 `clamp(\n 0.4·|I| + …)`（affect_math.py:118）抢先匹配成「无基线」，
+# 在 Zero 未动手时就假阳性红（本仓 07-28 实踩，见判别性自证测试）。
+_ZERO_SURVIVAL_AROUSAL_RE = re.compile(
+    rf"arousal\s*=\s*clamp\(\s*(?:({_NUM})\s*\+\s*)?({_NUM})\s*\*\s*abs\(intensity\)"
+)
+_ZERO_SURVIVAL_FUNC_RE = re.compile(
+    r"def fast_survival_prior\(.*?(?=\ndef |\nclass |\Z)", re.DOTALL
+)
+
+
+def _parse_survival_arousal_floor(source: str) -> float | None:
+    """解析 fast_survival_prior 的 arousal 基线（地板）；无基线项按 0.0，形态未知返回 None。"""
+    func_match = _ZERO_SURVIVAL_FUNC_RE.search(source)
+    if func_match is None:
+        return None
+    match = _ZERO_SURVIVAL_AROUSAL_RE.search(func_match.group(0))
+    if match is None:
+        return None
+    return float(match.group(1)) if match.group(1) is not None else 0.0
 
 
 @pytest.mark.zerorepo
@@ -1023,18 +1056,13 @@ class TestIgnitionGateReachabilityCrosscheck:
             consts[name] = float(match.group(1))
 
         # ⚠ 此处**从 Zero 源码读** fast_survival_prior 的 arousal 基线系数，不再手抄。
-        # 原实现硬编码 0.5，与 SURVIVAL_PRECISION/SALIENCE_THRESHOLD 的源码读取不对称：
-        # Zero 改常量会红、改 fast_survival_prior 的**公式**却照样绿——而 Zero 2026-07-28
-        # 议会复议正把 `arousal=clamp(0.5+0.5|I|)` 列为深层根因（intensity=0 仍给 0.5，
-        # 把「没有证据」编码成「确定的中等唤醒」），即这条最可能变的恰是原先测不到的那半。
-        survival_arousal_re = re.compile(
-            rf"arousal\s*=\s*clamp\(\s*({_NUM})\s*\+\s*({_NUM})\s*\*\s*abs\(intensity\)"
-        )
-        arousal_match = survival_arousal_re.search(source)
-        if arousal_match is None:
-            pytest.skip("未找到 fast_survival_prior 的 arousal 式，结构可能变更，跳过")
+        # Zero 07-28 二轮回执：去地板（→clamp(0.5|I|)）已列必改，且明确要求本例在其
+        # 落地当天变红=跨仓信号（勿改宽松）。届时红了是**正确行为**，重标须等 Zero
+        # 最终形态 ping（去地板与跨流归一化打包），勿见红即放宽断言。
         # intensity=0 时取基线项；斜率项 ≥0 故基线即下确界（clamp 下界 0.0 不咬合）
-        min_survival_arousal = float(arousal_match.group(1))
+        min_survival_arousal = _parse_survival_arousal_floor(source)
+        if min_survival_arousal is None:
+            pytest.skip("未找到 fast_survival_prior 的 arousal 式，结构可能变更，跳过")
 
         min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
         assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
@@ -1042,6 +1070,53 @@ class TestIgnitionGateReachabilityCrosscheck:
             f"{consts['SALIENCE_THRESHOLD']}——ignite 的 max-fallback 分支变为可达，"
             "外部亚阈先验可能在全场亚阈时被保留，本仓可达性结论须重评。"
         )
+
+    def test_survival_floor_guard_goes_red_not_skip_on_confirmed_change(self) -> None:
+        """判别性自证：对 Zero 已确认必改的去地板形态，上例走**红**（断言失败）而非 skip。
+
+        「绿灯必须先证明它能红」同族第五例：上一版正则硬性要求 `+` 基线项，恰好对
+        「Zero 动手当天」那条改动（clamp(0.5+0.5|I|)→clamp(0.5|I|)）no-match→skip
+        （默认模式黄灯，仅 STRICT 兜底转红）——守卫承诺的红是它给不出的。本例实证四态：
+        (1) 现行地板形态解析 0.5——且 decoy 在场不被抢注（反例非假想：首版可选基线正则
+        就被 occ_prior 的多行 clamp(0.4·|I|+…) 全文件抢先匹配、把真地板误读成 0.0，
+        Zero 未动手先假阳性红，07-28 实踩）；(2) 去地板形态解析 **0.0 而非 None**
+        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) 未知形态仍 None→skip；
+        (4) 函数整体缺位 None→skip。如实标注守不住什么：fast_survival_prior 若重构成
+        其它形状，本守卫依旧只能 skip，靠 STRICT 兜底。不依赖 D:\\Zero 在位，判别力常年在测。
+        """
+        decoy_occ_prior = (
+            "def occ_prior(appraisal):\n"
+            "    arousal = clamp(\n"
+            "        0.4 * abs(intensity)\n"
+            "        + va_coupling_neg * max(-valence, 0.0),\n"
+            "        -1.0,\n"
+            "        1.0,\n"
+            "    )\n"
+        )
+        floored = decoy_occ_prior + (
+            "def fast_survival_prior(features):\n"
+            "    arousal = clamp(0.5 + 0.5 * abs(intensity), 0.0, 1.0)\n"
+        )
+        floorless = decoy_occ_prior + (
+            "def fast_survival_prior(features):\n"
+            "    arousal = clamp(0.5 * abs(intensity), 0.0, 1.0)\n"
+        )
+        unknown_shape = decoy_occ_prior + (
+            "def fast_survival_prior(features):\n"
+            "    arousal = clamp(sigmoid(intensity), 0.0, 1.0)\n"
+        )
+
+        assert _parse_survival_arousal_floor(floored) == 0.5, (
+            "地板在场时必须解析出 0.5——若为 0.0 说明又被函数体外的 decoy 抢注（假阳性）"
+        )
+        floor = _parse_survival_arousal_floor(floorless)
+        assert floor == 0.0, "去地板形态必须解析为 0.0 而非 None——否则上例 skip 不红"
+        assert not (
+            floor * _ZERO_GATE_CONSTANTS["SURVIVAL_PRECISION"]
+            > _ZERO_GATE_CONSTANTS["SALIENCE_THRESHOLD"]
+        ), "去地板后上例主断言应不成立（红）——若此处成立说明判别力自证失效"
+        assert _parse_survival_arousal_floor(unknown_shape) is None
+        assert _parse_survival_arousal_floor(decoy_occ_prior) is None
 
 
 # ---------------------------------------------------------------------------
