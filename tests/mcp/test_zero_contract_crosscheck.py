@@ -1022,7 +1022,20 @@ class TestIgnitionGateReachabilityCrosscheck:
                 pytest.skip(f"未找到 {name}，跳过")
             consts[name] = float(match.group(1))
 
-        min_survival_arousal = 0.5  # fast_survival_prior: clamp(0.5+0.5·|intensity|) ≥ 0.5
+        # ⚠ 此处**从 Zero 源码读** fast_survival_prior 的 arousal 基线系数，不再手抄。
+        # 原实现硬编码 0.5，与 SURVIVAL_PRECISION/SALIENCE_THRESHOLD 的源码读取不对称：
+        # Zero 改常量会红、改 fast_survival_prior 的**公式**却照样绿——而 Zero 2026-07-28
+        # 议会复议正把 `arousal=clamp(0.5+0.5|I|)` 列为深层根因（intensity=0 仍给 0.5，
+        # 把「没有证据」编码成「确定的中等唤醒」），即这条最可能变的恰是原先测不到的那半。
+        survival_arousal_re = re.compile(
+            rf"arousal\s*=\s*clamp\(\s*({_NUM})\s*\+\s*({_NUM})\s*\*\s*abs\(intensity\)"
+        )
+        arousal_match = survival_arousal_re.search(source)
+        if arousal_match is None:
+            pytest.skip("未找到 fast_survival_prior 的 arousal 式，结构可能变更，跳过")
+        # intensity=0 时取基线项；斜率项 ≥0 故基线即下确界（clamp 下界 0.0 不咬合）
+        min_survival_arousal = float(arousal_match.group(1))
+
         min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
         assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
             f"survival 流最小 salience={min_survival_salience:.4f} 不再 > 阈值 "
