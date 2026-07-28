@@ -104,7 +104,8 @@ def _do_probe() -> CapabilityFlags:
 
     # ── 步骤 2：onnxruntime EP 探测 ───────────────────────────────────────────
     try:
-        import onnxruntime as ort  # type: ignore[import-untyped]
+        # 无内联 ignore：onnxruntime 已在 pyproject 的 mypy ignore_missing_imports 覆盖内
+        import onnxruntime as ort
 
         available = ort.get_available_providers()
     except Exception as exc:
