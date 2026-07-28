@@ -32,6 +32,8 @@ import collections
 import logging
 import os
 import threading
+import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 import numpy as np
@@ -71,6 +73,32 @@ _RMSSD_REF_MS: float = 100.0
 _PERCENTILE_EPS: float = 1e-6
 
 
+# ── v2（scl_baseline_delta）常量：均由 WESAD 真被试 P0–P3 探针选定 ─────────────
+# 依据 notes/2026-07-28-eda-v2-probe-p0-p2-results.md §10——四判据全面胜过「裸 SCL 无修正」对照臂：
+# 判别 10/10 vs 9/10 · 抗漂移 0.050 vs 0.324 · 持续比 +1.010 vs +0.966 · 跨被试极差 0.548 vs 1.745
+_SCL_BASELINE_HORIZON_SECONDS: float = 1800.0
+"""窗间基线回溯时长（秒）。30 分钟——须**舒适超过典型唤醒事件时长**。
+
+⚠ 已知限制：持续比在 horizon ≥ ~1.4× 事件时长时才饱和到 ~1.0；本参数在 WESAD 上只验证到
+「1800s 覆盖 645s 应激事件」，**45 分钟以上的持续唤醒是否击穿该值，本数据集无法验证**。
+过大同样有害：horizon 逼近会话总长时基线历史开始纳入唤醒期本身（实测 3600s 下判别力塌到 2/10）。
+"""
+
+_SCL_DELTA_REF_US: float = 1.0
+"""Δ→μa 的对称归一化参考（μS）。判别/持续/跨被试三项对该值不敏感（0.5–1.5 同表现）。"""
+
+_SCL_BASELINE_MIN_OBSERVATIONS: int = 2
+"""出首个读数所需的最少历史窗数（与覆盖率双门，取更严者）。"""
+
+_SCL_BASELINE_MIN_COVERAGE: float = 0.15
+"""出首个读数所需的历史**时间跨度**占 horizon 的比例。
+
+0.15 → 首读约 4.5 分钟、None 占比 4.2%（对比 0.5：首读 15 分钟、None 14%）。
+⚠ 实测降低该值**反而改善抗漂移**（漂移比 0.156→0.050），且持续比/跨被试可比完全不受影响
+（二者量的是稳态读数）。未取更激进的 0.05，因其早期基线样本极少、对异常首窗的鲁棒性未验证。
+"""
+
+
 def _linear_normalize(value: float, ref: float) -> float:
     """线性归一化到 [-1, 1]，clip 到 [0, ref] 后映射。
 
@@ -79,6 +107,16 @@ def _linear_normalize(value: float, ref: float) -> float:
     """
     ratio = min(max(value / ref, 0.0), 1.0)
     return ratio * 2.0 - 1.0
+
+
+def _symmetric_normalize(value: float, ref: float) -> float:
+    """**对称**归一化到 [-1, 1]：``clip(value / ref, -1, 1)``。
+
+    与 `_linear_normalize` 的区别（**不可互换**）：后者假设输入非负、把 [0, ref] 映到 [-1, 1]
+    （value=0 → -1.0）；本函数的输入 Δ 可正可负，零输入必须映到 **0.0**（中性）而非 -1.0。
+    v2 的 Δ（当前窗 SCL − 窗间基线）用本函数。
+    """
+    return min(max(value / ref, -1.0), 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +210,12 @@ class EdaChannel:
         percentile_window: int | None = None,
         percentile_cold_start: int | None = None,
         percentile_range: tuple[int, int] = (5, 95),
+        arousal_metric: Literal["scr_amplitude_v1", "scl_baseline_delta_v2"] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        baseline_horizon_seconds: float = _SCL_BASELINE_HORIZON_SECONDS,
+        delta_ref_us: float = _SCL_DELTA_REF_US,
+        baseline_min_observations: int = _SCL_BASELINE_MIN_OBSERVATIONS,
+        baseline_min_coverage_fraction: float = _SCL_BASELINE_MIN_COVERAGE,
     ) -> None:
         self.sampling_rate = sampling_rate
         self.normalization = normalization
@@ -179,6 +223,19 @@ class EdaChannel:
         self.window_seconds = window_seconds
         self.cold_start_seconds = cold_start_seconds
         self.percentile_range = percentile_range
+
+        # 度量选择：显式入参 > env > 默认 v1（零回归）。**构造期一次性解析**，不在 sense() 内
+        # 逐次读——v2 是有状态的（baseline_history），运行中切换会让基线跨语义污染。
+        self.arousal_metric = arousal_metric or self._resolve_arousal_metric_env()
+        self.clock = clock
+        self.baseline_horizon_seconds = baseline_horizon_seconds
+        self.delta_ref_us = delta_ref_us
+        self.baseline_min_observations = baseline_min_observations
+        self.baseline_min_coverage_fraction = baseline_min_coverage_fraction
+        # v2 的窗间基线历史：(时钟秒, 窗内 SCL 均值)。**无 maxlen**——按真实秒数手动裁剪，
+        # 不复用 v1 那套 `round(秒 × sampling_rate)` 的样本数推导（该推导与「每次调用产出一个
+        # 标量」的实际单位错配，见蓝图 §4；v2 不继承它）。
+        self.baseline_history: collections.deque[tuple[float, float]] = collections.deque()
 
         # 秒制化解析：窗/冷启动 = round(秒 × 构造期 sampling_rate)，采样率无关（修固定 60 在
         # 256Hz=0.23s「崩」的 footgun）。显式样本数覆盖（非 None）优先——保精确控制与既有调用零回归。
@@ -222,17 +279,36 @@ class EdaChannel:
         # 双载模型，此处防并发改历史）。
         self.history_lock = threading.Lock()
 
-    def reset(self) -> None:
-        """清空滚动幅度历史（**被试切换时调用方必须调用**）。
+    @staticmethod
+    def _resolve_arousal_metric_env() -> Literal["scr_amplitude_v1", "scl_baseline_delta_v2"]:
+        """解析 ``ZERO_EDA_AROUSAL_METRIC``；非法值告警后回退 v1（保优雅回退，不 raise）。"""
+        raw = os.getenv("ZERO_EDA_AROUSAL_METRIC")
+        if raw is None:
+            return "scr_amplitude_v1"
+        value = raw.strip()
+        if value in ("scr_amplitude_v1", "scl_baseline_delta_v2"):
+            return value  # type: ignore[return-value]
+        logger.warning(
+            "ZERO_EDA_AROUSAL_METRIC=%r 非法（合法值：scr_amplitude_v1 / scl_baseline_delta_v2），"
+            "回退 scr_amplitude_v1",
+            raw,
+        )
+        return "scr_amplitude_v1"
 
-        调用后 percentile 模式回到冷启动状态，linear 模式不受影响。
+    def reset(self) -> None:
+        """清空滚动历史（**被试切换时调用方必须调用**）——v1 幅度历史与 v2 基线历史**都清**。
+
+        调用后 percentile 模式回到冷启动状态，linear 模式不受影响；v2 回到冷启动（下若干轮返回
+        None 直到重新攒够基线）。
         ⚠ 调用方（编排/接入层）有责任在被试切换时调用本方法或 ``PerceptionHub.reset_all()``；
-        **未调用将导致新被试沿用旧被试的历史分位区间（跨被试污染）**——有状态通道的固有契约，
+        **未调用将导致新被试沿用旧被试的历史分位区间/基线（跨被试污染）**——有状态通道的固有契约，
         Protocol 无法在编译期强制（W2，见 pitfalls「有状态感知通道被试切换须 reset」）。
+        v2 的污染更直接：旧被试基线直接决定新被试 Δ 的零点。
         """
         with self.history_lock:
             for key in self._amplitude_history:
                 self._amplitude_history[key].clear()
+            self.baseline_history.clear()
 
     async def sense(
         self,
@@ -281,7 +357,73 @@ class EdaChannel:
             return None
 
     def _process(self, raw: dict[str, Any]) -> ModalityPrior | None:
-        """延迟 import neurokit2 并执行 EDA 处理。
+        """按 ``arousal_metric`` 分派到 v1 / v2 实现（构造期已定，运行期不再读 env）。"""
+        if self.arousal_metric == "scl_baseline_delta_v2":
+            return self._process_v2_scl_baseline_delta(raw)
+        return self._process_v1_scr_amplitude(raw)
+
+    def _process_v2_scl_baseline_delta(self, raw: dict[str, Any]) -> ModalityPrior | None:
+        """v2：窗内 SCL 均值 − 窗间中位数基线 → 对称归一化（**不做 phasic 分解**）。
+
+        设计与选参依据：`notes/2026-07-28-eda-metric-redesign-blueprint.md` §2.1 +
+        `notes/2026-07-28-eda-v2-probe-p0-p2-results.md` §10（WESAD 真被试四判据全面胜过
+        「裸 SCL 无修正」对照臂）。
+
+        为什么不做 ``nk.eda_phasic``：实测 15/30/60s 窗内 ``mean(eda)`` 与 ``EDA_Tonic.mean()``
+        相对差中位数 <0.1%（litreview §10.1），分解在 SCL 层近乎零增量信息。跳过它连带消除
+        cvxEDA/highpass 双分支——即 v1 「方法边界断崖」这个跨采样率失败成因本身。
+        故 v2 **不需要 neurokit2**，也不受采样率驱动的算法分支影响。
+
+        为什么冷启动返回 None 而非回退固定 ref：无基线证据时给出的读数必然是「按某个臆断零点
+        算出的 Δ」，比不给更有害（v1 的「回退 linear」在评审实测中导致冷启动期读数钉死 −1.0）。
+        None 会使 ``merge_physio_priors`` 降级为裸 ``hrv/rmssd``——这是**有意的诚实降级**。
+        """
+        eda: Any = raw.get("eda")
+        if eda is None:
+            raise ValueError("signal dict 缺少 'eda' 键")
+
+        scl_raw = float(np.mean(np.asarray(eda, dtype=np.float64)))
+        # NaN 守卫**早于任何状态写入**：坏值进了 baseline_history 会污染后续所有窗的基线中位数。
+        # 判别力已实证：把本守卫下移到 append 之后，TestV2NaNGuard 立即变红（历史混入 (t, nan)）。
+        if not np.isfinite(scl_raw):
+            logger.warning("EdaChannel v2: 窗内 SCL 非有限值（信号退化），本轮无证据")
+            return None
+
+        now = self.clock()
+        with self.history_lock:
+            # 按**真实秒数**裁剪（非样本数/调用数）——v1 单位错配不继承
+            while (
+                self.baseline_history
+                and now - self.baseline_history[0][0] > self.baseline_horizon_seconds
+            ):
+                self.baseline_history.popleft()
+            prior = list(self.baseline_history)  # 快照**不含**本次样本
+            self.baseline_history.append((now, scl_raw))
+
+        span = (now - prior[0][0]) if prior else 0.0
+        if (
+            len(prior) < self.baseline_min_observations
+            or span < self.baseline_horizon_seconds * self.baseline_min_coverage_fraction
+        ):
+            return None  # 冷启动：无基线证据 → 无证据
+
+        # 中位数而非均值：对偶发 SCR 尖峰更稳健
+        baseline = float(np.median([value for _, value in prior]))
+        delta = scl_raw - baseline
+        mu_a = _symmetric_normalize(delta, self.delta_ref_us)
+        mu_v = 0.0  # EDA 对 valence 盲（Kreibig 2010），与 v1 一致
+
+        return build_recommended_prior(
+            modality=self.name,
+            mu=(mu_v, mu_a),
+            kind=ModalityKind.PHYSIO,
+        )
+
+    def _process_v1_scr_amplitude(self, raw: dict[str, Any]) -> ModalityPrior | None:
+        """v1（🔴 已知失效，见类 docstring）：延迟 import neurokit2 并执行 EDA 处理。
+
+        **本方法自 v2 引入起逻辑零改动**（仅重命名），以保 ``arousal_metric="scr_amplitude_v1"``
+        默认路径的零回归。
 
         neurokit2 仅在此处 import，避免模块加载时因缺包崩溃。
         采样率 >4Hz 用 cvxEDA，≤4Hz 用 highpass（gap-6，低采样率 highpass 更稳）。
