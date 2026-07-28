@@ -99,7 +99,7 @@ Zero_MCP/
 │   └── storage/                    # 存储层（骨架：Postgres / Neo4j / Redis，待建）
 ├── mcp-server/                     # TS MCP 对外聚合层（@modelcontextprotocol/sdk，独立 package.json，暂未用）
 ├── docs/v2/                        # 架构图：*.mmd（mermaid 源）+ *.png（飞书画板渲染，随仓提交，README 内嵌）
-├── tests/                          # 1069 用例：agents/mcp/orchestration/safety/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归）
+├── tests/                          # 1133 用例：agents/mcp/orchestration/safety/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归）
 ├── evals/                          # 53 条 agent 行为级 evals（感知/操控/停滞）
 ├── ai-docs/                        # 知识库：模块三件套 + catalog + pitfalls（本地维护，不入库）
 ├── notes/                          # 设计纪要 / 实测报告 / 工程实施记录（本地，不入库）
