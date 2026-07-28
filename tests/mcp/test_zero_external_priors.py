@@ -347,6 +347,91 @@ class TestIsPhysioStream:
 # ---------------------------------------------------------------------------
 
 
+class TestM7MuDomain:
+    """M7 客户端校验：出线 μ 各维 ∈[-1,1]，镜像 Zero `affect_math.py:1039-1043`。
+
+    背景：Zero commit `0d4edb1`（2026-07-28 20:00，已在其 main）新增 M7 fail-fast——
+    越界 μ 从「静默降级」变成 `raise ValueError`。经其 server 包成 ToolError → 我方
+    `graceful_step` 降级 None = **整轮 step 静默丢失**（不是只丢一条流），故必须在客户端拦住。
+
+    **本类的存在理由是「契约类有校验 ≠ 无绕过路径」**：`ModalityPrior` 的构造期校验
+    与 frozen 只覆盖「正常构造 + 构造后赋值」，而 `model_construct` / `model_copy` /
+    鸭子类型伪造均可绕过；且本函数默认 `merge_physio=True`，合并会**产出新的 μ**，
+    校验入参根本看不到它。故守卫必须作用于 `as_stream()` 的**出线 tuple**。
+    以下每个用例对应一条**实测跑通过**的绕过口（守卫落地前它们把 (7.7, nan) 原样送出网）。
+    """
+
+    def test_model_construct_bypass_is_caught(self) -> None:
+        """`model_construct()` 跳过全部校验造出的越界先验，被出境守卫拦下。"""
+        rogue = ModalityPrior.model_construct(modality="audio", mu=(9.9, 0.0), precision=(0.2, 0.2))
+        with pytest.raises(ValueError, match="M7") as exc_info:
+            build_external_priors_override([rogue])
+        assert "audio" in str(exc_info.value)
+
+    def test_model_copy_bypass_is_caught(self) -> None:
+        """`model_copy(update=)` 不触发 validator，越界 μ 被出境守卫拦下。"""
+        rogue = _make_prior("vision").model_copy(update={"mu": (5.0, -9.0)})
+        with pytest.raises(ValueError, match="M7"):
+            build_external_priors_override([rogue])
+
+    def test_duck_typed_fake_prior_is_caught(self) -> None:
+        """鸭子类型伪造（非 ModalityPrior 实例）也被拦下。
+
+        `PerceptionHub` 收集通道产物时只判 `BaseException`/`None`、**不判类型**，
+        故伪造对象能混入 priors 列表——守卫读 `as_stream()` 输出而非模型实例，正好覆盖。
+
+        ⚠ 伪造体必须带 `modality` 属性才构成真实威胁：缺它会先在
+        `merge_physio_priors`（`external_priors.py:481` 读 `prior.modality`）炸
+        `AttributeError`，那是**崩在别处**、不能算本守卫拦下的（初版本例正是这样
+        误报为通过——「测试红了要先看它红在哪一行」）。
+        """
+
+        class FakePrior:
+            modality = "vision"  # 非生理前缀 → merge 阶段原样透传，得以走到 M7 守卫
+
+            def as_stream(self) -> tuple[str, tuple[float, float], tuple[float, float]]:
+                return ("vision", (7.7, float("nan")), (0.2, 0.1))
+
+        with pytest.raises(ValueError, match="M7"):
+            build_external_priors_override([FakePrior()])  # type: ignore[list-item]
+
+    def test_nan_mu_is_caught(self) -> None:
+        """NaN 的 μ 被拦下（`-1.0 <= nan <= 1.0` 恒 False → 取反成立）。"""
+        rogue = ModalityPrior.model_construct(
+            modality="vision", mu=(0.0, float("nan")), precision=(0.2, 0.2)
+        )
+        with pytest.raises(ValueError, match="M7"):
+            build_external_priors_override([rogue])
+
+    def test_boundary_mu_passes_not_stricter_than_zero(self) -> None:
+        """μ=±1.0 边界放行——不得比 Zero M7 更严（其判据用 `<=`，同样放行）。
+
+        守卫过严会把合法载荷拦在客户端，是与漏拦同样真实的失败模式。
+        """
+        prior = _make_prior("vision", mu=(-1.0, 1.0), precision=(0.2, 0.2))
+        result = build_external_priors_override([prior])
+        assert result["external_priors"][0][1] == pytest.approx((-1.0, 1.0))
+
+    def test_guard_sees_post_merge_mu_not_input_mu(self) -> None:
+        """守卫作用于**合并后**的出线 μ——证明它没被装在函数入口。
+
+        默认 `merge_physio=True` 会把 EDA/HRV 合成单条 physio 流并产出新的 μ_a
+        （精度加权）与 μ_v（硬置 0.0）。本例两条入参各自合法，合并后仍合法 →
+        不该 raise；同时断言出线 μ 确实**是合并产物而非任一入参原值**，
+        从而证明守卫读到的是合并之后的东西。
+        """
+        eda = _make_prior("eda/sc", mu=(0.0, 0.76), precision=(1e-3, 0.15))
+        hrv = _make_prior("hrv/rmssd", mu=(0.0, 0.91), precision=(1e-3, 0.20))
+        result = build_external_priors_override([eda, hrv])
+        streams = result["external_priors"]
+        assert len(streams) == 1, "默认应合并为单条 physio 流"
+        merged_mu_a = streams[0][1][1]
+        assert merged_mu_a not in (pytest.approx(0.76), pytest.approx(0.91)), (
+            "出线 μ_a 应是合并产物，若等于某条入参原值说明守卫/合并顺序有误"
+        )
+        assert 0.76 < merged_mu_a < 0.91, f"精度加权均值应落在两入参之间，实际 {merged_mu_a}"
+
+
 class TestM3PrecisionCap:
     """M3 客户端校验：非生理流 Πv/Πa ≤ cap；超上界 raise。
 
@@ -372,6 +457,21 @@ class TestM3PrecisionCap:
         prior = _make_prior("audio", mu=(0.1, 0.2), precision=(0.5, 0.95))
         with pytest.raises(ValueError):
             build_external_priors_override([prior])
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_precision_is_caught(self, bad: float) -> None:
+        """NaN/inf 的 Π 被出境守卫拦下——`value > cap` 对 NaN **恒 False**，会静默穿过上界关。
+
+        ⚠ 这条比越界 μ 更隐蔽，因为**两侧都没有兜底**：Zero 的 M7（`affect_math.py:1039`）
+        只守 μ 不守 Π，其 `:1052` `pi_v <= 0.0` 与 `:1058` `pi_v > cap` 对 NaN 同样恒 False
+        → NaN 精度会一路进入融合数学产出 NaN 后验，无任何 fail-fast。删掉本守卫不会有
+        其它防线接住（对比越界 μ 至少会被 Zero M7 响亮 raise）。
+        """
+        rogue = ModalityPrior.model_construct(
+            modality="vision", mu=(0.1, 0.1), precision=(bad, 0.2)
+        )
+        with pytest.raises(ValueError, match="有限值"):
+            build_external_priors_override([rogue])
 
     def test_physio_high_pi_v_passes_mirrors_zero_m2(self) -> None:
         """生理流高 Πv（0.9>cap）不 raise：按 MIN 计（Zero M2 会覆写）；且原值透传。"""

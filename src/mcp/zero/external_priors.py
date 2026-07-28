@@ -25,6 +25,7 @@ build_recommended_prior 提供，供感知侧盖精度时参考。
 from __future__ import annotations
 
 import logging
+import math
 import os
 from enum import StrEnum
 
@@ -598,7 +599,22 @@ def build_external_priors_override(
     streams: list[ExternalPriorTuple] = []
     for i, prior in enumerate(priors):
         stream = prior.as_stream()
-        name, _mu, (pi_v, pi_a) = stream
+        name, mu, (pi_v, pi_a) = stream
+        # M7：μ 域校验，镜像 Zero affect_math.py:1039-1043（commit 0d4edb1，2026-07-28 已在其
+        # main）。**必须校验出线 tuple 而非入参 priors**：① 本函数默认 merge_physio=True，
+        # 合并会产出新 μ（μ_a 为 CI 加权值、μ_v 硬置 0.0），入口校验看不到它；② 入参是模型实例，
+        # 而 ModalityPrior 的构造期校验可被 model_construct / model_copy / 鸭子类型伪造绕过
+        # （实测四条绕过口均能把 (7.7, nan) 送出网），信任模型实例等于没有守卫。
+        # 越界 μ 会直接抬高 Zero 的 stream_salience 买到本不该有的点燃资格；不拦则 Zero 侧
+        # raise 后经 server ToolError → 我方 graceful_step 降级为 None = **整轮 step 静默丢失**。
+        # NaN 亦由此条拦下（`-1.0 <= nan` 恒 False → 取反成立）。
+        for dim, coord in (("μv", mu[0]), ("μa", mu[1])):
+            if not (-1.0 <= coord <= 1.0):
+                raise ValueError(
+                    f"M7 μ 越界：先验流[{i}] {name!r} 的 {dim}={coord} 不在 [-1, 1] 内"
+                    "（镜像 Zero affect_math.py:1039 的 M7 fail-fast）。"
+                    "注意本校验作用于合并后的出线值，请检查 ModalityPrior 构造或合并输入。"
+                )
         # M3：精度上界。镜像 Zero M2-先于-M3——生理流 Πv 会被 Zero 覆写为 MIN，故校验时按 MIN
         # 计（不因 MCP 透传的高 Πv 误报），MCP 侧仍原样透传由 Zero 权威覆写。生理流判定用
         # _triggers_zero_m2（忠实镜像 Zero 的 name.lower().startswith）而非 is_physio_stream，
@@ -606,6 +622,16 @@ def build_external_priors_override(
         triggers_m2 = _triggers_zero_m2(name)
         effective_pi_v = MIN_PRECISION if triggers_m2 else pi_v
         for dim, value in (("Πv", effective_pi_v), ("Πa", pi_a)):
+            # 有限性先于上界：`value > cap` 对 NaN **恒 False**，NaN 精度会静默穿过本关。
+            # Zero 侧无对应兜底——其 affect_math.py:1052 `pi_v <= 0.0` 与 :1058 `pi_v > cap`
+            # 同为 NaN-恒 False，M7 又只守 μ 不守 Π → NaN 精度两侧都不 fail-fast，直接进
+            # 融合数学产出 NaN 后验（比越界 μ 更隐蔽：后者至少被 Zero M7 响亮 raise）。
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"M3 精度非有限值：先验流[{i}] {name!r} 的 {dim}={value}。"
+                    "NaN/inf 精度会静默污染 Zero 融合后验（Zero 侧无对应 fail-fast，"
+                    "其 :1052/:1058 判据对 NaN 恒 False），故由 MCP 侧单边拦截。"
+                )
             if value > resolved_cap:
                 raise ValueError(
                     f"M3 精度超上界：先验流[{i}] {name!r} 的 {dim}={value} 超过 "
