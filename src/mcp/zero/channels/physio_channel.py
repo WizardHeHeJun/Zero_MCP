@@ -130,21 +130,31 @@ class EdaChannel:
     从注入的 EDA 信号提取 SCR 幅度，归一化为 arousal 分量。
     valence 恒 0.0（EDA 对 valence 盲，Kreibig 2010）。
 
-    🔴 **已知失效（2026-07-28 WESAD 真被试实测，尚未修复）**：本通道的 arousal 读数
-    **在真数据上与唤醒系统性反相关**，勿作真实唤醒指标消费。
+    🔴 **v1（`arousal_metric="scr_amplitude_v1"`，当前默认）已知失效**——2026-07-28 WESAD
+    真被试实测，其 arousal 读数**在真数据上与唤醒系统性反相关**，勿作真实唤醒指标消费。
+    ✅ **修法已落地为 v2**（`arousal_metric="scl_baseline_delta_v2"`，见下），**默认仍是 v1**；
+    翻默认值是独立的第二个 PR（蓝图 `notes/2026-07-28-eda-metric-redesign-blueprint.md` §2.6）。
+
     实测（`notes/2026-07-28-wesad-eda-metric-invalidation.md`，15 被试中取 5 例）：
-    「stress > baseline」排序正确率**我方 1/5、经典 SCL 4/5**；跨采样率极差中位数 0.68
+    「stress > baseline」排序正确率**v1 1/5、经典 SCL 4/5**；跨采样率极差中位数 0.68
     （协议 G1 阈值 0.15）、12 组中 8 组饱和到 ±1.0。
-    根因不在 `_SCR_REF_AMPLITUDE*` 两个常量，而在 `_process` 的 **per-window
+    根因不在 `_SCR_REF_AMPLITUDE*` 两个常量，而在 `_process_v1_scr_amplitude` 的 **per-window
     `nk.standardize`**：z-score 抹掉绝对水平后，`EDA_Phasic.abs().mean()` 实际度量的是
     「相位成分占窗内总方差的比例」；而真实唤醒的主载体是**缓慢的紧张性上升**（stress 段
     SCL 斜率 +0.35~+1.78 μS/窗），它在 z-score 后越大越主导方差 → 相位占比反而越小。
     合成 `nk.eda_simulate` eval 长期全绿，是因为合成信号紧张性平坦、只变 SCR 数——
     恰好落在该度量唯一成立的区域。
-    修法属**度量重设计**（取消 per-window standardize / 改用 μS 绝对量或 SCL 斜率 /
-    改用 SCR 频次），命中关键设计决策 → 须走 `/algo-team` 文献门，不在工程侧直接改。
+
+    ✅ **v2 = `_process_v2_scl_baseline_delta`**：窗内 SCL 均值 − 窗间中位数基线 → 对称归一化，
+    **不做 phasic 分解**（连带消除 cvxEDA/highpass 双分支这个跨采样率失败成因）。
+    常量由 WESAD P0–P3 探针选定，四判据全面胜过「裸 SCL 无修正」对照臂
+    （`notes/2026-07-28-eda-v2-probe-p0-p2-results.md` §10）。
+    ⚠ v2 已知限制：`baseline_horizon_seconds` 须舒适超过典型唤醒事件时长，
+    **45 分钟以上的持续唤醒是否击穿默认 1800s，WESAD 数据集无法验证**。
+
     当前无生产影响：physio 先验在 Zero 点燃门下恒不可点燃（对内核零贡献）；但 Zero 正在
-    修点燃门，**一旦 physio 变为可点燃，此反号读数会真的污染内核**——两者是同一条时间线。
+    修点燃门，**一旦 physio 变为可点燃，v1 的反号读数会真的污染内核**——两者是同一条时间线，
+    翻默认值到 v2 的时点应与之协调（蓝图 §2.6）。
 
     **Protocol 兼容**：结构上满足 PerceptionChannel Protocol（无需继承）：
     - name: str 属性（"eda/sc"）。
@@ -196,6 +206,22 @@ class EdaChannel:
                               默认 (5, 95)。P5/P95 Winsorization 有文献背书、优于 min/max
                               （Lykken 原典 min/max 对伪迹不鲁棒）；样本量不足时可退 (10,90)，
                               与 cold_start 联动调整。
+
+        ── 以下为 v2（scl_baseline_delta）专属；v1 路径完全不读 ──
+        arousal_metric:       度量选择。None（默认）= 走 env ``ZERO_EDA_AROUSAL_METRIC``，
+                              env 缺省/非法则 ``"scr_amplitude_v1"``（零回归）。显式入参优先于 env。
+                              ⚠ **构造期一次性解析**——v2 有状态（baseline_history），运行中切换
+                              会让基线跨语义污染，故不在 sense() 内逐次读 env。
+        clock:                时钟注入（默认 ``time.monotonic``）。v2 的历史裁剪与冷启动判定按
+                              **真实秒数**，注入可测时钟即可让离线回放/单测完全确定（不依赖墙钟）。
+        baseline_horizon_seconds: v2 窗间基线回溯时长（秒）。默认 1800.0，见
+                              ``_SCL_BASELINE_HORIZON_SECONDS`` 的取值依据与已知限制。
+        delta_ref_us:         v2 的 Δ→μa 对称归一化参考（μS）。默认 1.0；实测判别/持续/跨被试
+                              三项对该值不敏感（0.5–1.5 同表现）。
+        baseline_min_observations: v2 出首个读数所需的最少历史窗数。默认 2（与覆盖率**双门**，
+                              取更严者）。
+        baseline_min_coverage_fraction: v2 出首个读数所需的历史时间跨度占 horizon 的比例。
+                              默认 0.15（首读约 4.5 分钟、None 占比 4.2%）。
     """
 
     name: str = "eda/sc"

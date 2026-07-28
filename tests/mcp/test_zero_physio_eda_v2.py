@@ -17,6 +17,9 @@ import pytest
 
 from src.mcp.zero.channels.physio_channel import (
     _SCL_BASELINE_HORIZON_SECONDS,
+    _SCL_BASELINE_MIN_COVERAGE,
+    _SCL_BASELINE_MIN_OBSERVATIONS,
+    _SCL_DELTA_REF_US,
     EdaChannel,
     _symmetric_normalize,
 )
@@ -319,8 +322,25 @@ class TestV2ConcurrencySafety:
 
 
 class TestV2ConstantsMatchProbeSelection:
-    """常量须与 P0–P3 探针选定值一致——改动即须重跑探针（防静默漂移）。"""
+    """**四个** v2 常量须与 P0–P3 探针选定值一致——改动即须重跑探针（防静默漂移）。
 
-    def test_horizon_default_pinned(self) -> None:
+    ⚠ 本类曾只 pin 了 4 个中的 1 个（code-review WARN #4：类名承诺的保障范围大于实际交付，
+    属 pitfalls「绿灯必须先证明它能红」同族）。现四个全 pin，且同时断言
+    **模块常量**与**构造后实例属性**——只 pin 模块常量会漏掉「默认值绑错常量」这一类改动。
+    """
+
+    def test_horizon_pinned(self) -> None:
         assert _SCL_BASELINE_HORIZON_SECONDS == 1800.0
         assert EdaChannel().baseline_horizon_seconds == 1800.0
+
+    def test_delta_ref_pinned(self) -> None:
+        assert _SCL_DELTA_REF_US == 1.0
+        assert EdaChannel().delta_ref_us == 1.0
+
+    def test_min_observations_pinned(self) -> None:
+        assert _SCL_BASELINE_MIN_OBSERVATIONS == 2
+        assert EdaChannel().baseline_min_observations == 2
+
+    def test_min_coverage_pinned(self) -> None:
+        assert _SCL_BASELINE_MIN_COVERAGE == 0.15
+        assert EdaChannel().baseline_min_coverage_fraction == 0.15
