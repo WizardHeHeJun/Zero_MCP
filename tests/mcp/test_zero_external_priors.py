@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from src.agents.models.zero_affect import ModalityPrior
+from src.mcp.zero import external_priors as external_priors_module
 from src.mcp.zero.external_priors import (
     EXTERNAL_PRIOR_SCHEMA_VERSION,
     MIN_PRECISION,
@@ -29,6 +30,7 @@ from src.mcp.zero.external_priors import (
     ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT,
     ZERO_MAX_EXTERNAL_STREAMS_DEFAULT,
     ModalityKind,
+    _assert_merge_arity_invariant,
     build_external_priors_override,
     build_recommended_prior,
     is_physio_stream,
@@ -663,6 +665,73 @@ class TestPhysioPreMerge:
         assert [name for name, _mu, _p in default["external_priors"]] == [PHYSIO_MERGED_MODALITY]
         opted_out = build_external_priors_override(priors, merge_physio=False)
         assert [name for name, _mu, _p in opted_out["external_priors"]] == ["eda/sc", "hrv/rmssd"]
+
+    def test_omega_half_gives_hrv_its_exact_reliability_weight(self) -> None:
+        """ω=0.5 时 HRV 实际权重**恒等于** Π_hrv/(Π_eda+Π_hrv)——故再按可靠度设 ω 是二次施加。
+
+        对任意 (Π_eda, Π_hrv) 成立的恒等式（Zero 议会 ω 档位终裁的代数核心）：
+            w_hrv(ω) = (1-ω)·Π_hrv / [ω·Π_eda + (1-ω)·Π_hrv]，ω=0.5 → Π_hrv/(Π_eda+Π_hrv)
+        """
+        pi_eda = PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        pi_hrv = PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        w_hrv = 0.5 * pi_hrv / (0.5 * pi_eda + 0.5 * pi_hrv)
+        assert w_hrv == pytest.approx(pi_hrv / (pi_eda + pi_hrv))
+        # 判别性：该权重确实 ≠ 0.5（否则本例退化为「对称权重=对称权重」的空断言）
+        assert w_hrv != pytest.approx(0.5)
+
+    def test_omega_half_preserves_mu_and_halves_precision(self) -> None:
+        """ω=0.5 只调保守度：μ 与「不合并双流进 fuse_terms」逐位相同，Π 精确减半。
+
+        任何 ω≠0.5 会同时扰动 μ 与 Π（把本该正交的两个自由度耦合）——一并作反例守卫。
+        """
+        mu_eda, mu_hrv = 0.76, 0.91
+        pi_eda = PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        pi_hrv = PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        # Zero fuse_terms 对两条独立流的等效结果
+        mu_unmerged = (pi_eda * mu_eda + pi_hrv * mu_hrv) / (pi_eda + pi_hrv)
+        pair = [
+            _make_prior("eda/sc", mu=(0.0, mu_eda), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("hrv/rmssd", mu=(0.0, mu_hrv), precision=(MIN_PRECISION, 0.18)),
+        ]
+        merged = merge_physio_priors(pair)[0]
+        assert merged.mu[1] == pytest.approx(mu_unmerged, abs=1e-12), "ω=0.5 应保持 μ 不变"
+        assert (pi_eda + pi_hrv) / merged.precision[1] == pytest.approx(2.0), "Π 应精确减半"
+        # 反例：ω≠0.5 会同时挪动 μ（证明「只调一个维度」是 ω=0.5 独有性质）
+        shifted = merge_physio_priors(pair, omega=0.4286)[0]
+        assert shifted.mu[1] != pytest.approx(mu_unmerged, abs=1e-6)
+
+    def test_merge_arity_invariant_currently_holds(self) -> None:
+        """当前子源集合与可靠度权重表一致于二元推导——不变量成立。"""
+        _assert_merge_arity_invariant()  # 不抛即通过
+
+    def test_adding_source_without_rederivation_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠ 治理守卫：只加同源子通道、不重走 N 元推导 → 硬失败（非静默降保守度）。
+
+        背景（Zero 议会转 CS 席治理项）：M6 按合并后计数=1，其前提是相关性已被 CI 推导吸收。
+        若第三个源被塞进二元式复用 ω=0.5，"physio" 背后会藏 3 条朴素求和的证据，
+        **两仓都感知不到 M6 失效**。故此处必须 raise 而非放行。
+        """
+        monkeypatch.setattr(
+            external_priors_module, "_PHYSIO_MERGE_SOURCES", ("eda", "hrv", "rsp"), raising=True
+        )
+        monkeypatch.setattr(
+            external_priors_module,
+            "PHYSIO_SUBSOURCE_PRECISION_A",
+            {"eda": 0.15, "hrv": 0.20, "rsp": 0.10},
+            raising=True,
+        )
+        with pytest.raises(NotImplementedError, match="N 元 CI 推导"):
+            _assert_merge_arity_invariant()
+        # 合并入口本身也必须被守住（不是只有辅助函数会抛）
+        with pytest.raises(NotImplementedError, match="N 元 CI 推导"):
+            merge_physio_priors(
+                [
+                    _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+                    _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+                ]
+            )
 
     def test_merge_avoids_naive_precision_inflation(self) -> None:
         """合并后 Πa 严格小于不合并时的朴素 Σπ——这正是要规避的 2× 虚增。"""

@@ -304,12 +304,31 @@ def build_recommended_prior(
 # ---------------------------------------------------------------------------
 
 PHYSIO_MERGE_OMEGA_DEFAULT: float = 0.5
-"""EDA/HRV 协方差交叉（CI）预合并的固定权重 ω 默认值（对称权重）。
+"""EDA/HRV 协方差交叉（CI）预合并的固定权重 ω —— **唯一不重复计可靠度的取值**。
 
-Zero 议会裁定：1 维 CI 严格最优会退化到 ω*∈{0,1}（完全弃用一方——二者都只测同一标量
-arousal、天然对齐，落入退化角），不实用；故采**次优保守固定权重**（Niehsen 2002 快速 CI）。
-对称 ω=0.5 是议会给出确切数值（Π_merged=0.175）的那一档；可靠度加权档 ω≈0.571。
-env `ZERO_PHYSIO_MERGE_OMEGA` 可覆盖。
+背景：1 维 CI 严格最优会退化到 ω*∈{0,1}（完全弃用一方——二者都只测同一标量 arousal、
+天然对齐，落入退化角），不实用；故采次优保守固定权重（Niehsen 2002 快速 CI）。
+
+**为何必须是 0.5**（Zero 议会 2026-07-28 ω 档位终裁，本仓现场复核）：本仓约定 ω 乘在
+``Π_eda`` 上，HRV 在合并均值里的实际权重是
+
+    w_hrv(ω) = (1-ω)·Π_hrv / [ω·Π_eda + (1-ω)·Π_hrv]
+
+ω=0.5 时分子分母同除 0.5，**精确退化**为 ``Π_hrv/(Π_eda+Π_hrv)``——这是对**任意**
+(Π_eda, Π_hrv) 都成立的恒等式（现场随机核验 1e4 组，最大偏差 0.0），非本组数值的巧合。
+即 ω=0.5 时 HRV **已自动拿到「它该得的」可靠度权重**（本组数值下 0.5714）；若再把 ω 设成
+可靠度比例，等于**二次施加**可靠度。
+
+更干净的判据（现场复核）：不预合并、双流直接进 Zero ``fuse_terms`` 得 μ=0.845714/Σπ=0.35；
+ω=0.5 预合并得 **μ 完全不变（Δ=0.0）、Π 精确减半（比值 2.000000）**——只调「保守度」这一个
+维度。任何 ω≠0.5 都会**同时**扰动 μ（实测 Δμ≈1e-2）与 Π，把本该正交的两个自由度耦合起来。
+
+⚠ **勿换档**：ω=0.571 与 ω=0.4286 是「同一个错误的两个方向」（分别在 EDA/HRV 上多算一次
+可靠度，实测把 μ 往相反方向各推 ~1e-2），Zero 议会均已弃用。
+⚠ 跨仓约定错位提醒：Zero 材料里的 ω≈0.571 是加在 **HRV** 上的权重，与本仓「ω 乘 Π_eda」
+约定相反（对应本仓 ω=0.4286）——该档本身已作废，此处记录以免日后误代入。
+
+env ``ZERO_PHYSIO_MERGE_OMEGA`` 可覆盖，**仅供实验/对照，生产不应改**。
 """
 
 PHYSIO_SUBSOURCE_PRECISION_A: dict[str, float] = {"eda": 0.15, "hrv": 0.20}
@@ -332,6 +351,35 @@ PHYSIO_MERGED_MODALITY: str = "physio"
 """
 
 _PHYSIO_MERGE_SOURCES: tuple[str, str] = ("eda", "hrv")
+
+_PHYSIO_MERGE_ARITY: int = 2
+"""本模块合并式的**推导元数**（当前 = 二元 CI）。
+
+治理不变量（Zero 议会 2026-07-28 转 CS 席治理项）：``build_external_priors_override`` 的 M6
+流数按**合并后**计数，其成立前提是「合并流背后的相关性风险已被 CI 推导吸收」。若日后新增同源
+子通道（如呼吸率 RSP）却**直接塞进现有二元公式复用 ω=0.5**，则 M6 计数为 1 的 ``physio``
+背后可能藏进 3、4 条**朴素求和**的原始证据——**M6 的保险会在 Zero 与本仓双方都感知不到的
+地方失效**。故新增源必须重走 N 元 CI 推导；本常量 + ``_assert_merge_arity_invariant()``
+使「只加源、不改推导」在运行期硬失败，而非静默降低保守度。
+"""
+
+
+def _assert_merge_arity_invariant() -> None:
+    """守卫：子源集合与可靠度权重表须与推导元数一致，否则拒绝合并。
+
+    Raises:
+        NotImplementedError: 子源数 ≠ 推导元数，或子源集合与权重表键集不一致
+            （即有人加了源却没重走 N 元推导）。
+    """
+    sources = set(_PHYSIO_MERGE_SOURCES)
+    weighted = set(PHYSIO_SUBSOURCE_PRECISION_A)
+    if len(sources) != _PHYSIO_MERGE_ARITY or sources != weighted:
+        raise NotImplementedError(
+            f"physio 预合并的推导元数为 {_PHYSIO_MERGE_ARITY}（二元 CI），但当前子源="
+            f"{sorted(sources)}、可靠度权重表={sorted(weighted)}。**新增同源子通道必须重走 "
+            "N 元 CI 推导**，不可复用二元式的 ω=0.5——否则 M6 按合并后计数=1，却掩盖 N 条"
+            "朴素求和的原始证据，Zero 与本仓均无从察觉（Zero 议会 2026-07-28 治理项）。"
+        )
 
 
 def _resolve_merge_omega(omega: float | None) -> float:
@@ -381,9 +429,20 @@ def merge_physio_priors(
         新列表：EDA/HRV 被替换为单条 ``physio``（落在首个生理流原位置），其余流保持原序。
         **不足两条**（缺 EDA 或缺 HRV）时原样返回——无相关性双计问题，无需合并。
 
+    ⚠ **勿把 Π_merged 解释为「假设 EDA/HRV 完全相关（ρ=1）」**——数值上站不住：若真设 ρ=1，
+    标准 GLS 约束权重下的最优融合是 ``max(Π_eda, Π_hrv)=0.20``（方差 5.0），而 0.175 对应
+    方差 5.714，**比「假设完全相关」下能达到的最优还保守**（现场复核）。正确表述：
+    ω=0.5 对 EDA–HRV 间**任意未知**相关系数 ρ∈[-1,1] 均给出一致的保守界
+    （Julier & Uhlmann 1997），且是使均值估计不受可靠度重复加权污染的唯一取值；
+    **不代表对 ρ 做出任何具体假设，尤其不等价于假设 ρ=1**。
+
     Raises:
-        ValueError: ω 不在 (0,1) 开区间。
+        ValueError:          ω 不在 (0,1) 开区间。
+        NotImplementedError: 子源数与推导元数不符（见 _assert_merge_arity_invariant）。
     """
+    # 治理不变量：新增同源子通道必须重走 N 元 CI 推导，否则 M6 的保险会静默失效
+    _assert_merge_arity_invariant()
+
     found: dict[str, int] = {}
     for index, prior in enumerate(priors):
         name = prior.modality.lower()
