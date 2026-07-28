@@ -183,6 +183,12 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
 
     截断不在此处（由 Task 11 prompt_loader 统一处理）。
 
+    **注入过滤边界**（蓝图 v2 WARN-1）：本摘要整体会进 Supervisor 的 LLM prompt，故
+    **所有由被感知应用填写的自由文本**都在此处过 `sanitize_screen_text`——包括活跃窗口标题、
+    UIA 元素的 `name` 与 `control_type`、视觉对象的 `label`。`text_blocks` 例外：它由调用方
+    预先过滤后经 `sanitized_texts` 传入（保持既有契约）。不过滤的只有 `VisualObject.source`
+    与 `UiaElement.source`——它们是 `Literal` 枚举、由本仓自己填，非外部输入。
+
     Args:
         snapshot: 原始感知快照。
         sanitized_texts: 过滤后的文本列表（与 snapshot.text_blocks 一一对应）。
@@ -192,8 +198,12 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
     """
     lines: list[str] = []
 
-    # 基本元信息
-    window_title = snapshot.active_window_title or "(无活跃窗口)"
+    # 基本元信息（窗口标题由外部进程提供 → 与 text_blocks 同为不可信文本，须过滤）
+    window_title = (
+        sanitize_screen_text(snapshot.active_window_title)
+        if snapshot.active_window_title
+        else "(无活跃窗口)"
+    )
     lines.append(f"[感知摘要] 窗口={window_title}")
     lines.append(f"模式={snapshot.perception_mode}  uia_hollow={snapshot.uia_hollow}")
     lines.append(f"屏幕={snapshot.screen_width}x{snapshot.screen_height}")
@@ -202,7 +212,9 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
     if snapshot.uia_elements:
         lines.append(f"UIA元素({len(snapshot.uia_elements)}):")
         for elem in snapshot.uia_elements[:20]:  # 最多列 20 个，防摘要过长
-            lines.append(f"  [{elem.control_type}] {elem.name or '(无名)'}")
+            # name/control_type 均由被感知应用自行填写 → 不可信，须过滤
+            elem_name = sanitize_screen_text(elem.name) if elem.name else "(无名)"
+            lines.append(f"  [{sanitize_screen_text(elem.control_type)}] {elem_name}")
         if len(snapshot.uia_elements) > 20:
             lines.append(f"  ...（共 {len(snapshot.uia_elements)} 个，截断显示 20）")
     else:
@@ -220,7 +232,11 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
     if snapshot.visual_objects:
         lines.append(f"视觉对象({len(snapshot.visual_objects)}):")
         for obj in snapshot.visual_objects[:10]:
-            lines.append(f"  [{obj.source}] {obj.label} conf={obj.confidence:.2f}")
+            # label 源自模型/模板匹配对屏幕内容的读出 → 不可信。
+            # source 是 Literal 枚举（我方自产）→ 不过滤。
+            lines.append(
+                f"  [{obj.source}] {sanitize_screen_text(obj.label)} conf={obj.confidence:.2f}"
+            )
     else:
         lines.append("视觉对象: (空)")
 
