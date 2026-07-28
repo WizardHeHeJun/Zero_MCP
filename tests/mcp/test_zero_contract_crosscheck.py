@@ -1047,11 +1047,17 @@ class TestIgnitionGateReachabilityCrosscheck:
             )
 
     def test_survival_stream_always_ignites(self) -> None:
-        """SURVIVAL_PRECISION ⊗ SALIENCE_THRESHOLD **绑定**：survival 恒过阈。
+        """SURVIVAL_PRECISION ⊗ SALIENCE_THRESHOLD **绑定**：默认配置下 survival 恒过阈。
 
-        推论：`ignite` 的 `if not fired: fired=[max by salience]` 兜底分支**结构性不可达**
-        （survival arousal 恒 ≥0.5、Π 恒 (0.4,0.4) → salience ≥0.200 > 0.18）。故外部亚阈
-        先验永远等不到「全场亚阈时当选 max」的逃逸机会。两常量任一动即须同评。
+        推论：`ignite` 的 `if not fired: fired=[max by salience]` 兜底分支在**默认配置下**
+        不可达（survival arousal 恒 ≥0.5、Π 恒 (0.4,0.4) → salience ≥0.200 > 0.18）。故外部
+        亚阈先验等不到「全场亚阈时当选 max」的逃逸机会。两常量任一动即须同评。
+
+        ⚠ **2026-07-29 重标**：Zero 已落 `arousal_floor_fix` 门控（commit 4760dfb，
+        「线A」），本例按上一版结构断言如期变红——那是设计意图，不是缺陷。重标后本例改为
+        **按分支各自判定**：默认分支（带地板）仍须过阈；门开分支（去地板）则**已知不过阈**，
+        这条不再是「结构性不可达」而是「默认配置下不可达」。见下方 `test_survival_max_fallback_
+        becomes_reachable_when_floor_fix_gate_opens` —— 门开后的可达性单列一条正面刻画。
         """
         source = self._source()
         consts = {}
@@ -1062,37 +1068,107 @@ class TestIgnitionGateReachabilityCrosscheck:
             consts[name] = float(match.group(1))
 
         # ⚠ 此处**从 Zero 源码读** fast_survival_prior 的 arousal 基线系数，不再手抄。
-        # Zero 07-28 二轮回执：去地板（→clamp(0.5|I|)）已列必改，且明确要求本例在其
-        # 落地当天变红=跨仓信号（勿改宽松）。届时红了是**正确行为**，重标须等 Zero
-        # 最终形态 ping（去地板与跨流归一化打包），勿见红即放宽断言。
-        #
-        # 三种落地形态都要能红（Zero 复议纪要 §六(e):186 裁定 floor 修复**与 D formula
-        # 共用同一 default-off 总开关**、「关闭时旧行为逐字不变」——即最可能的落地不是
-        # 直接改这一行，而是**新增分支/条件**。若只断言「基线值 == 0.5」，门控落地当天
-        # 走 legacy 分支照样绿，正是本仓 pitfalls ② 那个失败模式的复发）：
-        #   裸改（无门控）→ 基线解析 0.0 → 主断言红；
-        #   多分支门控   → len>1     → 结构断言红；
-        #   条件表达式   → 解析不出   → 空列表断言红。
+        # 现行形态（Zero 复议 §六(e):186 裁定的 default-off 门控）：两分支，基线 {0.0, 0.5}。
+        # 仍要求「形态一变就红」：任何第三种分支、或基线集合变化，都落到下面的逐值断言上。
         floors = _survival_arousal_floors(source)
         if floors is None:
             pytest.skip("未找到 fast_survival_prior 函数体，Zero 结构可能大改，跳过")
-        assert floors, (
-            "fast_survival_prior 在位但 arousal 式解析不出（可能改成条件表达式/门控形态）"
-            "——须按 Zero 最终形态重标本守卫，勿放宽（Zero 07-28 二轮：去地板已列必改）。"
+        assert sorted(floors) == [0.0, 0.5], (
+            f"fast_survival_prior 的 arousal 分支基线集合变为 {sorted(floors)}（期望 "
+            "[0.0, 0.5] = 门开去地板 / 门关带地板两分支）——Zero 又动了 survival 证据式，"
+            "须重新核对默认路径走哪条，勿放宽本断言。"
         )
-        assert len(floors) == 1, (
-            f"fast_survival_prior 出现 {len(floors)} 个 arousal 分支形态（基线 {floors}）"
-            "——与 Zero 复议 §六(e) 的 default-off 门控落地形状一致。此时「哪条是默认路径」"
-            "本守卫判不了，须按 Zero ping 的最终形态重标（含门开关默认值 pin）。"
+
+        # 默认路径 pin：`arousal_floor_fix` 形参默认 False = 走**带地板**分支。
+        # 这一条是「哪条是默认」的唯一真相；只 pin 基线集合而不 pin 默认值，Zero 把默认翻成
+        # True 的那天本例照样绿——正是本仓 pitfalls ② 的失败模式。
+        default_match = re.search(r"arousal_floor_fix\s*:\s*bool\s*=\s*(True|False)", source)
+        assert default_match is not None, (
+            "未找到 arousal_floor_fix 形参默认值——门控形态又变了，须按新形态重标。"
         )
+        assert default_match.group(1) == "False", (
+            "arousal_floor_fix 默认值翻为 True（去地板成为默认路径）——survival 在 I=0 时"
+            "salience=0，ignite 的 max-fallback 变为默认可达，本仓可达性结论须整体重评。"
+        )
+
         # intensity=0 时取基线项；斜率项 ≥0 故基线即下确界（clamp 下界 0.0 不咬合）
-        min_survival_arousal = floors[0]
+        min_survival_arousal = max(floors)  # 默认分支 = 带地板那条
 
         min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
         assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
             f"survival 流最小 salience={min_survival_salience:.4f} 不再 > 阈值 "
             f"{consts['SALIENCE_THRESHOLD']}——ignite 的 max-fallback 分支变为可达，"
             "外部亚阈先验可能在全场亚阈时被保留，本仓可达性结论须重评。"
+        )
+
+    def test_survival_max_fallback_becomes_reachable_when_floor_fix_gate_opens(self) -> None:
+        """门开（`ZERO_IGNITION_GATE_FUSION=false`）后 survival 在 I=0 时**不再过阈**。
+
+        这是 Zero 07-29 落地带来的**新事实**，本仓可达性结论的适用范围因此收窄：
+        「外部亚阈先验永远等不到 max-fallback」只在**门关（默认）**下成立。门一开，
+        足够平淡的输入下全场可能亚阈，此时 `ignite` 的 max-fallback 会挑出 salience
+        最大者——**本仓的 physio 先验（恒亚阈）由此获得被保留的路径**。
+
+        ⚠ 「平淡」不等于「intensity=0」：去地板只清掉 arousal 项，**valence 项
+        `clamp(0.6·goal)` 原样保留**。故门开后 survival 亚阈的真实条件是
+        `intensity≈0` **且** `|goal| < 阈值/(Π·0.6)`。本例按该条件判定，不用
+        「基线=0 → 恒亚阈」那种看着成立、实则与 Zero 改什么都无关的空断言。
+
+        本例把这条正面刻画钉住：若 Zero 日后给去地板分支补回下限、或调高 valence 系数
+        使可行域塌空，本例变红 → 提醒我们把「门开=physio 有逃逸机会」这个结论撤回。
+        """
+        source = self._source()
+        consts = {}
+        for name in ("SURVIVAL_PRECISION", "SALIENCE_THRESHOLD"):
+            match = re.search(rf"^{name}\s*=\s*({_NUM})", source, re.MULTILINE)
+            if match is None:
+                pytest.skip(f"未找到 {name}，跳过")
+            consts[name] = float(match.group(1))
+        threshold = consts["SALIENCE_THRESHOLD"]
+        precision = consts["SURVIVAL_PRECISION"]
+
+        floors = _survival_arousal_floors(source)
+        if floors is None:
+            pytest.skip("未找到 fast_survival_prior 函数体，Zero 结构可能大改，跳过")
+        assert sorted(floors) == [0.0, 0.5], f"分支基线集合变为 {sorted(floors)}，须重标"
+
+        # valence 系数从源码读（不手抄）：`valence = clamp(0.6 * goal, -1.0, 1.0)`
+        func_match = _ZERO_SURVIVAL_FUNC_RE.search(source)
+        assert func_match is not None
+        v_match = re.search(rf"valence\s*=\s*clamp\(\s*({_NUM})\s*\*\s*goal", func_match.group(0))
+        if v_match is None:
+            pytest.skip("survival valence 式形态变更，跳过（须按新形态重标）")
+        valence_coef = float(v_match.group(1))
+
+        # 门开分支 = 无基线项那条 → intensity=0 时 arousal=0，salience = |coef·goal|·Π。
+        # 亚阈可行域：|goal| < threshold/(Π·coef)。goal∈[-1,1]，故该域非空 ⇔ 上界 > 0。
+        gate_open_floor = min(floors)
+        assert gate_open_floor == 0.0, "门开分支不再是「无基线」形态，须重标"
+        goal_bound = threshold / (precision * valence_coef)
+        assert 0.0 < goal_bound, "亚阈可行域为空——门开后 survival 仍恒过阈，结论须撤回"
+        assert goal_bound == pytest.approx(0.75, abs=1e-9), (
+            f"门开后 survival 的亚阈条件漂移：|goal| < {goal_bound:.4f}（期望 0.75="
+            f"{threshold}/({precision}·{valence_coef})）——本仓「门开=physio 有逃逸机会」"
+            "的适用范围随之改变，须跨仓同评。"
+        )
+
+        # 反面对照（非冗余）：门关分支下**任何** goal 都过阈——0.5·Π=0.200 > 0.18 与 goal 无关。
+        # 这条是上一例结论的另一面：可达性的翻转完全由门决定，不由输入决定。
+        assert max(floors) * precision > threshold, (
+            "门关分支下 survival 已非恒过阈——与 test_survival_stream_always_ignites 冲突，"
+            "两例须同评。"
+        )
+
+        # 门与门的绑定：floor_fix 不是独立旋钮，而是 gate_fusion 的取反（Zero 议会 D5 强制
+        # 共用同一开关）。这条绑定一旦解开，两个门可各自独立开合 → 组合态爆炸，本仓的
+        # 二态刻画（门关/门开）不再充分。
+        core_py = _ZERO_SRC / "agents" / "affect_core.py"
+        if not core_py.is_file():
+            pytest.skip(f"Zero affect_core.py 不存在（{core_py}），跳过绑定核对")
+        core_source = core_py.read_text(encoding="utf-8")
+        assert "arousal_floor_fix=not state.gate_fusion" in core_source, (
+            "affect_core 不再把 arousal_floor_fix 绑定为 `not gate_fusion`——两门可独立开合，"
+            "本仓「门关/门开」二态刻画不再充分，须按新组合态重标可达性结论。"
         )
 
     def test_survival_floor_guard_goes_red_not_skip_on_confirmed_change(self) -> None:
@@ -1104,11 +1180,13 @@ class TestIgnitionGateReachabilityCrosscheck:
         (1) 现行地板形态解析 [0.5]——且 decoy 在场不被抢注（反例非假想：首版可选基线正则
         就被 occ_prior 的多行 clamp(0.4·|I|+…) 全文件抢先匹配、把真地板误读成 0.0，
         Zero 未动手先假阳性红，07-28 实踩）；(2) 裸去地板形态解析 **[0.0] 而非 None**
-        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) **门控多分支形态**（Zero
-        复议 §六(e):186 裁定 floor 与 D formula 共用 default-off 总开关、「关闭时旧行为
-        逐字不变」→ 最可能的落地是新增分支而非改这一行）→ 两元素 → 结构断言红，而非
-        「走 legacy 分支照样绿」（那正是本仓 pitfalls ② 失败模式的复发）；(4) 条件表达式
-        等不可解析形态 → **空列表**（非 None）→ 断言红；(5) 函数整体缺位 → None → skip。
+        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) **门控多分支形态**必须解析出
+        **两个**元素而非只取第一个匹配——2026-07-29 Zero 已按此形态落地（commit 4760dfb），
+        上例遂改为「基线集合逐值 pin + 默认值 pin」；只取首个匹配会让「走 legacy 分支照样绿」，
+        即 default-off 落地当天守卫失明（本仓 pitfalls ② 失败模式）；(4) 条件表达式等不可解析
+        形态 → **空列表**（非 None）→ 断言红；(5) 函数整体缺位 → None → skip。
+        (6) **默认值翻转**（`arousal_floor_fix: bool = True`）→ 默认值 pin 断言红——这是重标后
+        新增的一格：门控形态已成既定事实，此后唯一能悄悄改变默认路径的就是翻这个默认值。
         如实标注守不住什么：(5) 这一格（Zero 整个重命名/删除 fast_survival_prior）本守卫
         只能 skip、靠 STRICT 兜底转红。不依赖 D:\\Zero 在位，判别力常年在测。
         """
@@ -1160,6 +1238,19 @@ class TestIgnitionGateReachabilityCrosscheck:
             "不可解析形态须返回空列表（→上例断言红），返回 None 会逃进 skip"
         )
         assert _survival_arousal_floors(decoy_occ_prior) is None
+
+        # (6) 默认值 pin 的判别力：门控形态既已落地，唯一能悄悄改默认路径的就是翻这个默认值。
+        # 用与上例**同一条正则**跑两份合成源码，证明它分得开 False / True，而非恒绿。
+        default_re = r"arousal_floor_fix\s*:\s*bool\s*=\s*(True|False)"
+        legacy_sig = "def fast_survival_prior(features, *, arousal_floor_fix: bool = False):\n"
+        flipped_sig = "def fast_survival_prior(features, *, arousal_floor_fix: bool = True):\n"
+        legacy_match = re.search(default_re, legacy_sig)
+        flipped_match = re.search(default_re, flipped_sig)
+        assert legacy_match is not None and legacy_match.group(1) == "False"
+        assert flipped_match is not None and flipped_match.group(1) == "True", (
+            "默认值翻为 True 时正则须解析出 True（→上例断言红）；解析不出会逃进"
+            "「未找到默认值」那条 assert，同样是红，但归因会指错方向"
+        )
 
 
 # ---------------------------------------------------------------------------
