@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -45,8 +46,13 @@ def _make_channel(
     - ModalityPrior  → sense() 返回该先验。
     - None           → sense() 返回 None（无证据）。
     - Exception 实例 → sense() 抛出该异常。
+
+    ⚠ 用 ``spec=["name", "sense"]`` 而非裸 ``MagicMock()``：裸 mock 会**自动伪造任意属性**，
+    使 Hub 的可选协议鸭子类型检测（``getattr(ch, "prepare"/"reset", None)`` + ``callable``）
+    全部误判为「该通道实现了此可选方法」，进而 await 一个不可等待的 MagicMock。
+    加 spec 后 mock 只暴露 Protocol 真实成员，可选协议的「未实现即跳过」分支才测得准。
     """
-    channel = MagicMock()
+    channel = MagicMock(spec=["name", "sense"])
     channel.name = name
     if isinstance(sense_return, BaseException):
         channel.sense = AsyncMock(side_effect=sense_return)
@@ -306,3 +312,125 @@ class TestPerceptionChannelProtocol:
         prior = _make_prior("m", mu=(0.0, 0.0), precision=(0.5, 0.5))
         hub = PerceptionHub([_make_channel("m", prior)])
         assert isinstance(hub, PerceptionHub)
+
+
+# ---------------------------------------------------------------------------
+# 重依赖预热（prepare_all）—— 防「并发首次 import 半成品模块」竞态回归
+# ---------------------------------------------------------------------------
+
+
+class TestPerceptionHubPrepareAll:
+    """``collect()`` 必须在并发派发**之前串行**预热各通道的重依赖延迟 import。
+
+    实测缺陷（非预防性优化）：AudioChannel 线程首次 ``import torch`` 期间，torch 已进
+    ``sys.modules`` 但未初始化完；同批并发的 HrvChannel 走
+    ``nk.hrv_time → scipy.stats.iqr → scipy array-API 分发 → getattr(sys.modules["torch"],
+    "Tensor")`` 撞上半成品 → ``AttributeError`` → 该通道先验被 ``collect()`` 静默跳过。
+    即**受害者并不 import torch**，是 SciPy 去探测它。故守卫「预热发生」+「串行」+「先于 sense」。
+    """
+
+    async def test_prepare_called_before_any_sense(self) -> None:
+        """预热必须**先于**任何 sense()——顺序错了竞态窗口依然存在。"""
+        order: list[str] = []
+
+        class _Heavy:
+            name = "heavy"
+
+            async def prepare(self) -> None:
+                order.append("prepare")
+
+            async def sense(self, signal: Any | None = None) -> ModalityPrior | None:
+                order.append("sense")
+                return _make_prior("heavy", mu=(0.0, 0.1), precision=(0.5, 0.5))
+
+        hub = PerceptionHub([_Heavy()])  # type: ignore[list-item]
+        await hub.collect()
+        assert order == ["prepare", "sense"], f"预热未先于 sense：{order}"
+
+    async def test_prepares_are_serial_not_concurrent(self) -> None:
+        """多个通道的预热必须**串行**——并发预热等于没修（import 仍会重叠）。"""
+        active = 0
+        max_active = 0
+
+        class _Heavy:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def prepare(self) -> None:
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.01)  # 制造重叠窗口：并发实现会让 max_active > 1
+                active -= 1
+
+            async def sense(self, signal: Any | None = None) -> ModalityPrior | None:
+                return _make_prior(self.name, mu=(0.0, 0.1), precision=(0.5, 0.5))
+
+        hub = PerceptionHub([_Heavy("a"), _Heavy("b"), _Heavy("c")])  # type: ignore[list-item]
+        await hub.collect()
+        assert max_active == 1, f"预热并发执行（峰值 {max_active}）——竞态窗口未消除"
+
+    async def test_channel_without_prepare_is_skipped(self) -> None:
+        """无 prepare() 的通道安全跳过（可选协议，鸭子类型，同 reset()）。"""
+        prior = _make_prior("plain", mu=(0.0, 0.2), precision=(0.5, 0.5))
+        plain = _make_channel("plain", prior)
+        assert not hasattr(plain, "prepare")
+        hub = PerceptionHub([plain])
+        assert await hub.collect() == [prior]
+
+    async def test_prepare_failure_does_not_block_other_channels(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """单通道预热失败**不阻断** collect——其余通道照常产先验，失败者走 sense 的既有回退。"""
+        good_prior = _make_prior("good", mu=(0.0, 0.3), precision=(0.5, 0.5))
+
+        class _BadPrepare:
+            name = "bad"
+
+            async def prepare(self) -> None:
+                raise ImportError("模拟缺库")
+
+            async def sense(self, signal: Any | None = None) -> ModalityPrior | None:
+                return None  # 缺库 → 既有优雅回退
+
+        hub = PerceptionHub([_BadPrepare(), _make_channel("good", good_prior)])  # type: ignore[list-item]
+        with caplog.at_level(logging.WARNING):
+            priors = await hub.collect()
+        assert priors == [good_prior], "预热失败的通道不应拖垮其余通道"
+        assert any("预热失败" in r.getMessage() for r in caplog.records)
+
+    async def test_prepare_runs_once_across_collects(self) -> None:
+        """预热幂等：多次 collect() 只预热一次（避免每轮重复线程派发开销）。"""
+        calls = 0
+
+        class _Heavy:
+            name = "heavy"
+
+            async def prepare(self) -> None:
+                nonlocal calls
+                calls += 1
+
+            async def sense(self, signal: Any | None = None) -> ModalityPrior | None:
+                return _make_prior("heavy", mu=(0.0, 0.1), precision=(0.5, 0.5))
+
+        hub = PerceptionHub([_Heavy()])  # type: ignore[list-item]
+        assert hub.prepared is False
+        await hub.collect()
+        await hub.collect()
+        await hub.collect()
+        assert calls == 1, f"预热被重复执行 {calls} 次"
+        assert hub.prepared is True
+
+    async def test_real_heavy_channels_expose_prepare(self) -> None:
+        """真通道（audio/vision）须实现 prepare()——否则修复对生产路径不生效。
+
+        判别性守卫：若日后有人删掉 AudioChannel.prepare，本例红；仅靠上面的假通道测试
+        无法发现（假通道自带 prepare）。
+        """
+        from src.mcp.zero.channels.audio_channel import AudioChannel
+        from src.mcp.zero.channels.vision_channel import VisionChannel
+
+        for cls in (AudioChannel, VisionChannel):
+            assert callable(getattr(cls, "prepare", None)), (
+                f"{cls.__name__} 缺 prepare()——并发首次 import 竞态会复活"
+            )

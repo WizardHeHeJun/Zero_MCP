@@ -114,6 +114,24 @@ class VisionChannel:
         # 阻塞推理走线程池，不堵事件循环（python-code.md async 规则）
         return await asyncio.to_thread(self._infer, raw)
 
+    async def prepare(self) -> None:
+        """async：预热 emotiefflib/onnxruntime 的延迟 import（并发前串行调用）。
+
+        与 ``AudioChannel.prepare`` 同源：把重依赖的首次 import 挪到并发之前，避免工作线程里
+        「半成品模块」窗口被其它线程的模块探测撞上（详见 ``PerceptionHub.prepare_all``）。
+        本通道走 ONNX 后端（零 timm），主要收益是消除首帧延迟并与 audio 侧对称；
+        幂等，缺库时静默返回，``sense()`` 仍优雅回退。
+        """
+
+        def _warm() -> None:
+            import emotiefflib.facial_analysis  # noqa: F401
+            import onnxruntime  # noqa: F401
+
+        try:
+            await asyncio.to_thread(_warm)
+        except ImportError as exc:
+            logger.warning("VisionChannel 预热：emotiefflib/onnxruntime 不可用（将回退）: %s", exc)
+
     def _ensure_recognizer(self) -> Any | None:
         """延迟加载并缓存 recognizer；非 VA（非 mtl）模型 → warning + None（缓存哨兵不重载）。"""
         if self.recognizer is not None:

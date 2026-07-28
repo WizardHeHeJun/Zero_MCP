@@ -62,6 +62,8 @@ class PerceptionHub:
 
     def __init__(self, channels: list[PerceptionChannel]) -> None:
         self.channels = channels
+        # 重依赖延迟 import 是否已串行预热（见 prepare_all：防并发首次 import 的半成品模块竞态）
+        self.prepared = False
 
     def reset_all(self) -> None:
         """被试切换时的统一入口：对**有状态**通道（实现了 reset()）调用其 reset()。
@@ -75,6 +77,43 @@ class PerceptionHub:
             if callable(reset):
                 reset()
 
+    async def prepare_all(self) -> None:
+        """**串行**预热各通道的重依赖延迟 import（并发派发前调用，幂等）。
+
+        为什么必须串行、且必须在 gather 之前（真实缺陷，非预防性优化）：各通道的 ``_process``
+        经 ``asyncio.to_thread`` 落到线程池并发执行，而重依赖是**在工作线程里首次 import** 的。
+        实测竞态（完整 traceback 见 pitfalls「并发首次 import torch 撞 scipy array-API 探测」）：
+
+            AudioChannel 线程   : import torch  →  torch 已进 sys.modules 但**尚未初始化完**
+            HrvChannel  线程   : nk.hrv_time → scipy.stats.iqr → scipy 的 array-API 分发
+                                 → array_api_compat `_issubclass_fast`
+                                 → getattr(sys.modules["torch"], "Tensor")
+            → AttributeError: partially initialized module 'torch' has no attribute 'Tensor'
+
+        即**并非 physio 通道自己去 import torch**，而是 SciPy 会**探测** ``sys.modules["torch"]``
+        以判断入参是否 torch 张量；恰好撞上另一线程的半成品 torch 就抛。后果是 physio 先验被
+        ``collect()`` 当作「通道异常」**静默跳过**——冷启动下间歇丢流，且日志之外无任何征兆。
+
+        预热把这些 import 挪到**并发之前逐个完成**，此后 ``sys.modules`` 里恒是完整模块，
+        探测不再有半成品窗口。``prepare()`` 是**可选**协议（鸭子类型，同 ``reset()``）：
+        无重依赖的通道不必实现。单通道预热失败**不阻断**其余通道——该通道会在 ``sense()``
+        时按既有约定优雅回退（缺库→warning+None）。
+        """
+        for ch in self.channels:
+            prepare = getattr(ch, "prepare", None)
+            if not callable(prepare):
+                continue
+            try:
+                await prepare()
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                # 预热失败不致命：该通道 sense() 会走既有优雅回退路径
+                logger.warning(
+                    "PerceptionChannel %r 预热失败（不阻断，sense() 时将优雅回退）: %s",
+                    getattr(ch, "name", ch),
+                    exc,
+                )
+        self.prepared = True
+
     async def collect(self) -> list[ModalityPrior]:
         """async：并发收集各通道先验，单通道失败/无证据降级跳过。
 
@@ -82,7 +121,12 @@ class PerceptionHub:
         异常 → logger.warning 记录通道名与错误，跳过；
         None → 本轮无证据，跳过；
         ModalityPrior → 保留（不做任何融合，顺序与 channels 一致）。
+
+        首次调用前先 ``prepare_all()`` 串行预热重依赖 import——避免并发首次 import 的
+        半成品模块竞态导致通道被静默跳过（见 ``prepare_all`` docstring 的实测 traceback）。
         """
+        if not self.prepared:
+            await self.prepare_all()
         tasks = [ch.sense() for ch in self.channels]
         results: list[ModalityPrior | None | BaseException] = await asyncio.gather(
             *tasks, return_exceptions=True

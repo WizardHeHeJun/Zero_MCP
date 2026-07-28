@@ -152,6 +152,30 @@ class AudioChannel:
         # 阻塞推理走线程池，不堵事件循环（python-code.md async 规则）
         return await asyncio.to_thread(self._infer, raw)
 
+    async def prepare(self) -> None:
+        """async：预热 torch/transformers 的延迟 import（PerceptionHub 并发前串行调用）。
+
+        **这不是性能优化，是修一个实测缺陷**：torch 若在工作线程里首次 import，其「已进
+        sys.modules 但未初始化完」的窗口会被**其它线程**的 SciPy array-API 探测撞上
+        （``getattr(sys.modules["torch"], "Tensor")`` → AttributeError: partially initialized
+        module），导致同批并发的 physio 通道先验被 ``collect()`` 静默跳过。预热让 import 在
+        并发之前完成，探测此后恒见完整模块。详见 ``PerceptionHub.prepare_all`` 与 pitfalls。
+
+        幂等（模块已在 sys.modules 时为一次字典查找）；缺库时静默返回——``sense()`` 仍按既有
+        约定优雅回退（不在预热阶段抬升为错误）。
+        """
+
+        def _warm() -> None:
+            import torch  # noqa: F401  # 关键：让 torch 在并发之前完成初始化
+            import transformers  # noqa: F401
+
+        try:
+            await asyncio.to_thread(_warm)
+        except ImportError as exc:
+            logger.warning(
+                "AudioChannel 预热：torch/transformers 不可用（sense 时将回退）: %s", exc
+            )
+
     def _ensure_model(self) -> tuple[Any, Any] | None:
         """延迟加载并缓存模型；模型 id 走 env ``ZERO_AUDIO_MODEL_PATH``（空=未配置返回 None）。"""
         if self.model is not None and self.processor is not None:
