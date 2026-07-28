@@ -61,8 +61,17 @@ def _hrv_ch(rate: int = 256) -> HrvChannel:
 
 @pytest.fixture(autouse=True)
 def _enable_physio(monkeypatch: pytest.MonkeyPatch) -> None:
-    """所有本文件测试自动开 ZERO_PHYSIO_CHANNEL_ENABLED。"""
+    """所有本文件测试自动开 ZERO_PHYSIO_CHANNEL_ENABLED，并把 EDA 度量钉到 **v1**。
+
+    背景：蓝图任务 8 已把 `EdaChannel` 默认度量翻为 v2（`scl_baseline_delta_v2`）。
+    本文件的 EDA 用例（SCR 幅度判别性 / standardize 增益不变性 / percentile 暖机与跨被试）
+    **全部是 v1 特有行为**——v2 无 phasic 分解、无 percentile、语义完全不同。
+    故显式钉 v1；不钉会让这些断言测到一个根本不存在对应行为的实现。
+
+    v2 的真数据验证在 `evals/wesad_eda_v2_acceptance_gates.py`（对接真 EdaChannel 的验收门）。
+    """
     monkeypatch.setenv(_PHYSIO_FLAG_ENV, "true")
+    monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
 
 
 # ---------------------------------------------------------------------------

@@ -82,41 +82,57 @@ class TestSymmetricNormalize:
         assert _symmetric_normalize(1.0, 2.0) == pytest.approx(0.5)
 
 
-class TestDefaultIsV1ZeroRegression:
-    """默认必须仍是 v1——翻默认值是**独立的第二个 PR**（蓝图 §2.6）。"""
+class TestDefaultIsNowV2:
+    """⚠ **蓝图任务 8 已翻默认值**：默认从 v1 改为 v2。
 
-    def test_default_metric_is_v1(self) -> None:
-        assert EdaChannel().arousal_metric == "scr_amplitude_v1"
+    翻转依据见 `_DEFAULT_AROUSAL_METRIC` docstring（验收门全 PASS + 当前爆炸半径为零）。
+    v1 代码路径完整保留，把该常量改回 `"scr_amplitude_v1"` 即一键回滚。
+    """
 
-    def test_existing_construction_unchanged(self) -> None:
-        """既有调用点（不传新参数）构造出的实例仍走 v1，且 v2 状态为空。"""
-        channel = EdaChannel(sampling_rate=4, normalization="percentile")
+    def test_default_metric_is_v2(self) -> None:
+        assert EdaChannel().arousal_metric == "scl_baseline_delta_v2"
+
+    def test_v1_still_selectable(self) -> None:
+        """v1 未被删除（蓝图任务 9 未执行），显式指定仍可用——回滚路径存在。"""
+        channel = EdaChannel(arousal_metric="scr_amplitude_v1")
         assert channel.arousal_metric == "scr_amplitude_v1"
+
+    def test_default_construction_allocates_v2_state(self) -> None:
+        """默认构造即分配 v2 状态且为空（冷启动起点）。"""
+        channel = EdaChannel(sampling_rate=4)
+        assert channel.arousal_metric == "scl_baseline_delta_v2"
         assert len(channel.baseline_history) == 0
 
 
 class TestArousalMetricEnvResolution:
-    def test_env_selects_v2(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v2")
-        assert EdaChannel().arousal_metric == "scl_baseline_delta_v2"
+    def test_env_selects_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """env 可把默认（现为 v2）覆盖回 v1——运维层的回滚开关。"""
+        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
+        assert EdaChannel().arousal_metric == "scr_amplitude_v1"
 
     def test_explicit_argument_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v2")
-        assert EdaChannel(arousal_metric="scr_amplitude_v1").arousal_metric == "scr_amplitude_v1"
+        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
+        assert (
+            EdaChannel(arousal_metric="scl_baseline_delta_v2").arousal_metric
+            == "scl_baseline_delta_v2"
+        )
 
-    def test_illegal_env_falls_back_to_v1_with_warning(
+    def test_illegal_env_falls_back_to_default_with_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """非法 env 回退**当前默认**（现为 v2），并告警——不 raise，保优雅回退。"""
         monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v3")
         with caplog.at_level("WARNING"):
-            assert EdaChannel().arousal_metric == "scr_amplitude_v1"
+            assert EdaChannel().arousal_metric == "scl_baseline_delta_v2"
         assert "ZERO_EDA_AROUSAL_METRIC" in caplog.text
 
     def test_env_read_once_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """构造期一次性解析：构造后改 env 不得影响已有实例（有状态量不可运行中切换）。"""
+        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
         channel = EdaChannel()
-        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v2")
         assert channel.arousal_metric == "scr_amplitude_v1"
+        monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scl_baseline_delta_v2")
+        assert channel.arousal_metric == "scr_amplitude_v1"  # 不受运行中变更影响
 
 
 class TestV2ColdStart:

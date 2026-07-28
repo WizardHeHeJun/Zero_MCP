@@ -76,6 +76,22 @@ _PERCENTILE_EPS: float = 1e-6
 # ── v2（scl_baseline_delta）常量：均由 WESAD 真被试 P0–P3 探针选定 ─────────────
 # 依据 notes/2026-07-28-eda-v2-probe-p0-p2-results.md §10——四判据全面胜过「裸 SCL 无修正」对照臂：
 # 判别 10/10 vs 9/10 · 抗漂移 0.050 vs 0.324 · 持续比 +1.010 vs +0.966 · 跨被试极差 0.548 vs 1.745
+_DEFAULT_AROUSAL_METRIC: Literal["scr_amplitude_v1", "scl_baseline_delta_v2"] = (
+    "scl_baseline_delta_v2"
+)
+"""EDA 唤醒度量的默认版本——**蓝图任务 8「只翻一行默认值」的那一行**。
+
+翻转依据（`notes/2026-07-28-eda-v2-probe-p0-p2-results.md` §11，对接真 EdaChannel 的验收门）：
+P1' 判别 10/10 vs 对照臂 9/10 · G-Drift 0.042（阈值 0.5）· G-Sustained +1.010（无欠检测）·
+G1' 跨采样率极差 0.0002（v1 为 1.6041）· G4' 胸带腕带各 5/5 · G0 零回归既有测试不改即过。
+
+翻转时机依据（蓝图 §2.6-4）：「默认值翻转应**先于**或至少同步于点燃门放开对 physio 的消费，
+不要等点燃门开了才临时决定用哪个版本（两个变量一起变会让问题定位困难）」。
+当前 physio 先验在 Zero 点燃门下**恒不可点燃**，翻转的爆炸半径为零——这是最安全的窗口。
+
+⚠ 一键回滚：把本常量改回 `"scr_amplitude_v1"` 即可，v1 代码路径完整保留（蓝图任务 9 未执行）。
+"""
+
 _SCL_BASELINE_HORIZON_SECONDS: float = 1800.0
 """窗间基线回溯时长（秒）。30 分钟——须**舒适超过典型唤醒事件时长**。
 
@@ -324,16 +340,17 @@ class EdaChannel:
         """解析 ``ZERO_EDA_AROUSAL_METRIC``；非法值告警后回退 v1（保优雅回退，不 raise）。"""
         raw = os.getenv("ZERO_EDA_AROUSAL_METRIC")
         if raw is None:
-            return "scr_amplitude_v1"
+            return _DEFAULT_AROUSAL_METRIC
         value = raw.strip()
         if value in ("scr_amplitude_v1", "scl_baseline_delta_v2"):
             return value  # type: ignore[return-value]
         logger.warning(
             "ZERO_EDA_AROUSAL_METRIC=%r 非法（合法值：scr_amplitude_v1 / scl_baseline_delta_v2），"
-            "回退 scr_amplitude_v1",
+            "回退 %s",
             raw,
+            _DEFAULT_AROUSAL_METRIC,
         )
-        return "scr_amplitude_v1"
+        return _DEFAULT_AROUSAL_METRIC
 
     def reset(self) -> None:
         """清空滚动历史（**被试切换时调用方必须调用**）——v1 幅度历史与 v2 基线历史**都清**。

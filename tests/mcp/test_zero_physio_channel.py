@@ -34,6 +34,21 @@ from src.mcp.zero.channels.physio_channel import EdaChannel, HrvChannel
 from src.mcp.zero.external_priors import MIN_PRECISION, is_physio_stream
 from src.mcp.zero.perception import PerceptionChannel, PerceptionHub
 
+
+@pytest.fixture(autouse=True)
+def _pin_v1_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件测的是 **v1（scr_amplitude）**，显式把度量钉到 v1。
+
+    背景：蓝图任务 8 已把 `EdaChannel` 的默认度量翻为 v2（`scl_baseline_delta_v2`）。
+    本文件 50 处 `EdaChannel(...)` 构造均不传 `arousal_metric`，若不钉住会拿到 v2、
+    使这些 v1 行为断言失去意义。用 env 钉（构造期解析，显式入参 > env > 默认）——
+    一处生效、50 个构造点零改动，且语义诚实：**这个文件的被测对象就是 v1**。
+
+    v2 的对应测试在 `tests/mcp/test_zero_physio_eda_v2.py`。
+    """
+    monkeypatch.setenv("ZERO_EDA_AROUSAL_METRIC", "scr_amplitude_v1")
+
+
 # ---------------------------------------------------------------------------
 # 辅助：构造 mock neurokit2 模块
 # ---------------------------------------------------------------------------
