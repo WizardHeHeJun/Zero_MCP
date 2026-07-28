@@ -764,3 +764,133 @@ class TestCanonicalPhysiologyPlaceholderCrosscheck:
         assert by_key[(0.4, 0.5)]["temperature_c"] == pytest.approx(
             by_key[(-0.4, 0.5)]["temperature_c"]
         ), "temp 无 valence：非饱和同 |a| 不同 valence 应同温"
+
+
+# ---------------------------------------------------------------------------
+# TD/情境键跨仓系数 pin（防「Zero 单方调系数 → 本仓 resume E2E 红灯但归因不明」）
+#
+# `test_zero_client_e2e.py::TestZeroClientResumeAcrossRestart` 的判别观测量（重复强刺激下
+# valence_arousal 随会话历史单调漂移 Δ≈8.2e-3）由 Zero `ValueAgent` 的 TD 在线学习驱动：
+# 情境键恒 "mcp-step" → 同一 V(s) 跨轮累积 → `td_update` 以 lr 缩放每步 ΔV=lr·δ。
+# 阈值 `_RESUME_STATE_MARGIN=3e-3` 的依据（notes/2026-07-24-zero-link-resume-e2e-probe.md）
+# 因此**耦合这几个 Zero 侧常量**。Zero 2026-07-25 回执已把 lr / 情境键列入「必 ping」，但口头
+# 约定不可执行——此处把它变成可拦截的红，且失败文案直接给出复原路径。
+#
+# 正则直读 Zero 源码（不 import，避 torch/FastMCP 重依赖），D:\Zero 不在位 → skip。
+# 快照日期 2026-07-25 · Zero HEAD=aad6762。
+# ---------------------------------------------------------------------------
+
+_ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
+_ZERO_VALUE_PY = _ZERO_SRC / "agents" / "value.py"
+_ZERO_MAPPING_PY = _ZERO_SRC / "mcp_server" / "mapping.py"
+
+# 快照值（2026-07-25 现场核验）
+_PINNED_TD_LR = 0.2  # affect_math.py:138 —— 直接缩放 ΔV=lr·δ；闭式复算红线 lr≲0.057 转红
+_PINNED_TD_NEXT_VALUE = 0.0  # affect_math.py:139 —— 恒 0 使 gamma 项消失（gamma 对本仓是死系数）
+_PINNED_MCP_STIMULUS_KEY = "mcp-step"  # mapping.py:27 —— 情境键，跨轮同键才累积 V(s)
+
+# `def td_update(...)` 的形参默认值（形参各占一行，容忍空白/尾随逗号）
+_TD_KWARG_RE_TEMPLATE = r"^\s*{name}\s*:\s*float\s*=\s*([-\d.eE+]+)\s*,?\s*$"
+# `stimulus_from_payload(..., name: str = "mcp-step", ...)`
+_STIM_NAME_RE = re.compile(r"""^\s*name\s*:\s*str\s*=\s*["']([^"']+)["']""", re.MULTILINE)
+# `td_update(` 调用实参（当前调用无嵌套括号；有嵌套则匹配失败 → skip 而非误判）
+_TD_CALL_RE = re.compile(r"td_update\(([^()]*)\)")
+
+
+def _td_update_default(source: str, name: str) -> str | None:
+    """从 `def td_update(` 起至函数体前的签名块里取形参 `name` 的默认值字面量。"""
+    start = source.find("def td_update(")
+    if start == -1:
+        return None
+    end = source.find(")", start)
+    if end == -1:
+        return None
+    signature = source[start:end]
+    match = re.search(_TD_KWARG_RE_TEMPLATE.format(name=re.escape(name)), signature, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+@pytest.mark.zerorepo
+class TestTdCoefficientCrosscheck:
+    """跨仓 pin Zero 的 TD 系数与 MCP 情境键——它们是本仓 resume 判别阈值的隐式前提。
+
+    ⚠ 本组断言**不是**在规定 Zero 该用什么系数（那是 Zero 的自由）；而是让「Zero 改了系数」
+    这件事对本仓**立即可见且归因明确**，避免 resume E2E 以「sqlite/resume 失效」的错误面貌报红。
+    红了的正确处理是：复跑探针重标阈值 + 同步两仓 ping 清单，**不是**放宽断言。
+    """
+
+    def test_td_update_defaults_pinned(self) -> None:
+        """Zero `td_update` 的 `lr` / `next_value` 默认值未漂移。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过 TD 系数 pin")
+        if not _ZERO_AFFECT_MATH_PY.is_file():
+            pytest.skip(f"Zero affect_math.py 不存在（{_ZERO_AFFECT_MATH_PY}）")
+
+        source = _ZERO_AFFECT_MATH_PY.read_text(encoding="utf-8")
+        lr_literal = _td_update_default(source, "lr")
+        next_value_literal = _td_update_default(source, "next_value")
+        if lr_literal is None or next_value_literal is None:
+            pytest.skip(
+                f"未能从 Zero affect_math.py 解析 td_update 的 lr/next_value 默认值"
+                f"（签名可能已重构：lr={lr_literal!r} next_value={next_value_literal!r}）"
+            )
+
+        assert float(lr_literal) == pytest.approx(_PINNED_TD_LR), (
+            f"Zero TD 学习率漂移：td_update(lr={lr_literal}) ≠ 快照 {_PINNED_TD_LR}"
+            f"（2026-07-25 @ aad6762）。本仓 resume E2E 的 `_RESUME_STATE_MARGIN=3e-3` 依据实测"
+            f"漂移 8.2e-3，闭式红线为 lr≲0.057 → 请复跑 "
+            f"notes/2026-07-24-zero-link-resume-e2e-probe.md §4 的探针重标阈值/_RESUME_PRE_STEPS，"
+            f"并更新跨仓系数快照。"
+        )
+        assert float(next_value_literal) == pytest.approx(_PINNED_TD_NEXT_VALUE), (
+            f"Zero td_update 的 next_value 默认值变为 {next_value_literal}（快照 "
+            f"{_PINNED_TD_NEXT_VALUE}）——**gamma 由此从死系数变活**（原 delta=reward+gamma·0−V(s)，"
+            f"gamma 项恒消）。这正是 2026-07-25 回执里约定要 ping 的「引入真 next_value / 多步 "
+            f"bootstrap」事件：本仓 resume 观测量的漂移量会随之改变，须复跑探针。"
+        )
+
+    def test_value_agent_does_not_override_td_defaults(self) -> None:
+        """`ValueAgent` 仍以三个位置参数调 `td_update`（不覆写 lr/gamma/next_value）。
+
+        上一条 pin 的是**默认值**；只有调用方不覆写，默认值才等于运行时实际值。
+        """
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过 TD 调用点 pin")
+        if not _ZERO_VALUE_PY.is_file():
+            pytest.skip(f"Zero value.py 不存在（{_ZERO_VALUE_PY}）")
+
+        source = _ZERO_VALUE_PY.read_text(encoding="utf-8")
+        match = _TD_CALL_RE.search(source)
+        if match is None:
+            pytest.skip(
+                f"未在 Zero value.py 找到无嵌套括号的 `td_update(...)` 调用"
+                f"（{_ZERO_VALUE_PY}）——调用形态可能已重构，跳过而非误判"
+            )
+
+        call_args = match.group(1)
+        overridden = [kw for kw in ("lr=", "gamma=", "next_value=") if kw in call_args]
+        assert not overridden, (
+            f"Zero ValueAgent 现在覆写了 TD 参数 {overridden}（调用实参：{call_args!r}）——"
+            f"本仓据 `td_update` **默认值**推算的 resume 漂移量不再成立，须复跑探针重标阈值。"
+        )
+
+    def test_mcp_stimulus_key_pinned(self) -> None:
+        """MCP 路径的情境键仍恒为 "mcp-step"（跨轮同键才累积 V(s)）。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过情境键 pin")
+        if not _ZERO_MAPPING_PY.is_file():
+            pytest.skip(f"Zero mcp_server/mapping.py 不存在（{_ZERO_MAPPING_PY}）")
+
+        source = _ZERO_MAPPING_PY.read_text(encoding="utf-8")
+        match = _STIM_NAME_RE.search(source)
+        if match is None:
+            pytest.skip(
+                f'未在 Zero mapping.py 找到 `name: str = "..."` 默认情境键'
+                f"（{_ZERO_MAPPING_PY}）——签名可能已重构，跳过而非误判"
+            )
+
+        assert match.group(1) == _PINNED_MCP_STIMULUS_KEY, (
+            f"MCP 情境键漂移：Zero mapping.py={match.group(1)!r}，快照="
+            f"{_PINNED_MCP_STIMULUS_KEY!r}。若每步键不同，`value_table` 不再跨轮累积同一 V(s)"
+            f"→ 本仓 resume 观测量漂移归零 → `state-matters` 守卫会先行 FAIL（非 flaky，是真失效）"
+        )

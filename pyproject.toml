@@ -112,6 +112,9 @@ follow_imports = "skip"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# -ra：摘要里打印 skip/xfail 原因。zerorepo 跨仓用例缺前置即 skip，默认输出不显示原因时
+# 「覆盖静默归零」不可见（见 tests/mcp/conftest.py 的 ZERO_LINK_E2E_STRICT 守卫）。
+addopts = ["-ra"]
 markers = [
     "realenv: 需要真实桌面环境（实机手动运行，CI 跳过）",
     "zerorepo: 需 D:\\Zero 源码在位的跨仓契约回归（缺失即 skip）",
