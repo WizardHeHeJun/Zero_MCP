@@ -210,7 +210,19 @@ class TestPerceptionToZeroE2E:
         # 真先验构造 external_priors 载荷：M3 精度上界 / M6 流数上界 必须通过（真值合法）
         payload = build_external_priors_override(priors)
         assert payload["external_priors"], "external_priors 载荷不应为空"
-        assert len(payload["external_priors"]) == len(priors)
+        # EDA+HRV 同在时被 CI 预合并为单条 physio（Zero 议会 2026-07-28 终裁·MCP 侧执行项）
+        # → 载荷流数比感知流数少 1；仅其一在场则不合并、数目相等。
+        stream_names = [name for name, _mu, _prec in payload["external_priors"]]
+        merged_happened = "eda/sc" in modalities and "hrv/rmssd" in modalities
+        assert len(payload["external_priors"]) == len(priors) - (1 if merged_happened else 0), (
+            f"载荷流数与预合并语义不符：感知 {len(priors)} 条、载荷 {stream_names}、"
+            f"EDA+HRV 同在={merged_happened}"
+        )
+        if merged_happened:
+            assert "physio" in stream_names, f"预合并后应出现单条 physio 流，实际 {stream_names}"
+            assert not {"eda/sc", "hrv/rmssd"} & set(stream_names), (
+                f"预合并后不应再有独立 eda/hrv 流（会使 Σπ 虚增 2 倍），实际 {stream_names}"
+            )
 
         # --- 经 client 注入 D:\Zero 真 server，验证内核消费真先验并出 expression ---
         _set_stdio_env(monkeypatch)
