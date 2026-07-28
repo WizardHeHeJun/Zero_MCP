@@ -20,7 +20,12 @@ from typing import Any
 
 import pytest
 
-from src.mcp.zero.external_priors import ModalityKind, recommended_precision
+from src.mcp.zero.external_priors import (
+    ModalityKind,
+    ModalityPrior,
+    merge_physio_priors,
+    recommended_precision,
+)
 
 # D:\Zero 源码根路径
 _ZERO_ROOT = Path("D:/Zero")
@@ -785,9 +790,28 @@ class TestPhysiologyDecoderOnlineConstantsPin:
 #   physio Π̄=0.0905 → 需 |μ|≥1.9890 > √2  **不可达**（实测极限 μ=(-1,1) 仍 |Δ|=0.0）
 # → physio 先验对 Zero 内核**恒无影响**（M2 强制 Πv=MIN_PRECISION 是主因）。
 #
-# 本类不是「缺陷断言」而是**契约级事实的特征化**：Zero 调阈值/精度公式、或本仓调推荐精度，
-# 本类即红 → 触发跨仓协调（这正是 Zero 07-28「必 ping」约定想要的可执行形式）。
-# 同时把 Zero 必 ping 清单里尚无自动守卫的三项（σ 标度 / precision α·β / 点燃门常量）一并 pin。
+# ⚠ physio 有**两档口径**，本类两档都 pin（此前只 pin 了模态级，而线上发的是合并后那档）：
+#   模态级 `recommended_precision(PHYSIO)` = (MIN, 0.18) → Π̄=0.0905、门槛 1.9890；
+#   **线上 wire** = EDA/HRV 经 ω=0.5 CI 预合并（`merge_physio` **默认开**）后的单条 physio 流，
+#   Πa=0.5·0.15+0.5·0.20=0.175 → Π̄=0.0880、门槛 2.0455（更不可达，方向不变）。
+#   即改 `PHYSIO_SUBSOURCE_PRECISION_A` 才是改线上载荷，改 `EXTERNAL_PHYSIO_PRECISION_A` 在
+#   EDA+HRV 同在时是**死旋钮**。
+#
+# 本类不是「缺陷断言」而是**契约级事实的特征化**。同时把 Zero 必 ping 清单里尚无自动守卫的
+# 三项（σ 标度 / precision α·β / 点燃门常量）一并 pin。
+#
+# ⚠ **本类全绿 ≠ Zero 认可现判据**。Zero 科学家议会 2026-07-28 终裁（其
+# `notes/2026-07-28-ignition-gate-external-priors-council.md` §六 Q1 + `PRP/外部多模态先验流注入口/
+# design.md` §五附）已判定 `hypot(μ)·mean(Π)` 是**范畴错误**（同一数字既当齐次相对权重又当非齐次
+# 绝对判据），修法=按轴加权马氏距离 `D=sqrt(Πv·μv²+Πa·μa²)` + `θ'=0.28`，须走完整 PRP、近期不落地。
+# 绿只表示**旧判据尚未被替换**。
+#
+# ⚠ **本类探测得到什么、探测不到什么**（前一版注释在此处写了兑现不了的承诺，已订正）：
+#   探测得到：常量**值**漂移（`_ZERO_GATE_CONSTANTS` 逐值 pin）、本仓推荐精度/子源可靠度改动。
+#   探测**不到**：判据**公式**被替换。因为 `_mean_precision` 是旧式的**手抄镜像**，从不读 Zero
+#   `stream_salience` 的函数体；而终裁明令新公式以 **default-off 新增** selector + **新** θ' 常量
+#   落地、`SALIENCE_THRESHOLD=0.18` 与旧式**原样保留**（对标 fuse_independence_correct 先例）
+#   → Zero PRP 落地当天本类**全绿通过**。届时须按新公式重标，而非把绿当作「无事发生」。
 # ---------------------------------------------------------------------------
 
 _ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
@@ -908,6 +932,52 @@ class TestIgnitionGateReachabilityCrosscheck:
             f"physio 可达性变了：推荐精度 {physio_prec} 下最大 salience={max_salience:.4f} "
             f"已 ≥ 阈值 {threshold}——physio 先验从「恒被丢弃」变为可点燃，"
             "跨仓消费语义改变，须与 Zero 确认（本仓 07-28 实测原为不可达）。"
+        )
+
+    def test_merged_physio_wire_is_unreachable_under_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """**特征化·线上口径**：EDA/HRV 经默认 ω=0.5 预合并后真正发出的 physio 流仍不可达。
+
+        与上一例的区别：上例盯模态级 `recommended_precision(PHYSIO)`（Πa=0.18），
+        但 `merge_physio` **默认开**，线上 wire 是合并后的单条流（Πa=0.175）。
+        改 `PHYSIO_SUBSOURCE_PRECISION_A` 才会改线上载荷，而上一例对它完全不敏感——
+        少了本例，抬子源可靠度可让生产 physio 真变可点燃而两组守卫全绿。
+
+        这里跑**真的** `merge_physio_priors`（非手抄推导），故合并公式本身改动亦会被本例接住。
+        """
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        threshold = float(match.group(1))
+
+        monkeypatch.delenv("ZERO_PHYSIO_MERGE_OMEGA", raising=False)
+        for key in ("EXTERNAL_PHYSIO_PRECISION_V", "EXTERNAL_PHYSIO_PRECISION_A"):
+            monkeypatch.delenv(key, raising=False)
+
+        physio_prec = recommended_precision(ModalityKind.PHYSIO)
+        # μ 取合法域顶格（|μa|=1），本例只关心精度项决定的可达上界
+        merged = merge_physio_priors(
+            [
+                ModalityPrior(modality="eda/sc", mu=(0.0, 1.0), precision=physio_prec),
+                ModalityPrior(modality="hrv/rmssd", mu=(0.0, 1.0), precision=physio_prec),
+            ]
+        )
+        assert len(merged) == 1, f"预合并未产出单条流：{[p.modality for p in merged]}"
+
+        wire_prec = merged[0].precision
+        max_salience = _MU_MAX_NORM * _mean_precision(wire_prec)
+        onset = threshold / _mean_precision(wire_prec)
+
+        assert wire_prec[1] == pytest.approx(0.175, abs=1e-9), (
+            f"线上 physio 流的 Πa 漂移为 {wire_prec[1]}（期望 0.175=0.5·0.15+0.5·0.20）——"
+            "子源可靠度分层或 ω 档位被改动，须与 Zero 议会裁定核对（ω=0.5 为终裁值，勿换档）。"
+        )
+        assert max_salience < threshold, (
+            f"**线上** physio 可达性变了：合并后 Π={wire_prec} 下最大 salience="
+            f"{max_salience:.4f} 已 ≥ 阈值 {threshold}（门槛 |μ|≥{onset:.4f}）——"
+            "实际发给 Zero 的生理先验从「恒被丢弃」变为可点燃，须跨仓知会。"
         )
 
     def test_face_audio_ignition_thresholds_pinned(self, monkeypatch: pytest.MonkeyPatch) -> None:
