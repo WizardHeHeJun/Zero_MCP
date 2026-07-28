@@ -33,6 +33,7 @@ from src.agents.models.zero_affect import (  # noqa: E402
     TEXT_LABELS,
     AffectStimulus,
     ExpressionBundle,
+    ModalityPrior,
 )
 from src.mcp.zero.channels.audio_channel import AudioChannel  # noqa: E402
 from src.mcp.zero.channels.physio_channel import EdaChannel, HrvChannel  # noqa: E402
@@ -209,7 +210,19 @@ class TestPerceptionToZeroE2E:
         # 真先验构造 external_priors 载荷：M3 精度上界 / M6 流数上界 必须通过（真值合法）
         payload = build_external_priors_override(priors)
         assert payload["external_priors"], "external_priors 载荷不应为空"
-        assert len(payload["external_priors"]) == len(priors)
+        # EDA+HRV 同在时被 CI 预合并为单条 physio（Zero 议会 2026-07-28 终裁·MCP 侧执行项）
+        # → 载荷流数比感知流数少 1；仅其一在场则不合并、数目相等。
+        stream_names = [name for name, _mu, _prec in payload["external_priors"]]
+        merged_happened = "eda/sc" in modalities and "hrv/rmssd" in modalities
+        assert len(payload["external_priors"]) == len(priors) - (1 if merged_happened else 0), (
+            f"载荷流数与预合并语义不符：感知 {len(priors)} 条、载荷 {stream_names}、"
+            f"EDA+HRV 同在={merged_happened}"
+        )
+        if merged_happened:
+            assert "physio" in stream_names, f"预合并后应出现单条 physio 流，实际 {stream_names}"
+            assert not {"eda/sc", "hrv/rmssd"} & set(stream_names), (
+                f"预合并后不应再有独立 eda/hrv 流（会使 Σπ 虚增 2 倍），实际 {stream_names}"
+            )
 
         # --- 经 client 注入 D:\Zero 真 server，验证内核消费真先验并出 expression ---
         _set_stdio_env(monkeypatch)
@@ -238,3 +251,72 @@ class TestPerceptionToZeroE2E:
             await client.close_session(sid)
         finally:
             await client.__aexit__(None, None, None)
+
+    async def test_ignition_gate_admits_suprathreshold_drops_recommended(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """判别性守卫：注入通路确实有效 **且** 推荐精度的 physio 先验当前被硬门丢弃。
+
+        缺口背景：本文件上一个 E2E 只验「带先验能跑通、出合法 bundle」——**先验完全 no-op
+        时它同样绿**。本例用 A/B/C 三方对照补上判别力：
+          A 无先验  vs B physio 推荐精度先验 → **逐位相同**（salience ≤ 0.0905·√2 < 0.18，
+            M2 强制 Πv=MIN_PRECISION 使其恒不可点燃 —— 2026-07-28 实测）
+          A 无先验  vs C 超阈先验 Π=(0.8,0.8) → **必不同**（证明注入通路本身有效，
+            排除「B 相同只是因为压根没接上」这一竞争解释）
+        即：B 锁定当前跨仓事实，C 保证 B 的「相同」有意义。Zero 调阈值/σ 公式或本仓抬
+        EXTERNAL_PHYSIO_PRECISION_A 使 B 变为可点燃时本例即红 —— 正是需跨仓知会的时刻。
+
+        读出用 affect_readout="map"：Zero 默认 "sample" 且 rng_seed 默认 None，采样噪声
+        （实测区间 ~[0.076, 0.5]）远大于先验效应，会淹没判别（Zero 07-28 回执 C 条）。
+        """
+        _set_stdio_env(monkeypatch)
+        stim = AffectStimulus(valence=0.2, arousal=0.3)
+        config: dict[str, Any] = {"affect_readout": "map"}
+        # physio 推荐精度（Zero M2 会把 Πv 覆写为 MIN_PRECISION，此处即按最终形状给）
+        physio_prior = [ModalityPrior(modality="eda/sc", mu=(0.0, 0.9), precision=(1e-3, 0.18))]
+        # 超阈对照：mean(Π)=0.8、|μ|=hypot(0.9,0.9)≈1.27 → salience≈1.02 ≫ 0.18
+        supra_prior = [ModalityPrior(modality="ctrl/supra", mu=(0.9, 0.9), precision=(0.8, 0.8))]
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server（是否在 affective-expression 环境？）：{exc}")
+        try:
+
+            async def _va(priors: list[ModalityPrior] | None) -> tuple[float, float]:
+                """新开会话跑一步，返回 valence_arousal（新会话=零历史，隔离跨轮累积）。"""
+                sid = await client.open_session(config=config)
+                bundle = (
+                    await client.step(sid, stim, priors=priors)
+                    if priors
+                    else await client.step(sid, stim)
+                )
+                await client.close_session(sid)
+                return (bundle.valence_arousal[0], bundle.valence_arousal[1])
+
+            base = await _va(None)
+            with_physio = await _va(physio_prior)
+            with_supra = await _va(supra_prior)
+        finally:
+            await client.__aexit__(None, None, None)
+
+        d_physio = max(abs(base[0] - with_physio[0]), abs(base[1] - with_physio[1]))
+        d_supra = max(abs(base[0] - with_supra[0]), abs(base[1] - with_supra[1]))
+        print(
+            f"\n[点燃门 E2E] 无先验={base} physio={with_physio} 超阈={with_supra}"
+            f"\n  |Δ physio|={d_physio:.3e}  |Δ 超阈|={d_supra:.3e}"
+        )
+
+        # C：注入通路有效（若此断言红 = 先验根本没送达，B 的「相同」就失去意义）
+        assert d_supra > 0.0, (
+            "超阈先验未改变内核输出——external_priors 注入通路可能失效"
+            "（此时下一条 physio 断言的「无差异」不可解读为门控效应）"
+        )
+        # B：锁定当前跨仓事实——推荐精度 physio 先验恒不可点燃，输出逐位不变
+        assert d_physio == 0.0, (
+            f"physio 推荐精度先验现在改变了内核输出（|Δ|={d_physio:.3e}，原为严格 0）——"
+            "说明 Zero 的 SALIENCE_THRESHOLD/σ 公式或本仓 EXTERNAL_PHYSIO_PRECISION_A 已变，"
+            "physio 通路从「装饰品」变为真实参与融合。这是**契约级语义变更**，须跨仓确认后"
+            "再更新本断言（勿直接放宽）。"
+        )

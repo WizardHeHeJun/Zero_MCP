@@ -299,11 +299,206 @@ def build_recommended_prior(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# EDA/HRV 预合并（Zero 科学家议会 2026-07-28 终裁 · MCP 侧执行项）
+# ---------------------------------------------------------------------------
+
+PHYSIO_MERGE_OMEGA_DEFAULT: float = 0.5
+"""EDA/HRV 协方差交叉（CI）预合并的固定权重 ω —— **唯一不重复计可靠度的取值**。
+
+背景：1 维 CI 严格最优会退化到 ω*∈{0,1}（完全弃用一方——二者都只测同一标量 arousal、
+天然对齐，落入退化角），不实用；故采次优保守固定权重（Niehsen 2002 快速 CI）。
+
+**为何必须是 0.5**（Zero 议会 2026-07-28 ω 档位终裁，本仓现场复核）：本仓约定 ω 乘在
+``Π_eda`` 上，HRV 在合并均值里的实际权重是
+
+    w_hrv(ω) = (1-ω)·Π_hrv / [ω·Π_eda + (1-ω)·Π_hrv]
+
+ω=0.5 时分子分母同除 0.5，**精确退化**为 ``Π_hrv/(Π_eda+Π_hrv)``——这是对**任意**
+(Π_eda, Π_hrv) 都成立的恒等式（现场随机核验 1e4 组，最大偏差 0.0），非本组数值的巧合。
+即 ω=0.5 时 HRV **已自动拿到「它该得的」可靠度权重**（本组数值下 0.5714）；若再把 ω 设成
+可靠度比例，等于**二次施加**可靠度。
+
+更干净的判据（现场复核）：不预合并、双流直接进 Zero ``fuse_terms`` 得 μ=0.845714/Σπ=0.35；
+ω=0.5 预合并得 **μ 完全不变（Δ=0.0）、Π 精确减半（比值 2.000000）**——只调「保守度」这一个
+维度。任何 ω≠0.5 都会**同时**扰动 μ（实测 Δμ≈1e-2）与 Π，把本该正交的两个自由度耦合起来。
+
+⚠ **勿换档**：ω=0.571 与 ω=0.4286 是「同一个错误的两个方向」（分别在 EDA/HRV 上多算一次
+可靠度，实测把 μ 往相反方向各推 ~1e-2），Zero 议会均已弃用。
+⚠ 跨仓约定错位提醒：Zero 材料里的 ω≈0.571 是加在 **HRV** 上的权重，与本仓「ω 乘 Π_eda」
+约定相反（对应本仓 ω=0.4286）——该档本身已作废，此处记录以免日后误代入。
+
+env ``ZERO_PHYSIO_MERGE_OMEGA`` 可覆盖，**仅供实验/对照，生产不应改**。
+"""
+
+PHYSIO_SUBSOURCE_PRECISION_A: dict[str, float] = {"eda": 0.15, "hrv": 0.20}
+"""EDA / HRV 各自的唤醒度精度 Πa（可靠度分层，Zero 议会生物席，2026-07-28 采纳）。
+
+依据：EDA 仅受**交感胆碱能**支配（Critchley 2002），与 Zero 内部 survival 流共源程度最高
+→ 增量信息最少、可靠度最低（0.15）；HRV 主要由**迷走张力**驱动（Task Force 1996），走
+前额叶-迷走神经内脏整合环路（Thayer & Lane 2000），是**不同的中枢-外周环路**→ 0.20。
+
+⚠ 与 `_RECOMMENDED_PRECISION_DEFAULTS[PHYSIO]` 的 Πa=0.18 不冲突：0.18 是 §五 对
+「physio 模态整体」的推荐默认（议会明确**不动**）；此处是合并前的**子源可靠度分层**，
+ω=0.5 合并后 Π_merged=0.175 ≈ 0.18，量级自洽。
+"""
+
+PHYSIO_MERGED_MODALITY: str = "physio"
+"""预合并后单条生理流的流名。
+
+必须落在 `PHYSIO_STREAM_PREFIXES` 内以继续触发 Zero M2（Πv→MIN_PRECISION）——
+"physio" 是 Zero `_PHYSIO_PREFIXES`（affect_math.py:971）的首项，现场核验通过。
+"""
+
+_PHYSIO_MERGE_SOURCES: tuple[str, str] = ("eda", "hrv")
+
+_PHYSIO_MERGE_ARITY: int = 2
+"""本模块合并式的**推导元数**（当前 = 二元 CI）。
+
+治理不变量（Zero 议会 2026-07-28 转 CS 席治理项）：``build_external_priors_override`` 的 M6
+流数按**合并后**计数，其成立前提是「合并流背后的相关性风险已被 CI 推导吸收」。若日后新增同源
+子通道（如呼吸率 RSP）却**直接塞进现有二元公式复用 ω=0.5**，则 M6 计数为 1 的 ``physio``
+背后可能藏进 3、4 条**朴素求和**的原始证据——**M6 的保险会在 Zero 与本仓双方都感知不到的
+地方失效**。故新增源必须重走 N 元 CI 推导；本常量 + ``_assert_merge_arity_invariant()``
+使「只加源、不改推导」在运行期硬失败，而非静默降低保守度。
+"""
+
+
+def _assert_merge_arity_invariant() -> None:
+    """守卫：子源集合与可靠度权重表须与推导元数一致，否则拒绝合并。
+
+    Raises:
+        NotImplementedError: 子源数 ≠ 推导元数，或子源集合与权重表键集不一致
+            （即有人加了源却没重走 N 元推导）。
+    """
+    sources = set(_PHYSIO_MERGE_SOURCES)
+    weighted = set(PHYSIO_SUBSOURCE_PRECISION_A)
+    if len(sources) != _PHYSIO_MERGE_ARITY or sources != weighted:
+        raise NotImplementedError(
+            f"physio 预合并的推导元数为 {_PHYSIO_MERGE_ARITY}（二元 CI），但当前子源="
+            f"{sorted(sources)}、可靠度权重表={sorted(weighted)}。**新增同源子通道必须重走 "
+            "N 元 CI 推导**，不可复用二元式的 ω=0.5——否则 M6 按合并后计数=1，却掩盖 N 条"
+            "朴素求和的原始证据，Zero 与本仓均无从察觉（Zero 议会 2026-07-28 治理项）。"
+        )
+
+
+def _resolve_merge_omega(omega: float | None) -> float:
+    """解析 CI 合并权重 ω：显式值优先，否则走 env（默认 0.5）；须落 (0,1) 开区间。"""
+    if omega is None:
+        raw = os.getenv("ZERO_PHYSIO_MERGE_OMEGA")
+        omega = PHYSIO_MERGE_OMEGA_DEFAULT if raw is None else float(raw)
+    if not 0.0 < omega < 1.0:
+        raise ValueError(
+            f"physio 合并权重 ω={omega} 须落 (0,1) 开区间"
+            "（端点等于完全弃用一方，即 1 维 CI 的退化角，议会已排除）"
+        )
+    return omega
+
+
+def merge_physio_priors(
+    priors: list[ModalityPrior],
+    *,
+    omega: float | None = None,
+) -> list[ModalityPrior]:
+    """把 EDA 与 HRV 两条**相关**生理流按固定权重 CI 预合并为单条 ``physio`` 流。
+
+    **为何必须合并**（Zero 议会 2026-07-28 终裁，MCP 侧执行项）：EDA 与 HRV 高度相关
+    （同测交感唤醒）。作两条独立 streams 直接进 Zero `fuse_terms` 时朴素 `Σπ = 0.15+0.20
+    = 0.35`，**相当于把合并精度虚增 2 倍**——等于把「physio vs survival 共源」的风险
+    在「EDA vs HRV」内部重新引入一遍（Berntson 1991：交感/副交感非严格独立轴）。
+
+    **合并式**（协方差交叉信息形式，Julier & Uhlmann 1997 / Niehsen 2002 固定 ω 路线）::
+
+        Π_merged = ω·Π_eda + (1-ω)·Π_hrv
+        μ_merged = (ω·Π_eda·μ_eda + (1-ω)·Π_hrv·μ_hrv) / Π_merged
+
+    ω=0.5 且采可靠度分层 (0.15, 0.20) 时 `Π_merged = 0.175`（议会给出的确切值）。
+
+    效价维：两者均对效价盲（Kreibig 2010，Zero M2 无条件覆写 Πv=MIN_PRECISION），
+    故合并结果恒 `μ_v=0.0`、`Π_v=MIN_PRECISION`——与 M2 最终形状一致。
+
+    **精度取自可靠度分层常量而非入参先验的 Πa**：入参 Πa 通常是
+    `recommended_precision(PHYSIO)` 的模态级 0.18（不区分 eda/hrv），而合并需要子源级
+    可靠度；μ 仍全部取自真实读数。差异已在 `PHYSIO_SUBSOURCE_PRECISION_A` 说明。
+
+    Args:
+        priors: ModalityPrior 列表（通常来自 ``PerceptionHub.collect()``）。
+        omega:  CI 固定权重，None = 走 env ``ZERO_PHYSIO_MERGE_OMEGA``（默认 0.5）。
+
+    Returns:
+        新列表：EDA/HRV 被替换为单条 ``physio``（落在首个生理流原位置），其余流保持原序。
+        **不足两条**（缺 EDA 或缺 HRV）时原样返回——无相关性双计问题，无需合并。
+
+    ⚠ **勿把 Π_merged 解释为「假设 EDA/HRV 完全相关（ρ=1）」**——数值上站不住：若真设 ρ=1，
+    标准 GLS 约束权重下的最优融合是 ``max(Π_eda, Π_hrv)=0.20``（方差 5.0），而 0.175 对应
+    方差 5.714，**比「假设完全相关」下能达到的最优还保守**（现场复核）。正确表述：
+    ω=0.5 对 EDA–HRV 间**任意未知**相关系数 ρ∈[-1,1] 均给出一致的保守界
+    （Julier & Uhlmann 1997），且是使均值估计不受可靠度重复加权污染的唯一取值；
+    **不代表对 ρ 做出任何具体假设，尤其不等价于假设 ρ=1**。
+
+    Raises:
+        ValueError:          ω 不在 (0,1) 开区间。
+        NotImplementedError: 子源数与推导元数不符（见 _assert_merge_arity_invariant）。
+    """
+    # 治理不变量：新增同源子通道必须重走 N 元 CI 推导，否则 M6 的保险会静默失效
+    _assert_merge_arity_invariant()
+
+    found: dict[str, int] = {}
+    for index, prior in enumerate(priors):
+        name = prior.modality.lower()
+        for source in _PHYSIO_MERGE_SOURCES:
+            # 首条命中为准（同源多流非预期，取首条并在下方 debug 记录）
+            if source not in found and (
+                name == source or name.startswith(source + "/") or name.startswith(source + "_")
+            ):
+                found[source] = index
+
+    if len(found) < len(_PHYSIO_MERGE_SOURCES):
+        logger.debug(
+            "physio 预合并跳过：EDA/HRV 未同时在场（命中 %s），无相关性双计问题",
+            sorted(found),
+        )
+        return list(priors)
+
+    resolved_omega = _resolve_merge_omega(omega)
+    eda_index, hrv_index = found["eda"], found["hrv"]
+    weights = {
+        "eda": resolved_omega * PHYSIO_SUBSOURCE_PRECISION_A["eda"],
+        "hrv": (1.0 - resolved_omega) * PHYSIO_SUBSOURCE_PRECISION_A["hrv"],
+    }
+    pi_merged_a = weights["eda"] + weights["hrv"]
+    mu_merged_a = (
+        weights["eda"] * priors[eda_index].mu[1] + weights["hrv"] * priors[hrv_index].mu[1]
+    ) / pi_merged_a
+
+    merged = ModalityPrior(
+        modality=PHYSIO_MERGED_MODALITY,
+        mu=(0.0, mu_merged_a),
+        precision=(MIN_PRECISION, pi_merged_a),
+    )
+    logger.debug(
+        "physio 预合并：eda μa=%.4f + hrv μa=%.4f → %s μa=%.4f Πa=%.4f（ω=%.3f）",
+        priors[eda_index].mu[1],
+        priors[hrv_index].mu[1],
+        PHYSIO_MERGED_MODALITY,
+        mu_merged_a,
+        pi_merged_a,
+        resolved_omega,
+    )
+
+    keep_at, drop_at = min(eda_index, hrv_index), max(eda_index, hrv_index)
+    result = list(priors)
+    result[keep_at] = merged
+    del result[drop_at]
+    return result
+
+
 def build_external_priors_override(
     priors: list[ModalityPrior],
     *,
     max_streams: int | None = None,
     precision_cap: float | None = None,
+    merge_physio: bool = True,
 ) -> dict[str, list[ExternalPriorTuple]]:
     """将多模态先验列表构造为 Zero session.step(state_overrides=...) 的载荷。
 
@@ -332,6 +527,10 @@ def build_external_priors_override(
         priors:        ModalityPrior 列表，由 PerceptionHub.collect() 产出。
         max_streams:   M6 客户端流数上限。None = 走 env ZERO_MAX_EXTERNAL_STREAMS（默认 5）。
         precision_cap: M3 客户端精度上界。None = 走 env（默认 0.8，见 _resolve_precision_cap）。
+        merge_physio:  是否把 EDA/HRV 预合并为单条 physio 流（**默认 True**，Zero 议会
+                       2026-07-28 终裁的 MCP 侧执行项，见 merge_physio_priors）。传 False
+                       保留「两条独立生理流」的旧行为——仅供对照/回归，正常接线不应关闭
+                       （会使 Zero 侧朴素 Σπ 虚增 2 倍）。
 
     Returns:
         ``{"external_priors": [(name,(μ_v,μ_a),(Π_v,Π_a)), ...]}``
@@ -348,6 +547,14 @@ def build_external_priors_override(
     """
     resolved_max = _resolve_max_streams(max_streams)
     resolved_cap = _resolve_precision_cap(precision_cap)
+
+    # EDA/HRV 预合并（Zero 议会 2026-07-28 终裁：**默认开**）。二者高度相关，作两条独立流
+    # 注入会把合并精度虚增 2 倍（Σπ=0.35）。默认开而非默认关的理由：这不是「新增能力」而是
+    # **载荷构造的正确性修正**，且在 Zero 当前判据下 physio 流本就恒不点燃 → 今日**零可观测
+    # 回归**，待 Zero 按轴加权公式落地后自动生效正确语义。需保留旧行为传 merge_physio=False。
+    # M6 流数校验置于合并**之后**：合并减少流数，按最终注入形状计数才是 Zero 实际收到的。
+    if merge_physio:
+        priors = merge_physio_priors(priors)
 
     # M6：流数上界（默认对齐 Zero ZERO_MAX_EXTERNAL_STREAMS）
     if len(priors) > resolved_max:

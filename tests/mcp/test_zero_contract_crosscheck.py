@@ -20,6 +20,8 @@ from typing import Any
 
 import pytest
 
+from src.mcp.zero.external_priors import ModalityKind, recommended_precision
+
 # D:\Zero 源码根路径
 _ZERO_ROOT = Path("D:/Zero")
 _ZERO_SRC = _ZERO_ROOT / "src"
@@ -643,6 +645,320 @@ class TestPhysiologyDecoderContractCrosscheck:
         required = {"heart_rate_bpm", "skin_conductance"}
         missing = required - decoder_keys
         assert not missing, f"Zero decoder 未产必填字段 {sorted(missing)}（PhysiologyChannel 必填）"
+
+
+# ---------------------------------------------------------------------------
+# 在线真模型路径的**反归一化常量** pin（Zero 07-28 回执 ③(b) 补正）
+#
+# 此前我方只 pin 了**占位**路径（affect_math.py:479-481，见 TestCanonicalPlaceholder…）与真模型
+# 路径的**键名**（上一个类）——漏了真模型路径的**值级常量**。Zero 指出：设 ZERO_PHYSIOLOGY_MODEL_PATH
+# 后 composite.py:134-135 **整块覆盖** channels["physiology"]，占位式根本不执行，走的是
+# physiology_decoder.py:35-37 的**另一套常量**（temp 对 30/10 ≠ 占位的 36/3）。
+#
+# 为何这对**消费正确性**要命（W6 同类：静默标度差）：本仓 LinearPhysiologyMapper 的默认量纲
+# （skin_conductance_max_us=20.0、temperature_range=(30,40)）正是按**在线 decoder** 标定的。
+# Zero 若把 `vec[1]*20.0` 改成 `*10.0`，我方解析照样成功、mapper 照样不报错，但 level 静默错 2×
+# （与 W6 legacy sc 欠标度 20× 同族）。故此处不止 pin 常量，还断言**常量 ⇔ mapper 默认**的耦合。
+#
+# 另 wesad.py:59-62 的训练侧归一化与 decoder 反归一化是**逆变换对，必须成对同改**（Zero ③(b)）：
+# 单改一侧 → 权重与解码口径错配，输出物理量整体偏移。故一并 pin，任一侧漂移即红 → 触发 ping。
+# ---------------------------------------------------------------------------
+
+_ZERO_WESAD_PY = _ZERO_SRC / "agents" / "datasets" / "wesad.py"
+# 逐键取 return dict 的 RHS 表达式（到行尾/逗号），再从中提浮点字面量
+_PHYSIO_RHS_RE = re.compile(r'"([a-z_]+)"\s*:\s*([^,\n]+)')
+_FLOAT_LITERAL_RE = re.compile(r"\d+\.\d+")
+# 训练侧归一化（逆变换对）——锚在变量名上，结构改了则 skip、常量漂移则 fail
+_WESAD_HR_RE = re.compile(r"clamp\(\(hr\s*-\s*([\d.]+)\)\s*/\s*([\d.]+)")
+_WESAD_EDA_RE = re.compile(r"clamp\(eda_mean\s*/\s*([\d.]+)")
+_WESAD_TEMP_RE = re.compile(r"clamp\(\(temp_mean\s*-\s*([\d.]+)\)\s*/\s*([\d.]+)")
+
+# 在线 decoder 反归一化常量（Zero 07-28 现场核验：physiology_decoder.py:35-37）
+# key → (offset, span)；offset=None 表示纯标度（无偏置）
+_ONLINE_PHYSIO_CONSTANTS: dict[str, tuple[float | None, float]] = {
+    "heart_rate_bpm": (50.0, 70.0),  # 50 + vec*70 → [50,120] bpm
+    "skin_conductance": (None, 20.0),  # vec*20 → [0,20] μS
+    "temperature_c": (30.0, 10.0),  # 30 + vec*10 → [30,40] °C（≠占位 36/3）
+}
+
+
+@pytest.mark.zerorepo
+class TestPhysiologyDecoderOnlineConstantsPin:
+    """在线真模型路径的反归一化常量 pin + 与本仓 mapper 消费标度的耦合断言。
+
+    D:\\Zero / physiology_decoder.py / wesad.py 不在位或结构变更 → skip（不拖红）；
+    **常量漂移 → hard fail**（这正是要触发跨仓 ping 的信号）。
+    """
+
+    def _decoder_constants(self) -> dict[str, list[float]]:
+        """从 predict_physiology 的 return dict 逐键提浮点字面量；结构变更 → skip。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过在线常量 pin")
+        if not _ZERO_PHYSIO_DECODER_PY.is_file():
+            pytest.skip(f"Zero physiology_decoder.py 不存在（{_ZERO_PHYSIO_DECODER_PY}），跳过")
+        source = _ZERO_PHYSIO_DECODER_PY.read_text(encoding="utf-8")
+        idx = source.find("def predict_physiology")
+        if idx < 0:
+            pytest.skip("Zero physiology_decoder.py 未见 predict_physiology，跳过")
+        block = _RETURN_DICT_RE.search(source[idx:])
+        if block is None:
+            pytest.skip("predict_physiology 未见 `return {...}` 块，跳过")
+        found = {
+            key: [float(x) for x in _FLOAT_LITERAL_RE.findall(rhs)]
+            for key, rhs in _PHYSIO_RHS_RE.findall(block.group(1))
+        }
+        if not found:
+            pytest.skip("未从 return dict 提到常量，正则可能需更新，跳过")
+        return found
+
+    def test_online_decoder_constants_pinned(self) -> None:
+        """真模型反归一化常量逐值 pin（漂移即红 → 触发 Zero ping 约定）。"""
+        found = self._decoder_constants()
+        for key, (offset, span) in _ONLINE_PHYSIO_CONSTANTS.items():
+            assert key in found, (
+                f"在线 decoder 缺键 {key}（实际 {sorted(found)}）——canonical 契约漂移"
+            )
+            expected = [span] if offset is None else [offset, span]
+            assert found[key] == expected, (
+                f"在线 decoder 反归一化常量漂移：{key} 期望 {expected}、实际 {found[key]}。"
+                "这会让本仓 mapper 的物理量标度静默错配（W6 同类静默标度差）——"
+                "须与 Zero 协调（并同步 datasets/wesad.py 的逆变换对）。"
+            )
+
+    def test_online_constants_match_mapper_defaults(self) -> None:
+        """在线 decoder 量纲 ⇔ 本仓 LinearPhysiologyMapper 默认值（消费标度正确性的真断言）。
+
+        decoder sc 标度 == mapper skin_conductance_max_us；decoder temp [off, off+span]
+        == mapper temperature_range。任一侧改动而另一侧未跟 → level 静默错标度。
+        """
+        found = self._decoder_constants()
+        from src.mcp.zero.mappers.physiology import LinearPhysiologyMapper
+
+        mapper = LinearPhysiologyMapper()  # 默认值即消费标定
+        sc_span = found["skin_conductance"][0]
+        assert sc_span == mapper.skin_conductance_max_us, (
+            f"皮电标度失配：Zero decoder ×{sc_span}μS vs 本仓 mapper 默认上界 "
+            f"{mapper.skin_conductance_max_us}μS —— skin_conductance_level 会静默错标度。"
+        )
+        temp_off, temp_span = found["temperature_c"][0], found["temperature_c"][1]
+        assert (temp_off, temp_off + temp_span) == mapper.temperature_range, (
+            f"体温量程失配：Zero decoder 域 [{temp_off}, {temp_off + temp_span}] vs 本仓 mapper "
+            f"默认 temperature_range={mapper.temperature_range} —— skin_temperature_level 会错。"
+        )
+
+    def test_wesad_normalization_is_inverse_pair_of_decoder(self) -> None:
+        """训练侧 wesad 归一化 ⇔ decoder 反归一化为逆变换对（Zero ③(b)：必须成对同改）。"""
+        found = self._decoder_constants()
+        if not _ZERO_WESAD_PY.is_file():
+            pytest.skip(f"Zero wesad.py 不存在（{_ZERO_WESAD_PY}），跳过逆变换对断言")
+        src_text = _ZERO_WESAD_PY.read_text(encoding="utf-8")
+        hr_m = _WESAD_HR_RE.search(src_text)
+        eda_m = _WESAD_EDA_RE.search(src_text)
+        temp_m = _WESAD_TEMP_RE.search(src_text)
+        if not (hr_m and eda_m and temp_m):
+            pytest.skip("wesad.py 归一化结构变更（变量名/写法），正则未命中，跳过")
+
+        pairs = {
+            "heart_rate_bpm": [float(hr_m.group(1)), float(hr_m.group(2))],
+            "skin_conductance": [float(eda_m.group(1))],
+            "temperature_c": [float(temp_m.group(1)), float(temp_m.group(2))],
+        }
+        for key, train_consts in pairs.items():
+            assert train_consts == found[key], (
+                f"逆变换对断裂：{key} 训练侧 wesad 常量 {train_consts} ≠ decoder 反归一化 "
+                f"{found[key]}——单改一侧会让权重与解码口径错配，输出物理量整体偏移。"
+            )
+
+
+# ---------------------------------------------------------------------------
+# ignition 点燃门跨仓耦合：Zero 门控常量 ⊗ 本仓推荐精度的**可达性**
+#
+# Zero 07-28 回执 A 条提醒 SALIENCE_THRESHOLD 会门掉 value 流。本仓据此追查发现该门**同样**
+# 作用于 external_priors：`affect_core.py:100-108` 在 expand 后**无条件**进 ignite()，而
+# `expand_external_priors`（affect_math.py:974）只校验不改精度。默认 IGNITION_BETA=None 即硬门。
+#
+# salience(μ,Π) = hypot(μ)·mean(Π)（affect_math.py:673）——|μ| 的线性函数、门是**锐阶跃**。
+# 跨阈需 |μ| ≥ threshold/mean(Π)；而 ModalityPrior 各维 ∈[-1,1] → |μ| ≤ √2≈1.4142。
+# 本仓推荐精度的可达性（2026-07-28 真 server A/B 实测，与解析值吻合到小数点后四位）：
+#   face   Π̄=0.1600 → 需 |μ|≥1.1250 ≤ √2  **可达**（实测 μ=(-0.95,0.95) 点燃 |Δ|=1.55e-02）
+#   audio  Π̄=0.1750 → 需 |μ|≥1.0286 ≤ √2  **可达**（实测 μ=(0.9,0.9)   点燃 |Δ|=1.24e-02）
+#   physio Π̄=0.0905 → 需 |μ|≥1.9890 > √2  **不可达**（实测极限 μ=(-1,1) 仍 |Δ|=0.0）
+# → physio 先验对 Zero 内核**恒无影响**（M2 强制 Πv=MIN_PRECISION 是主因）。
+#
+# 本类不是「缺陷断言」而是**契约级事实的特征化**：Zero 调阈值/精度公式、或本仓调推荐精度，
+# 本类即红 → 触发跨仓协调（这正是 Zero 07-28「必 ping」约定想要的可执行形式）。
+# 同时把 Zero 必 ping 清单里尚无自动守卫的三项（σ 标度 / precision α·β / 点燃门常量）一并 pin。
+# ---------------------------------------------------------------------------
+
+_ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
+_NUM = r"[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?"
+
+# Zero 模块级门控/边界常量（必 ping：点燃门 + σ/精度边界）
+_ZERO_GATE_CONSTANTS: dict[str, float] = {
+    "MIN_SIGMA": 0.05,
+    "MIN_PRECISION": 1e-3,
+    "MAX_SAMPLE_SIGMA": 0.5,
+    "SURVIVAL_PRECISION": 0.4,
+    "SALIENCE_THRESHOLD": 0.18,
+    "AROUSAL_GAIN": 1.0,
+}
+
+# occ_prior σ 标度系数（affect_math.py:126-127）——Zero 07-28 ④ 订正：**这才是真旋钮**
+# （MIN_SIGMA 在 MCP 路径恒不咬合：mapping.py:53 钳 |I|≤1 → σ∈[0.10,0.35] 恒 >0.05）。
+_ZERO_SIGMA_CONF_RE = re.compile(rf"conf\s*=\s*clamp\(({_NUM})\s*\+\s*({_NUM})\s*\*\s*abs\(")
+_ZERO_SIGMA_RE = re.compile(rf"sigma\s*=\s*max\(MIN_SIGMA,\s*({_NUM})\s*\*\s*\(1\.0\s*-\s*conf\)")
+# precision() 的 α/β 默认（affect_math.py:155）——在 sigmoid **分子**，直接线性缩放判别信号
+_ZERO_ALPHA_BETA_RE = re.compile(
+    rf"def precision\([^)]*alpha:\s*float\s*=\s*({_NUM})[^)]*beta:\s*float\s*=\s*({_NUM})",
+    re.DOTALL,
+)
+# 默认硬门哨兵：IGNITION_BETA = None → ignite 走 step 分支（软门是显式非默认路径）
+_ZERO_IGNITION_BETA_RE = re.compile(r"^IGNITION_BETA\s*:[^=]*=\s*(\w+)", re.MULTILINE)
+
+_MU_MAX_NORM = 2.0**0.5  # ModalityPrior 各维 ∈[-1,1] → hypot 上界 √2
+
+
+def _mean_precision(precision: tuple[float, float]) -> float:
+    """镜像 Zero stream_salience 的精度项：mean(Π)。"""
+    return 0.5 * (precision[0] + precision[1])
+
+
+@pytest.mark.zerorepo
+class TestIgnitionGateReachabilityCrosscheck:
+    """Zero 点燃门常量 pin + 本仓推荐精度在该门下的可达性特征化。
+
+    D:\\Zero / affect_math.py 不在位或结构变更 → skip；**常量或可达性漂移 → hard fail**。
+    """
+
+    def _source(self) -> str:
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过点燃门跨仓断言")
+        if not _ZERO_AFFECT_MATH_PY.is_file():
+            pytest.skip(f"Zero affect_math.py 不存在（{_ZERO_AFFECT_MATH_PY}），跳过")
+        return _ZERO_AFFECT_MATH_PY.read_text(encoding="utf-8")
+
+    def test_gate_and_boundary_constants_pinned(self) -> None:
+        """Zero 门控/边界常量逐值 pin（必 ping：点燃门 + σ/精度边界）。"""
+        source = self._source()
+        for name, expected in _ZERO_GATE_CONSTANTS.items():
+            match = re.search(rf"^{name}\s*=\s*({_NUM})", source, re.MULTILINE)
+            if match is None:
+                pytest.skip(f"未在 Zero affect_math.py 找到常量 {name}，结构可能变更，跳过")
+            actual = float(match.group(1))
+            assert actual == expected, (
+                f"Zero 门控常量漂移：{name} 期望 {expected}、实际 {actual}。"
+                "本仓判别裕度/先验可达性依赖此值——须跨仓协调（Zero 07-28 必 ping 约定）。"
+            )
+
+    def test_occ_prior_sigma_coefficients_pinned(self) -> None:
+        """occ_prior σ 标度系数 pin（Zero ④ 订正：真旋钮，非 MIN_SIGMA）。"""
+        source = self._source()
+        conf_m = _ZERO_SIGMA_CONF_RE.search(source)
+        sigma_m = _ZERO_SIGMA_RE.search(source)
+        if conf_m is None or sigma_m is None:
+            pytest.skip("Zero occ_prior σ 公式结构变更，正则未命中，跳过")
+        conf_base, conf_gain = float(conf_m.group(1)), float(conf_m.group(2))
+        sigma_scale = float(sigma_m.group(1))
+        assert (conf_base, conf_gain, sigma_scale) == (0.3, 0.5, 0.5), (
+            f"occ_prior σ 标度漂移：conf={conf_base}+{conf_gain}·|I|、σ={sigma_scale}·(1−conf)，"
+            "期望 (0.3, 0.5, 0.5)。σ 减半 ⇒ π_total×4 ⇒ 判别裕度≈1/4（Zero 07-28 ④）。"
+        )
+
+    def test_precision_alpha_beta_defaults_pinned(self) -> None:
+        """precision() 的 α=1.0 / β=0.5 默认 pin（在 sigmoid 分子，直接缩放判别信号）。"""
+        source = self._source()
+        match = _ZERO_ALPHA_BETA_RE.search(source)
+        if match is None:
+            pytest.skip("Zero precision() 签名结构变更，正则未命中，跳过")
+        alpha, beta = float(match.group(1)), float(match.group(2))
+        assert (alpha, beta) == (1.0, 0.5), (
+            f"precision() α/β 漂移：期望 (1.0, 0.5)、实际 ({alpha}, {beta})——"
+            "π_da=sigmoid(α|δ|+βV) 的分子项，改动直接线性缩放我方判别信号。"
+        )
+
+    def test_ignition_default_is_hard_gate(self) -> None:
+        """IGNITION_BETA 默认 None（硬 step 门）——软门是显式非默认路径。"""
+        source = self._source()
+        match = _ZERO_IGNITION_BETA_RE.search(source)
+        if match is None:
+            pytest.skip("未找到 IGNITION_BETA 声明，结构可能变更，跳过")
+        assert match.group(1) == "None", (
+            f"IGNITION_BETA 默认漂移为 {match.group(1)!r}（期望 None=硬 step 门）。"
+            "转软门后所有流均参与融合、亚阈先验不再被丢——本仓可达性结论须整体重评。"
+        )
+
+    def test_physio_prior_is_unreachable_under_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**特征化**：physio 推荐精度下最大可达 salience < 阈值 → 对内核恒无影响。
+
+        这是当前跨仓事实（非期望）。Zero 降阈值 / 本仓抬 EXTERNAL_PHYSIO_PRECISION_A
+        使其可达时本例即红——正是需要跨仓知会的时刻。
+        """
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        threshold = float(match.group(1))
+
+        for key in ("EXTERNAL_PHYSIO_PRECISION_V", "EXTERNAL_PHYSIO_PRECISION_A"):
+            monkeypatch.delenv(key, raising=False)
+        physio_prec = recommended_precision(ModalityKind.PHYSIO)
+        max_salience = _MU_MAX_NORM * _mean_precision(physio_prec)
+
+        assert max_salience < threshold, (
+            f"physio 可达性变了：推荐精度 {physio_prec} 下最大 salience={max_salience:.4f} "
+            f"已 ≥ 阈值 {threshold}——physio 先验从「恒被丢弃」变为可点燃，"
+            "跨仓消费语义改变，须与 Zero 确认（本仓 07-28 实测原为不可达）。"
+        )
+
+    def test_face_audio_ignition_thresholds_pinned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """face/audio 跨阈 |μ| 门槛在合法域内且逐值 pin（锐阶跃边界，实测吻合）。"""
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        threshold = float(match.group(1))
+
+        for key in (
+            "EXTERNAL_FACE_PRECISION_V",
+            "EXTERNAL_FACE_PRECISION_A",
+            "EXTERNAL_AUDIO_PRECISION_V",
+            "EXTERNAL_AUDIO_PRECISION_A",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        expected_onsets = {ModalityKind.FACE: 1.1250, ModalityKind.AUDIO: 1.0286}
+        for kind, expected in expected_onsets.items():
+            onset = threshold / _mean_precision(recommended_precision(kind))
+            assert onset == pytest.approx(expected, abs=1e-4), (
+                f"{kind} 跨阈门槛漂移：期望 |μ|≥{expected}、实际 {onset:.4f}"
+            )
+            assert onset <= _MU_MAX_NORM, (
+                f"{kind} 跨阈门槛 {onset:.4f} 已超出 μ 合法域 √2={_MU_MAX_NORM:.4f}——"
+                "该模态先验变为恒不可点燃（与 physio 同命），须跨仓知会。"
+            )
+
+    def test_survival_stream_always_ignites(self) -> None:
+        """SURVIVAL_PRECISION ⊗ SALIENCE_THRESHOLD **绑定**：survival 恒过阈。
+
+        推论：`ignite` 的 `if not fired: fired=[max by salience]` 兜底分支**结构性不可达**
+        （survival arousal 恒 ≥0.5、Π 恒 (0.4,0.4) → salience ≥0.200 > 0.18）。故外部亚阈
+        先验永远等不到「全场亚阈时当选 max」的逃逸机会。两常量任一动即须同评。
+        """
+        source = self._source()
+        consts = {}
+        for name in ("SURVIVAL_PRECISION", "SALIENCE_THRESHOLD"):
+            match = re.search(rf"^{name}\s*=\s*({_NUM})", source, re.MULTILINE)
+            if match is None:
+                pytest.skip(f"未找到 {name}，跳过")
+            consts[name] = float(match.group(1))
+
+        min_survival_arousal = 0.5  # fast_survival_prior: clamp(0.5+0.5·|intensity|) ≥ 0.5
+        min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
+        assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
+            f"survival 流最小 salience={min_survival_salience:.4f} 不再 > 阈值 "
+            f"{consts['SALIENCE_THRESHOLD']}——ignite 的 max-fallback 分支变为可达，"
+            "外部亚阈先验可能在全场亚阈时被保留，本仓可达性结论须重评。"
+        )
 
 
 # ---------------------------------------------------------------------------

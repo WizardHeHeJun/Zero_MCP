@@ -20,16 +20,21 @@ from __future__ import annotations
 import pytest
 
 from src.agents.models.zero_affect import ModalityPrior
+from src.mcp.zero import external_priors as external_priors_module
 from src.mcp.zero.external_priors import (
     EXTERNAL_PRIOR_SCHEMA_VERSION,
     MIN_PRECISION,
+    PHYSIO_MERGED_MODALITY,
     PHYSIO_STREAM_PREFIXES,
+    PHYSIO_SUBSOURCE_PRECISION_A,
     ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT,
     ZERO_MAX_EXTERNAL_STREAMS_DEFAULT,
     ModalityKind,
+    _assert_merge_arity_invariant,
     build_external_priors_override,
     build_recommended_prior,
     is_physio_stream,
+    merge_physio_priors,
     recommended_precision,
 )
 
@@ -563,3 +568,178 @@ class TestEnvResolution:
         prior = _make_prior("vision", mu=(0.0, 0.0), precision=(0.9, 0.9))
         result = build_external_priors_override([prior])
         assert result["external_priors"][0][2] == pytest.approx((0.9, 0.9))
+
+
+# ---------------------------------------------------------------------------
+# EDA/HRV 协方差交叉预合并（Zero 议会 2026-07-28 终裁 · MCP 侧执行项）
+# ---------------------------------------------------------------------------
+
+
+class TestPhysioPreMerge:
+    """EDA 与 HRV 高度相关（同测交感唤醒），须预合并为单条 physio 再注入。
+
+    不合并时朴素 Σπ = 0.15+0.20 = 0.35，**相当于把合并精度虚增 2 倍**（议会数学席）。
+    合并式（CI 信息形式，ω 固定）：
+        Π_merged = ω·Π_eda + (1-ω)·Π_hrv
+        μ_merged = (ω·Π_eda·μ_eda + (1-ω)·Π_hrv·μ_hrv) / Π_merged
+    """
+
+    def test_merge_precision_matches_council_value(self) -> None:
+        """ω=0.5 + 可靠度分层 (0.15, 0.20) → Π_merged=0.175（议会给出的确切值）。"""
+        merged = merge_physio_priors(
+            [
+                _make_prior("eda/sc", mu=(0.0, 0.76), precision=(MIN_PRECISION, 0.18)),
+                _make_prior("hrv/rmssd", mu=(0.0, 0.91), precision=(MIN_PRECISION, 0.18)),
+            ]
+        )
+        assert len(merged) == 1, f"EDA+HRV 应合并为单条，实际 {[p.modality for p in merged]}"
+        assert merged[0].modality == PHYSIO_MERGED_MODALITY
+        assert merged[0].precision[1] == pytest.approx(0.175)
+        # 效价维：两者均对效价盲 → μv=0、Πv=MIN（与 Zero M2 最终形状一致）
+        assert merged[0].mu[0] == 0.0
+        assert merged[0].precision[0] == pytest.approx(MIN_PRECISION)
+
+    def test_merged_mu_is_precision_weighted(self) -> None:
+        """μ_merged 为精度加权（非算术平均）——HRV 可靠度更高故更靠近 HRV 读数。"""
+        mu_eda, mu_hrv = 0.76, 0.91
+        merged = merge_physio_priors(
+            [
+                _make_prior("eda/sc", mu=(0.0, mu_eda), precision=(MIN_PRECISION, 0.18)),
+                _make_prior("hrv/rmssd", mu=(0.0, mu_hrv), precision=(MIN_PRECISION, 0.18)),
+            ]
+        )
+        w_eda = 0.5 * PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        w_hrv = 0.5 * PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        expected = (w_eda * mu_eda + w_hrv * mu_hrv) / (w_eda + w_hrv)
+        assert merged[0].mu[1] == pytest.approx(expected)
+        # 判别性：精度加权 ≠ 算术平均（否则本例退化为无差别断言）
+        assert merged[0].mu[1] != pytest.approx((mu_eda + mu_hrv) / 2.0)
+        assert mu_eda < merged[0].mu[1] < mu_hrv, "加权结果应落两读数之间且偏向高可靠度侧"
+
+    def test_merged_stream_still_triggers_zero_m2(self) -> None:
+        """合并流名须仍落生理前缀集内，否则 Zero M2（Πv→MIN）不再触发。"""
+        assert is_physio_stream(PHYSIO_MERGED_MODALITY)
+        assert PHYSIO_MERGED_MODALITY.startswith(PHYSIO_STREAM_PREFIXES[0])
+
+    def test_single_source_is_not_merged(self) -> None:
+        """只有 EDA（或只有 HRV）时不合并——无相关性双计问题。"""
+        only_eda = [_make_prior("eda/sc", mu=(0.0, 0.5), precision=(MIN_PRECISION, 0.18))]
+        assert [p.modality for p in merge_physio_priors(only_eda)] == ["eda/sc"]
+        only_hrv = [_make_prior("hrv/rmssd", mu=(0.0, 0.5), precision=(MIN_PRECISION, 0.18))]
+        assert [p.modality for p in merge_physio_priors(only_hrv)] == ["hrv/rmssd"]
+
+    def test_non_physio_streams_untouched_and_order_kept(self) -> None:
+        """非生理流原样保留且保持顺序；合并流落在首个生理流原位置。"""
+        priors = [
+            _make_prior("audio", mu=(0.1, 0.4), precision=(0.10, 0.25)),
+            _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("vision", mu=(0.5, 0.1), precision=(0.20, 0.12)),
+            _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+        ]
+        names = [p.modality for p in merge_physio_priors(priors)]
+        assert names == ["audio", PHYSIO_MERGED_MODALITY, "vision"]
+
+    def test_omega_env_override_and_bounds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ω 走 env 可覆盖；端点 0/1（1 维 CI 退化角，议会已排除）fail-fast。"""
+        pair = [
+            _make_prior("eda/sc", mu=(0.0, 0.0), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("hrv/rmssd", mu=(0.0, 1.0), precision=(MIN_PRECISION, 0.18)),
+        ]
+        monkeypatch.setenv("ZERO_PHYSIO_MERGE_OMEGA", "0.571")
+        merged = merge_physio_priors(pair)
+        w_eda = 0.571 * PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        w_hrv = (1.0 - 0.571) * PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        assert merged[0].precision[1] == pytest.approx(w_eda + w_hrv)
+        for bad in ("0.0", "1.0", "-0.2"):
+            monkeypatch.setenv("ZERO_PHYSIO_MERGE_OMEGA", bad)
+            with pytest.raises(ValueError, match="开区间"):
+                merge_physio_priors(pair)
+
+    def test_override_merges_by_default_and_can_opt_out(self) -> None:
+        """注入边界默认合并；merge_physio=False 保留旧行为（逃生阀）。"""
+        priors = [
+            _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+        ]
+        default = build_external_priors_override(priors)
+        assert [name for name, _mu, _p in default["external_priors"]] == [PHYSIO_MERGED_MODALITY]
+        opted_out = build_external_priors_override(priors, merge_physio=False)
+        assert [name for name, _mu, _p in opted_out["external_priors"]] == ["eda/sc", "hrv/rmssd"]
+
+    def test_omega_half_gives_hrv_its_exact_reliability_weight(self) -> None:
+        """ω=0.5 时 HRV 实际权重**恒等于** Π_hrv/(Π_eda+Π_hrv)——故再按可靠度设 ω 是二次施加。
+
+        对任意 (Π_eda, Π_hrv) 成立的恒等式（Zero 议会 ω 档位终裁的代数核心）：
+            w_hrv(ω) = (1-ω)·Π_hrv / [ω·Π_eda + (1-ω)·Π_hrv]，ω=0.5 → Π_hrv/(Π_eda+Π_hrv)
+        """
+        pi_eda = PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        pi_hrv = PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        w_hrv = 0.5 * pi_hrv / (0.5 * pi_eda + 0.5 * pi_hrv)
+        assert w_hrv == pytest.approx(pi_hrv / (pi_eda + pi_hrv))
+        # 判别性：该权重确实 ≠ 0.5（否则本例退化为「对称权重=对称权重」的空断言）
+        assert w_hrv != pytest.approx(0.5)
+
+    def test_omega_half_preserves_mu_and_halves_precision(self) -> None:
+        """ω=0.5 只调保守度：μ 与「不合并双流进 fuse_terms」逐位相同，Π 精确减半。
+
+        任何 ω≠0.5 会同时扰动 μ 与 Π（把本该正交的两个自由度耦合）——一并作反例守卫。
+        """
+        mu_eda, mu_hrv = 0.76, 0.91
+        pi_eda = PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+        pi_hrv = PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        # Zero fuse_terms 对两条独立流的等效结果
+        mu_unmerged = (pi_eda * mu_eda + pi_hrv * mu_hrv) / (pi_eda + pi_hrv)
+        pair = [
+            _make_prior("eda/sc", mu=(0.0, mu_eda), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("hrv/rmssd", mu=(0.0, mu_hrv), precision=(MIN_PRECISION, 0.18)),
+        ]
+        merged = merge_physio_priors(pair)[0]
+        assert merged.mu[1] == pytest.approx(mu_unmerged, abs=1e-12), "ω=0.5 应保持 μ 不变"
+        assert (pi_eda + pi_hrv) / merged.precision[1] == pytest.approx(2.0), "Π 应精确减半"
+        # 反例：ω≠0.5 会同时挪动 μ（证明「只调一个维度」是 ω=0.5 独有性质）
+        shifted = merge_physio_priors(pair, omega=0.4286)[0]
+        assert shifted.mu[1] != pytest.approx(mu_unmerged, abs=1e-6)
+
+    def test_merge_arity_invariant_currently_holds(self) -> None:
+        """当前子源集合与可靠度权重表一致于二元推导——不变量成立。"""
+        _assert_merge_arity_invariant()  # 不抛即通过
+
+    def test_adding_source_without_rederivation_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠ 治理守卫：只加同源子通道、不重走 N 元推导 → 硬失败（非静默降保守度）。
+
+        背景（Zero 议会转 CS 席治理项）：M6 按合并后计数=1，其前提是相关性已被 CI 推导吸收。
+        若第三个源被塞进二元式复用 ω=0.5，"physio" 背后会藏 3 条朴素求和的证据，
+        **两仓都感知不到 M6 失效**。故此处必须 raise 而非放行。
+        """
+        monkeypatch.setattr(
+            external_priors_module, "_PHYSIO_MERGE_SOURCES", ("eda", "hrv", "rsp"), raising=True
+        )
+        monkeypatch.setattr(
+            external_priors_module,
+            "PHYSIO_SUBSOURCE_PRECISION_A",
+            {"eda": 0.15, "hrv": 0.20, "rsp": 0.10},
+            raising=True,
+        )
+        with pytest.raises(NotImplementedError, match="N 元 CI 推导"):
+            _assert_merge_arity_invariant()
+        # 合并入口本身也必须被守住（不是只有辅助函数会抛）
+        with pytest.raises(NotImplementedError, match="N 元 CI 推导"):
+            merge_physio_priors(
+                [
+                    _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+                    _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+                ]
+            )
+
+    def test_merge_avoids_naive_precision_inflation(self) -> None:
+        """合并后 Πa 严格小于不合并时的朴素 Σπ——这正是要规避的 2× 虚增。"""
+        priors = [
+            _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+            _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+        ]
+        naive_sum = sum(PHYSIO_SUBSOURCE_PRECISION_A.values())
+        merged_pi = merge_physio_priors(priors)[0].precision[1]
+        assert merged_pi < naive_sum
+        assert merged_pi == pytest.approx(naive_sum / 2.0), "对称 ω 下合并精度应为朴素和的一半"
