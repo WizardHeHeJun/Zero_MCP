@@ -183,11 +183,17 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
 
     截断不在此处（由 Task 11 prompt_loader 统一处理）。
 
-    **注入过滤边界**（蓝图 v2 WARN-1）：本摘要整体会进 Supervisor 的 LLM prompt，故
+    **注入过滤边界**（蓝图 v2 WARN-1 的**第②道**）：本摘要整体会进 Supervisor 的 LLM prompt，故
     **所有由被感知应用填写的自由文本**都在此处过 `sanitize_screen_text`——包括活跃窗口标题、
     UIA 元素的 `name` 与 `control_type`、视觉对象的 `label`。`text_blocks` 例外：它由调用方
     预先过滤后经 `sanitized_texts` 传入（保持既有契约）。不过滤的只有 `VisualObject.source`
-    与 `UiaElement.source`——它们是 `Literal` 枚举、由本仓自己填，非外部输入。
+    与 `UIAElement.source`——它们是 `Literal` 枚举、由本仓自己填，非外部输入。
+
+    ⚠ **WARN-1 的第①道（「MCP server 返回解析时入口即净化」）仍未实现**：`ScreenSnapshot`
+    里存的仍是未过滤原文，本函数是原文进 LLM 的**唯一**出口，故当前无可达注入面；但一旦出现
+    绕过本函数的新消费方（持久化存储重取、`mcp-server/` TS 层直接转发原始 JSON），该保护即失效。
+    第①道未做是**待决而非遗漏**——入口即净化会让快照与现场包再也留不下攻击原文，取证保真度
+    与纵深防御在此冲突，需产品决策。Task 7 验收「两道注入过滤到位」目前**仅达成第②道**。
 
     Args:
         snapshot: 原始感知快照。
