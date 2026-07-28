@@ -231,8 +231,9 @@ class EdaChannel:
         sampling_rate: int = 4,
         normalization: Literal["linear", "percentile"] = "linear",
         signal_source: Any | None = None,
-        window_seconds: float = 15.0,
-        cold_start_seconds: float = 10.0,
+        window_seconds: float = 1800.0,
+        cold_start_seconds: float = 1200.0,
+        analysis_window_seconds: float = 30.0,
         percentile_window: int | None = None,
         percentile_cold_start: int | None = None,
         percentile_range: tuple[int, int] = (5, 95),
@@ -263,18 +264,31 @@ class EdaChannel:
         # 标量」的实际单位错配，见蓝图 §4；v2 不继承它）。
         self.baseline_history: collections.deque[tuple[float, float]] = collections.deque()
 
-        # 秒制化解析：窗/冷启动 = round(秒 × 构造期 sampling_rate)，采样率无关（修固定 60 在
-        # 256Hz=0.23s「崩」的 footgun）。显式样本数覆盖（非 None）优先——保精确控制与既有调用零回归。
-        # max(1,…) 对推导+覆盖两路兜底：window_seconds≤0 或误传 percentile_window=0 均不产死 deque。
+        # 秒制化解析：窗/冷启动 = round(秒 ÷ **每次调用覆盖的秒数**)。
+        #
+        # ⚠ 单位错配修复（蓝图任务 10；六轮独立评审全部命中）：旧式除数误用 `sampling_rate`，
+        # 但 `_amplitude_history` 的 deque 存的是**每次 `_process()` 调用产出的一个标量**，
+        # 不是原始 EDA 采样点。旧式后果与其 docstring 自述的「采样率无关」**正好相反**：
+        # 4Hz→60 次调用暖机、256Hz→3840 次。正确除数是**分析窗长**（由 io_adapter 的
+        # `duration_s` 决定，与采样率无关）。
+        #
+        # 默认值同比放大以保**默认行为逐值不变**：1800/30=60、1200/30=40，与旧默认
+        # （15×4=60、10×4=40）在 4Hz 下完全一致；差别只在非默认采样率——那正是被修的 bug
+        # （256Hz 由 3840 回到 60）。前后对照见 `evals/wesad_eda_v1_deque_unit_fix_eval.py`。
+        #
+        # 显式样本数覆盖（非 None）优先——保精确控制与既有调用零回归。
+        # max(1,…) 对推导+覆盖两路兜底：秒数≤0 或误传 percentile_window=0 均不产死 deque。
+        per_call_seconds = analysis_window_seconds if analysis_window_seconds > 0 else 1.0
+        self.analysis_window_seconds = analysis_window_seconds
         resolved_window = (
             percentile_window
             if percentile_window is not None
-            else round(window_seconds * sampling_rate)
+            else round(window_seconds / per_call_seconds)
         )
         resolved_cold_start = (
             percentile_cold_start
             if percentile_cold_start is not None
-            else round(cold_start_seconds * sampling_rate)
+            else round(cold_start_seconds / per_call_seconds)
         )
         self.percentile_window = max(1, resolved_window)
         self.percentile_cold_start = max(1, resolved_cold_start)

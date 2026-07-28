@@ -824,24 +824,51 @@ class TestEdaChannelSecondsParameterization:
         assert ch._amplitude_history["cvxEDA"].maxlen == 60
 
     def test_window_seconds_is_sampling_rate_invariant(self) -> None:
-        """同一 window_seconds=15 在 4/8/256Hz 下 deque maxlen 随采样率成比例（footgun 修复）。"""
-        assert EdaChannel(sampling_rate=4, normalization="percentile").percentile_window == 60
-        assert EdaChannel(sampling_rate=8, normalization="percentile").percentile_window == 120
-        assert EdaChannel(sampling_rate=256, normalization="percentile").percentile_window == 3840
+        """⚠ **单位错配修复后**（蓝图任务 10）：同一 window_seconds 在任意采样率下 maxlen **恒定**。
+
+        修复前该断言写的是 4Hz→60 / 8Hz→120 / 256Hz→3840——即 maxlen **随采样率成比例**，
+        与本方法名（"sampling_rate_invariant"）**正好相反**。根因：deque 存的是每次
+        `_process()` 调用产出的**一个标量**，不是采样点，故除数应是**分析窗长**而非采样率。
+        """
+        for rate in (4, 8, 256):
+            channel = EdaChannel(sampling_rate=rate, normalization="percentile")
+            assert channel.percentile_window == 60, f"{rate}Hz 下 maxlen 应恒为 60"
 
     def test_cold_start_seconds_is_sampling_rate_invariant(self) -> None:
-        """cold_start_seconds=10 在 4/8Hz 下 → 40 / 80 样本（随采样率成比例）。"""
-        assert EdaChannel(sampling_rate=4, normalization="percentile").percentile_cold_start == 40
-        assert EdaChannel(sampling_rate=8, normalization="percentile").percentile_cold_start == 80
+        """cold_start 同理：任意采样率下恒为 40（修复前 4Hz→40 / 8Hz→80）。"""
+        for rate in (4, 8, 256):
+            channel = EdaChannel(sampling_rate=rate, normalization="percentile")
+            assert channel.percentile_cold_start == 40, f"{rate}Hz 下 cold_start 应恒为 40"
 
-    def test_custom_window_seconds_derives_maxlen_with_round(self) -> None:
-        """自定义 window_seconds 经 round(seconds×rate) 推导 maxlen（含小数积 round）。"""
-        ch = EdaChannel(sampling_rate=8, normalization="percentile", window_seconds=5.0)
-        assert ch.percentile_window == 40
+    def test_custom_window_seconds_derives_maxlen_by_analysis_window(self) -> None:
+        """自定义秒数经 round(window_seconds ÷ analysis_window_seconds) 推导（含小数商 round）。"""
+        ch = EdaChannel(
+            sampling_rate=8,
+            normalization="percentile",
+            window_seconds=600.0,
+            analysis_window_seconds=15.0,
+        )
+        assert ch.percentile_window == 40  # 600/15
         assert ch._amplitude_history["highpass"].maxlen == 40
-        # 小数积 round：7Hz × 2.4s = 16.8 → 17
-        ch2 = EdaChannel(sampling_rate=7, normalization="percentile", window_seconds=2.4)
+        # 小数商 round：100s ÷ 6s = 16.67 → 17
+        ch2 = EdaChannel(
+            sampling_rate=7,
+            normalization="percentile",
+            window_seconds=100.0,
+            analysis_window_seconds=6.0,
+        )
         assert ch2.percentile_window == 17
+
+    def test_analysis_window_seconds_drives_maxlen_not_sampling_rate(self) -> None:
+        """判别性：**改分析窗长**才动 maxlen，**改采样率**不动——这是本次修复的核心断言。"""
+        base = EdaChannel(sampling_rate=4, normalization="percentile")
+        rate_changed = EdaChannel(sampling_rate=256, normalization="percentile")
+        window_changed = EdaChannel(
+            sampling_rate=4, normalization="percentile", analysis_window_seconds=60.0
+        )
+        assert rate_changed.percentile_window == base.percentile_window  # 采样率无关
+        assert window_changed.percentile_window == 30  # 1800/60，分析窗长翻倍 → maxlen 减半
+        assert window_changed.percentile_window != base.percentile_window
 
     def test_explicit_sample_override_wins_over_seconds(self) -> None:
         """显式样本数覆盖（percentile_window/percentile_cold_start）优先于秒制参数。"""
@@ -909,15 +936,16 @@ class TestEdaChannelSecondsParameterization:
     ) -> None:
         """秒制推导路径 footgun：cold_start_seconds > window_seconds → 推导 cold>window → 告警。
 
-        window_seconds=15 / cold_start_seconds=20 @4Hz → 推导 window=60、cold_start=80（80>60）。
+        window_seconds=1800 / cold_start_seconds=2400 @ 分析窗长 30s
+        → window=60、cold_start=80（80>60）。
         守卫此路径——重构新增暴露面，勿只经显式样本数覆盖路径触发告警。
         """
         with caplog.at_level(logging.WARNING):
             ch = EdaChannel(
                 sampling_rate=4,
                 normalization="percentile",
-                window_seconds=15.0,
-                cold_start_seconds=20.0,
+                window_seconds=1800.0,
+                cold_start_seconds=2400.0,
             )
         assert ch.percentile_window == 60
         assert ch.percentile_cold_start == 80
@@ -950,13 +978,13 @@ class TestEdaChannelSecondsParameterization:
     ) -> None:
         """经 cold_start_seconds 推导的暖机阈值真正门控冷启动：未达阈值时 == linear。
 
-        sampling_rate=4, cold_start_seconds=1.25 → round(1.25×4)=5；喂 4 次（<5）应恒等 linear。
+        cold_start_seconds=150 ÷ 分析窗长 30s → 5；喂 4 次（<5）应恒等 linear。
         """
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
         ch_pct = EdaChannel(
             sampling_rate=4,
             normalization="percentile",
-            cold_start_seconds=1.25,  # → cold_start=5
+            cold_start_seconds=150.0,  # ÷30 → cold_start=5
         )
         assert ch_pct.percentile_cold_start == 5
         phasic_values = [0.1, 0.3, 0.5, 0.2]  # 4 次 < 5，全程冷启动
