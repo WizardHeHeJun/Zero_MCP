@@ -869,15 +869,21 @@ _ZERO_SURVIVAL_FUNC_RE = re.compile(
 )
 
 
-def _parse_survival_arousal_floor(source: str) -> float | None:
-    """解析 fast_survival_prior 的 arousal 基线（地板）；无基线项按 0.0，形态未知返回 None。"""
+def _survival_arousal_floors(source: str) -> list[float] | None:
+    """列出 fast_survival_prior 函数体内**所有** arousal 式的基线（地板）。
+
+    返回 None = 函数不在位（Zero 结构大改/文件不对）→ 调用方 skip。
+    返回 []   = 函数在位但无可解析 arousal 式（如基线被写成条件表达式）→ 调用方判红。
+    返回多元素 = 存在多个分支形态（门控落地的典型形状）→ 调用方判红。
+    无基线项（`clamp(0.5*|I|)`）记 0.0，使其进入主断言而非逃进 skip。
+    """
     func_match = _ZERO_SURVIVAL_FUNC_RE.search(source)
     if func_match is None:
         return None
-    match = _ZERO_SURVIVAL_AROUSAL_RE.search(func_match.group(0))
-    if match is None:
-        return None
-    return float(match.group(1)) if match.group(1) is not None else 0.0
+    return [
+        float(m.group(1)) if m.group(1) is not None else 0.0
+        for m in _ZERO_SURVIVAL_AROUSAL_RE.finditer(func_match.group(0))
+    ]
 
 
 @pytest.mark.zerorepo
@@ -1059,10 +1065,28 @@ class TestIgnitionGateReachabilityCrosscheck:
         # Zero 07-28 二轮回执：去地板（→clamp(0.5|I|)）已列必改，且明确要求本例在其
         # 落地当天变红=跨仓信号（勿改宽松）。届时红了是**正确行为**，重标须等 Zero
         # 最终形态 ping（去地板与跨流归一化打包），勿见红即放宽断言。
+        #
+        # 三种落地形态都要能红（Zero 复议纪要 §六(e):186 裁定 floor 修复**与 D formula
+        # 共用同一 default-off 总开关**、「关闭时旧行为逐字不变」——即最可能的落地不是
+        # 直接改这一行，而是**新增分支/条件**。若只断言「基线值 == 0.5」，门控落地当天
+        # 走 legacy 分支照样绿，正是本仓 pitfalls ② 那个失败模式的复发）：
+        #   裸改（无门控）→ 基线解析 0.0 → 主断言红；
+        #   多分支门控   → len>1     → 结构断言红；
+        #   条件表达式   → 解析不出   → 空列表断言红。
+        floors = _survival_arousal_floors(source)
+        if floors is None:
+            pytest.skip("未找到 fast_survival_prior 函数体，Zero 结构可能大改，跳过")
+        assert floors, (
+            "fast_survival_prior 在位但 arousal 式解析不出（可能改成条件表达式/门控形态）"
+            "——须按 Zero 最终形态重标本守卫，勿放宽（Zero 07-28 二轮：去地板已列必改）。"
+        )
+        assert len(floors) == 1, (
+            f"fast_survival_prior 出现 {len(floors)} 个 arousal 分支形态（基线 {floors}）"
+            "——与 Zero 复议 §六(e) 的 default-off 门控落地形状一致。此时「哪条是默认路径」"
+            "本守卫判不了，须按 Zero ping 的最终形态重标（含门开关默认值 pin）。"
+        )
         # intensity=0 时取基线项；斜率项 ≥0 故基线即下确界（clamp 下界 0.0 不咬合）
-        min_survival_arousal = _parse_survival_arousal_floor(source)
-        if min_survival_arousal is None:
-            pytest.skip("未找到 fast_survival_prior 的 arousal 式，结构可能变更，跳过")
+        min_survival_arousal = floors[0]
 
         min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
         assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
@@ -1076,13 +1100,17 @@ class TestIgnitionGateReachabilityCrosscheck:
 
         「绿灯必须先证明它能红」同族第五例：上一版正则硬性要求 `+` 基线项，恰好对
         「Zero 动手当天」那条改动（clamp(0.5+0.5|I|)→clamp(0.5|I|)）no-match→skip
-        （默认模式黄灯，仅 STRICT 兜底转红）——守卫承诺的红是它给不出的。本例实证四态：
-        (1) 现行地板形态解析 0.5——且 decoy 在场不被抢注（反例非假想：首版可选基线正则
+        （默认模式黄灯，仅 STRICT 兜底转红）——守卫承诺的红是它给不出的。本例实证五态：
+        (1) 现行地板形态解析 [0.5]——且 decoy 在场不被抢注（反例非假想：首版可选基线正则
         就被 occ_prior 的多行 clamp(0.4·|I|+…) 全文件抢先匹配、把真地板误读成 0.0，
-        Zero 未动手先假阳性红，07-28 实踩）；(2) 去地板形态解析 **0.0 而非 None**
-        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) 未知形态仍 None→skip；
-        (4) 函数整体缺位 None→skip。如实标注守不住什么：fast_survival_prior 若重构成
-        其它形状，本守卫依旧只能 skip，靠 STRICT 兜底。不依赖 D:\\Zero 在位，判别力常年在测。
+        Zero 未动手先假阳性红，07-28 实踩）；(2) 裸去地板形态解析 **[0.0] 而非 None**
+        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) **门控多分支形态**（Zero
+        复议 §六(e):186 裁定 floor 与 D formula 共用 default-off 总开关、「关闭时旧行为
+        逐字不变」→ 最可能的落地是新增分支而非改这一行）→ 两元素 → 结构断言红，而非
+        「走 legacy 分支照样绿」（那正是本仓 pitfalls ② 失败模式的复发）；(4) 条件表达式
+        等不可解析形态 → **空列表**（非 None）→ 断言红；(5) 函数整体缺位 → None → skip。
+        如实标注守不住什么：(5) 这一格（Zero 整个重命名/删除 fast_survival_prior）本守卫
+        只能 skip、靠 STRICT 兜底转红。不依赖 D:\\Zero 在位，判别力常年在测。
         """
         decoy_occ_prior = (
             "def occ_prior(appraisal):\n"
@@ -1101,22 +1129,37 @@ class TestIgnitionGateReachabilityCrosscheck:
             "def fast_survival_prior(features):\n"
             "    arousal = clamp(0.5 * abs(intensity), 0.0, 1.0)\n"
         )
+        # Zero 复议 §六(e) 的 default-off 门控落地形状（floor 与 D formula 同一总开关）
+        gated_branches = decoy_occ_prior + (
+            "def fast_survival_prior(features, use_axis_weighted_gate=False):\n"
+            "    if use_axis_weighted_gate:\n"
+            "        arousal = clamp(0.5 * abs(intensity), 0.0, 1.0)\n"
+            "    else:\n"
+            "        arousal = clamp(0.5 + 0.5 * abs(intensity), 0.0, 1.0)\n"
+        )
         unknown_shape = decoy_occ_prior + (
             "def fast_survival_prior(features):\n"
             "    arousal = clamp(sigmoid(intensity), 0.0, 1.0)\n"
         )
 
-        assert _parse_survival_arousal_floor(floored) == 0.5, (
-            "地板在场时必须解析出 0.5——若为 0.0 说明又被函数体外的 decoy 抢注（假阳性）"
+        assert _survival_arousal_floors(floored) == [0.5], (
+            "地板在场时必须解析出 [0.5]——若为 [0.0] 说明又被函数体外的 decoy 抢注（假阳性）"
         )
-        floor = _parse_survival_arousal_floor(floorless)
-        assert floor == 0.0, "去地板形态必须解析为 0.0 而非 None——否则上例 skip 不红"
+        floors = _survival_arousal_floors(floorless)
+        assert floors == [0.0], "去地板形态必须解析为 [0.0] 而非 None——否则上例 skip 不红"
         assert not (
-            floor * _ZERO_GATE_CONSTANTS["SURVIVAL_PRECISION"]
+            floors[0] * _ZERO_GATE_CONSTANTS["SURVIVAL_PRECISION"]
             > _ZERO_GATE_CONSTANTS["SALIENCE_THRESHOLD"]
         ), "去地板后上例主断言应不成立（红）——若此处成立说明判别力自证失效"
-        assert _parse_survival_arousal_floor(unknown_shape) is None
-        assert _parse_survival_arousal_floor(decoy_occ_prior) is None
+        gated = _survival_arousal_floors(gated_branches)
+        assert gated is not None and len(gated) == 2, (
+            f"门控多分支形态须解析出两个形态（实际 {gated}）——只取第一个匹配会让"
+            "「走 legacy 分支照样绿」，即 default-off 落地当天守卫失明"
+        )
+        assert _survival_arousal_floors(unknown_shape) == [], (
+            "不可解析形态须返回空列表（→上例断言红），返回 None 会逃进 skip"
+        )
+        assert _survival_arousal_floors(decoy_occ_prior) is None
 
 
 # ---------------------------------------------------------------------------
