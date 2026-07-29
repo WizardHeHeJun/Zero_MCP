@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterable
+import warnings
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +37,22 @@ from src.mcp.zero.external_priors import (
     merge_physio_priors,
     recommended_precision,
 )
+from tests.mcp.conftest import STRICT_ENV
 
-# D:\Zero 源码根路径
-_ZERO_ROOT = Path("D:/Zero")
+# D:\Zero 源码根路径。**默认值不变**（`D:/Zero`），另开一个 env 覆盖口：
+# 跨仓变异验证必须在 `git show <ref>:…` 取出的 **pin 副本**上做（Zero 工作树随时可能被别的
+# 会话改动 ⇒ 读工作树的结论不可复现），没有覆盖口就只能去改对方的树——那是更坏的选择。
+# 未设 env ⇒ 与改造前逐字节相同，零回归。
+_ZERO_REPO_ROOT_ENV = "ZERO_REPO_ROOT"
+_ZERO_ROOT_DEFAULT = "D:/Zero"
+
+
+def _resolve_zero_root(environ: Mapping[str, str]) -> Path:
+    """按环境变量解析 Zero 仓根路径；未设/空值 → 默认 `D:/Zero`（纯函数，故可两分支实证）。"""
+    return Path(environ.get(_ZERO_REPO_ROOT_ENV) or _ZERO_ROOT_DEFAULT)
+
+
+_ZERO_ROOT = _resolve_zero_root(os.environ)
 _ZERO_SRC = _ZERO_ROOT / "src"
 
 # ---------------------------------------------------------------------------
@@ -580,7 +595,7 @@ def _fetch_affect_state_defaults_or_skip() -> dict[str, Any]:
 # 右边是**标识符**（别名指向 ZERO_ERROR_CODE_UNKNOWN_SESSION）→ 不匹配 → skip → STRICT 转 fail。
 #
 # 新守卫 pin 三件事，且**本仓持有自己的期望**（不是「对方有什么就认什么」的恒真式）：
-#   1. 符号集：Zero 顶层 `ZERO_ERROR_CODE_*` 全集 == 本仓 `_EXPECTED_ZERO_ERROR_CODE_SYMBOLS`；
+#   1. 符号：本仓已消费的 `ZERO_ERROR_CODE_*` 全在 Zero 侧在位（见下「双态化」——单向不是等号）；
 #   2. 逐符号值：Zero 每个符号的字面量 == 本仓 client 同名常量
 #      （本仓字面量独立持有 → 单边改值即红）；
 #   3. 令牌格式：`_tool_error` 的构造前缀 == `[zero:`（本仓消费正则的依据，换分隔符即红）。
@@ -589,6 +604,75 @@ def _fetch_affect_state_defaults_or_skip() -> dict[str, Any]:
 # 解析一律走 AST（同 `_top_level_func` 的教训：文本切法会被 docstring/注释里的同形 token 污染）。
 # D:\Zero 或 server.py 不在位 → skip（环境缺口）；**文件在位但结构对不上 → 判红**
 # ——这正是本轮教训「检查比消费方宽松 ⇒ 绿灯从没能红」的直接修正。
+#
+# ── 【2026-07-29 双态化】为什么等号断言必须拆掉 ──────────────────────────────
+# 本守卫读的是 D:\Zero 的**工作副本**，没有 pinned ref：本会话实测同一批断言相隔 20 分钟
+# 两次结果不同（我方一行未改）。今天绿只是因为 Zero 恰好已把 8 码合进 main；一次回滚、
+# 或换机器 checkout 旧 ref，同一批断言就翻成**结构性假红**。而把期望硬 pin 成「就是这 8 个」
+# 只是把假红从一侧翻到另一侧（对方加一个我方不消费的码就红），**不是解法**。
+#
+# 改成「形态分流 + 单向 pin」：
+#
+#   形态判定（`_zero_error_code_shape`，一律 AST 按**符号名**，不看行号/不做文本切分）：
+#     · token              —— `ZERO_ERROR_CODE_*` 常量 + `ZERO_ERROR_CODES` 登记名 + 顶层
+#                             `_tool_error` 三者齐备（= 换代后形态）；
+#     · legacy-bare-prefix —— 上述三者**全无**，但 `_UNKNOWN_SESSION_MARKER = "<字面量>"` 在位
+#                             （= 换代前形态）。本仓 client 的 `_LEGACY_UNKNOWN_SESSION_RE`
+#                             仍消费**其中一个码**（unknown-session）⇒ 该形态**能跑但能力残缺**，
+#                             不是「零回归的老部署」，实测覆盖面见 `TestLegacyShapeCompatCoverage`；
+#     · unrecognized       —— 两套形态都认不出 ⇒ **判红**。红文案按信号分「从未有过机制」
+#                             （早期历史 ref）与「改到一半」两支，不对前者做错误归因。
+#
+#   断言方向（单向包含，不是等号；**但「产出」与「定义」分两条线**）：
+#     · 本仓**已消费**的码（≡ `client._CODE_TO_EXCEPTION` 的键，由
+#       `TestExpectedCodeSetMatchesConsumption` 钉死这条等价）必须在 Zero 侧在位、值相等、
+#       且已登记 —— 缺一即**红**（真回归：查表落空 → 归类退化成基类、静默降级）；
+#     · 🛑 Zero **会产出**（出现在 `_tool_error(...)` 的**码实参**——位置 0 或关键字 `code=`，
+#       两种写法同等对待，见 `_tool_error_code_argument`）而本仓未消费的码 —— **全模式判红**
+#       （`test_produced_error_codes_are_all_consumed`）。这条是 2026-07-29 补的：原先「对方比
+#       我方多一律只告警」的依据是「未登记码退回基类 + warning ⇒ 跨仓单边升级零回归」，
+#       **该依据被一次实证推翻**——Zero 只要把某个既有失效模式**重新切分**到新码
+#       （如 payload-invalid 的一支切成 stim-invalid），我方就不是「多一条没归类的新错误」，
+#       而是**既有归类被掏空**：ZeroLinkCallerFaultError（NonDegradable，上抛不吞）退化成
+#       ZeroLinkCallError（可降级）→ 被 graceful_step 的 except 元组兜住
+#       → **每轮静默 return None**。
+#       等号断言本来会红并强制两仓协调，单向包含则全绿（在 Zero `daecce1` 真副本上实测 6/6 全绿）。
+#     · 🛑 **反方向**（2026-07-29 补，m9）：本仓标为**不可降级**的码，Zero 侧必须**仍有产出点**
+#       （`test_non_degradable_consumed_codes_are_still_produced_by_zero`）。此前四条守卫全是
+#       「Zero 产出的码是否被我方消费」单向的，「我方消费的码是否还有人产出」无人看：实测把
+#       `deploy-env-invalid` 的 `raise _tool_error(...)` 换成裸 `raise ValueError(...)`
+#       ——符号仍定义、仍登记、令牌前缀不动 ⇒ 其余守卫**全绿**，而那条 wire 上没有令牌 ⇒
+#       classify 返回 None ⇒ 回基类 ⇒ graceful_step 静默吞掉「部署端 env 错」。
+#       只对不可降级族强制（不是全部已消费码）：`timeout-step` 是双方协商过的「只登记不产出」
+#       正常态，全域强制会当场假红并逼出豁免名单；且可降级码撤产出点的后果是「本来就会降级的
+#       继续降级」，观测面不变。取舍与实证见该用例 docstring。
+#     · Zero **定义/登记了但尚无产出点**、本仓未消费的码 —— 不红，发 `UserWarning`；
+#       `ZERO_LINK_E2E_STRICT=1` 下转 fail。依据：`timeout-step` 就是这种「先登记后产出」的
+#       正常态（双方明知），日常不该打扰；但登记通常是产出的预告，联调/发版门要求当场表态。
+#     · legacy 形态 —— 码表类断言 `skip`，理由带 `[shape=legacy-bare-prefix]` 前缀，与「码被删」
+#       的红文案**不是同一句话**；且 `ZERO_LINK_E2E_STRICT=1` 时 `tests/mcp/conftest.py` 把
+#       zerorepo 的 skip 一律转 fail ⇒ 联调/发版门上旧 ref 照样拦得住。
+#
+#   ⚠ **本节守卫已知盖不住的口子（m8，2026-07-29 实证，不硬凑守卫）**：
+#     Zero 把某个既有失效模式**重切到另一个「我方已消费」的码**，且原码在别处**仍有产出点**。
+#     实测（`daecce1` pin 副本，把 zero.step 的「stim/external_priors 载荷不合法」一支从
+#     `ZERO_ERROR_CODE_PAYLOAD_INVALID` 改发 `ZERO_ERROR_CODE_TIMEOUT_LOCK`）：
+#     **8 条守卫全绿**——产出集没变（两个码本来都在产出）、值没变、登记没变、令牌没变。
+#     而消费侧行为与 blocker 完全同型：CallerFault（上抛不吞）→ LockTimeout（可降级）→ 被吞。
+#     为什么无解：本仓只能看见「哪些**码**会被产出」，看不见「**哪个产出点**承载哪个语义」；
+#     `_tool_error(SYM, "人读文案")` 里唯一的语义线索是自然语言文案，拿它做守卫是脆弱锚点
+#     （pitfalls ⑦）。**若全部产出点都被切走**，m9 反向守卫会红（实测 mut-D2 RED）——
+#     即 m9 覆盖了 m8 的「整码消失」子集，剩下的「部分重切」是真残留。
+#     ⇒ 这是要向 Zero 索取的**契约**（产出点语义绑定），不是我方能单边补上的守卫。见 residual。
+#
+#   为什么「legacy 形态放绿」不是恒真式（pitfalls ⑥）：
+#     1. legacy 分支要**正证据**——`_UNKNOWN_SESSION_MARKER` 必须是顶层字符串字面量；
+#        什么都没有（真·无机制）落 unrecognized ⇒ **红**，不会静静绿掉；
+#     2. 诊断用例 `test_error_code_mechanism_shape` 在 legacy 分支上**继续断言**：该字面量
+#        == 本仓 `ZERO_ERROR_CODE_UNKNOWN_SESSION`，且本仓 `classify_zero_error` 确能从
+#        legacy 形态渲染出的**真 wire 文本**（带 FastMCP 外壳）提出该码。
+#        即「legacy 可以绿」的前提是**我方兼容层还活着**——哪天本仓撤了
+#        `_LEGACY_UNKNOWN_SESSION_RE`，legacy 形态立刻变红，且红在正确的一方。
 # ---------------------------------------------------------------------------
 
 # Zero server 定义机读错误码的源文件（相对 D:\Zero）
@@ -598,6 +682,8 @@ _ZERO_CODE_SYMBOL_PREFIX = "ZERO_ERROR_CODE_"
 _ZERO_CODE_REGISTRY_NAME = "ZERO_ERROR_CODES"
 _ZERO_LEGACY_ALIAS_NAME = "_UNKNOWN_SESSION_MARKER"
 _ZERO_TOOL_ERROR_FUNC = "_tool_error"
+# `_tool_error(code, message)` 的码形参名——产出点写成关键字实参 `code=SYM` 时按此名定位。
+_ZERO_TOOL_ERROR_CODE_KWARG = "code"
 
 # 本仓对 Zero 码表的**独立期望**（符号名集合）。Zero 改名/加码/删码而本仓未跟 → 下面第 1 条红。
 # 值不写在这里（按 Zero 要求「按符号名 pin」），而是与本仓 client 的同名常量逐个比对（第 2 条）
@@ -616,8 +702,47 @@ _EXPECTED_ZERO_ERROR_CODE_SYMBOLS: frozenset[str] = frozenset(
         "ZERO_ERROR_CODE_TIMEOUT_STEP",
     }
 )
+# 每个已消费码的**族归属期望**：True = 不可降级（`graceful_step` 上抛不吞）、
+# False = 可降级（被 `except (ZeroLinkCallError, …)` 兜住、降级成 None）。
+# ⚠ 值**独立手持**、不从 client 反推——反推即同一份数据自己比自己（恒真式，pitfalls ⑥）。
+# 覆盖域则**从 `client._CODE_TO_EXCEPTION` 推导**校验（见
+# `test_each_consumed_code_keeps_its_degradability_family`）：新增码没在此表表态即红，
+# 堵住旧写法「新增可降级码在两个集合里都不出现 ⇒ 静默通过」的口子。
+_EXPECTED_CODE_DEGRADABILITY: dict[str, bool] = {
+    # 可降级：client 能自愈（同 id 重开会话重试）
+    "ZERO_ERROR_CODE_UNKNOWN_SESSION": False,
+    # 可降级：未进内核、运行态未改，退避后可原样重试
+    "ZERO_ERROR_CODE_TIMEOUT_LOCK": False,
+    # 可降级：不可原样重试，但按本仓 §2.5 走「不重试 + ERROR 日志 + 降级 None」
+    "ZERO_ERROR_CODE_TIMEOUT_STEP": False,
+    # 不可降级：会话级 config 不兼容 —— open 成功、每 step 必崩，只有换 config 重开能好
+    "ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE": True,
+    # 不可降级：调用方传参/配置错 —— 每轮必复现，改传参才能好（本仓自己的 bug）
+    "ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID": True,
+    "ZERO_ERROR_CODE_PAYLOAD_INVALID": True,
+    "ZERO_ERROR_CODE_CONFIG_INVALID": True,
+    # 不可降级：部署端 env 错 —— 改 client 传参永远改不好
+    "ZERO_ERROR_CODE_DEPLOY_ENV_INVALID": True,
+}
+
 # 令牌构造前缀：本仓消费正则 `\[zero:([a-z][a-z0-9-]*)\]` 的依据。
 _EXPECTED_TOKEN_PREFIX = "[zero:"
+
+# Zero 机读错误码机制的三种形态（判定见 `_zero_error_code_shape`）
+_SHAPE_TOKEN = "token"
+_SHAPE_LEGACY = "legacy-bare-prefix"
+_SHAPE_UNRECOGNIZED = "unrecognized"
+
+# 函数定义节点：`def` 与 `async def` **一律同等对待**。跨仓守卫只关心「顶层有没有这个符号」，
+# 同/异步是 Zero 的内部选择——分开处理过一次就出过误诊（见 `_zero_top_level_func` docstring）。
+_FuncDef = ast.FunctionDef | ast.AsyncFunctionDef
+_FUNC_DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+# legacy（裸前缀）形态下，本仓兼容层**真正认得**的码符号。
+# ⚠ 不是「老部署零回归」——只有这一个码有 `_LEGACY_UNKNOWN_SESSION_RE` 兜底，
+# 其余码在该形态的 wire 上**根本不存在**。这个集合由
+# `TestLegacyShapeCompatCoverage` 用真 wire 文本逐码实测钉死，改一边即红。
+_LEGACY_COMPAT_COVERED_SYMBOLS: frozenset[str] = frozenset({"ZERO_ERROR_CODE_UNKNOWN_SESSION"})
 
 
 def _zero_server_tree_or_skip() -> ast.Module:
@@ -685,19 +810,24 @@ def _zero_alias_target(tree: ast.Module, alias_name: str) -> str | None:
     return None
 
 
+def _zero_top_level_func(tree: ast.Module, name: str) -> _FuncDef | None:
+    """按名取 Zero 的**顶层**函数节点（`def` 与 `async def` 同等对待）；不存在 → None。
+
+    ⚠ 存在的理由是**口径统一**：此前 `_zero_top_level_func_names`（形态判定）收
+    `FunctionDef | AsyncFunctionDef`，而 `_zero_tool_error_token_prefix`（令牌前缀）只收
+    `FunctionDef` —— Zero 把 `_tool_error` 改成 `async def`（纯重构、语义不变）就会让形态仍判
+    token、而前缀取不到 → 红文案变成「未找到可解析的 f-string 首段常量」，把一次无害重构
+    误诊成「令牌构造方式变了」。两处一律走本函数，口径不可能再分叉。
+    """
+    return next((n for n in tree.body if isinstance(n, _FUNC_DEF_NODES) and n.name == name), None)
+
+
 def _zero_tool_error_token_prefix(tree: ast.Module) -> str | None:
     """取 Zero `_tool_error` 里 f-string 的**首段常量**（即令牌构造前缀）；取不到 → None。
 
     形如 `return ToolError(f"[zero:{code}] {message…}")` → JoinedStr 的第一个 Constant 段。
     """
-    func = next(
-        (
-            n
-            for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == _ZERO_TOOL_ERROR_FUNC
-        ),
-        None,
-    )
+    func = _zero_top_level_func(tree, _ZERO_TOOL_ERROR_FUNC)
     if func is None:
         return None
     for node in ast.walk(func):
@@ -709,40 +839,459 @@ def _zero_tool_error_token_prefix(tree: ast.Module) -> str | None:
     return None
 
 
+def _tool_error_code_argument(node: ast.Call) -> tuple[ast.expr | None, str]:
+    """取一次 `_tool_error(...)` 调用的**码实参**节点：位置 0 与关键字 `code=` **同等对待**。
+
+    返回 `(实参节点, 定位失败的描述)`；节点非 None 时第二项为空串。
+
+    🛑 存在的理由（本轮 blocker）：旧实现只看 `node.args`，于是 `_tool_error(code=SYM, message=…)`
+    这种**纯关键字**写法被 `not node.args` 直接 `continue` 掉——既不进产出集、也不进「解析不了」，
+    整个调用点从守卫视野里**静默消失**。后果两层：
+      ① `test_produced_error_codes_are_all_consumed` 全绿放行，「Zero 把既有失效模式重切到新码 ⇒
+         我方归类被掏空 ⇒ graceful_step 静默 return None」原样走通（实证：Zero `daecce1` pin 副本 +
+         关键字实参变异下 STIM_INVALID 两集皆无、主守卫 GREEN；改回位置实参即 RED）；
+      ② 该符号反落进 ① 的 `extras` 被交给 `_warn_unconsumed_zero_codes`，而那条警告正文写死
+         「这些码**当前未出现在任何 `_tool_error(...)` 产出点**」——此时那句话是**假的**。
+    调用写法（位置 / 关键字）是 Zero 的自由，守卫不能因此变瞎：故两种一律收，
+    `**kwargs` 展开或压根没有码实参 → 归「解析不了」交调用方判红，不猜、不放过。
+    """
+    if node.args:
+        return node.args[0], ""
+    for keyword in node.keywords:
+        if keyword.arg == _ZERO_TOOL_ERROR_CODE_KWARG:
+            return keyword.value, ""
+    if any(keyword.arg is None for keyword in node.keywords):
+        return None, (
+            f"line {node.lineno}: `{_ZERO_TOOL_ERROR_FUNC}(**kwargs)` 展开，码实参无法静态定位"
+        )
+    return None, (
+        f"line {node.lineno}: `{_ZERO_TOOL_ERROR_FUNC}(...)` 既无位置实参、"
+        f"也无 `{_ZERO_TOOL_ERROR_CODE_KWARG}=` 关键字实参"
+    )
+
+
+def _zero_produced_error_code_symbols(tree: ast.Module) -> tuple[set[str], list[str]]:
+    """取 Zero **真正会发到 wire 上**的码符号（`_tool_error(<SYM>, …)` 的码实参）。
+
+    码实参 = 位置 0 **或** 关键字 `code=`（见 `_tool_error_code_argument`）。
+
+    返回 `(可解析的码符号集, 解析不了的实参描述列表)`。
+
+    为什么必须把「产出」与「定义」分开看（本轮 blocker 的核心）：
+    - **定义**（顶层 `ZERO_ERROR_CODE_* = "…"` + 登记表）只说明这个码**存在**。Zero 可以先登记
+      后产出——`timeout-step` 至今就是「只登记不产出」，这是双方明知且认可的状态。
+    - **产出**才决定消费侧要不要有归类。任何出现在 `_tool_error(...)` 码实参上的码，都可能在
+      下一次调用里落到本仓 `_exception_for_error_text`；查表落空 ⇒ 退回基类 `ZeroLinkCallError`
+      ⇒ 被 `graceful_step` 的 `except (ZeroLinkCallError, …)` 兜住 ⇒ **静默 return None**。
+
+    ⚠ 只认 `Name` 实参：写成变量/f-string/属性访问就无法静态判定该出口发的是哪个码，
+    此时守卫是**瞎的**，故一律进返回值的第二项交由调用方判红——不猜、不放过。
+    ⚠ 定位不到码实参（`**kwargs` / 无实参）同样进第二项，**绝不 `continue` 跳过**：
+    「跳过」= 两个集合都不进 = 守卫对该调用点失明却报绿，正是本轮 blocker 的形状。
+    """
+    produced: set[str] = set()
+    unresolvable: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != _ZERO_TOOL_ERROR_FUNC:
+            continue
+        code_arg, why = _tool_error_code_argument(node)
+        if code_arg is None:
+            unresolvable.append(why)
+            continue
+        if isinstance(code_arg, ast.Name) and code_arg.id.startswith(_ZERO_CODE_SYMBOL_PREFIX):
+            produced.add(code_arg.id)
+        else:
+            unresolvable.append(f"line {code_arg.lineno}: {ast.dump(code_arg)[:120]}")
+    return produced, unresolvable
+
+
+def _zero_module_assigned_names(tree: ast.Module) -> set[str]:
+    """Zero 顶层被赋值的全部名字（含 `A = …` 与 `A: T = …`）。
+
+    形态判定只看**名字在不在**，不看右值形状：Zero 把某个码改成计算式/把登记表改成 set 字面量
+    时，形态仍是 token，由各自那条断言给出**精确**的红（「值不是字面量」「登记表解析不了」），
+    而不是被形态判定笼统吞成 unrecognized。
+    """
+    names: set[str] = set()
+    for node in tree.body:
+        targets, _ = _module_assign_targets(node)
+        names.update(targets)
+    return names
+
+
+def _zero_top_level_func_names(tree: ast.Module) -> set[str]:
+    """Zero 顶层函数名集合（含 `async def`）——与 `_zero_top_level_func` 同一口径。"""
+    return {node.name for node in tree.body if isinstance(node, _FUNC_DEF_NODES)}
+
+
+def _zero_module_str_literal(tree: ast.Module, name: str) -> str | None:
+    """取 Zero 顶层 `name = "字面量"` 的字符串值；不是字符串字面量赋值 → None。"""
+    for node in tree.body:
+        targets, value = _module_assign_targets(node)
+        if name in targets and isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+    return None
+
+
+def _zero_error_code_shape_signals(tree: ast.Module) -> dict[str, bool]:
+    """形态判定的四个原子信号（单独暴露，便于红文案里直接把实测信号打出来）。"""
+    assigned = _zero_module_assigned_names(tree)
+    func_names = _zero_top_level_func_names(tree)
+    return {
+        "code_symbols": any(name.startswith(_ZERO_CODE_SYMBOL_PREFIX) for name in assigned),
+        "registry": _ZERO_CODE_REGISTRY_NAME in assigned,
+        "tool_error_func": _ZERO_TOOL_ERROR_FUNC in func_names,
+        "legacy_marker_literal": _zero_module_str_literal(tree, _ZERO_LEGACY_ALIAS_NAME)
+        is not None,
+    }
+
+
+def _zero_error_code_shape(tree: ast.Module) -> str:
+    """判 Zero 机读错误码机制的形态：token / legacy-bare-prefix / unrecognized。
+
+    纯函数（只吃 AST），故可用**合成源码**逐形态实证判别力，见
+    `TestZeroErrorCodeShapeClassifier`。
+    """
+    signals = _zero_error_code_shape_signals(tree)
+    token_parts = (signals["code_symbols"], signals["registry"], signals["tool_error_func"])
+    if all(token_parts):
+        return _SHAPE_TOKEN
+    if not any(token_parts) and signals["legacy_marker_literal"]:
+        return _SHAPE_LEGACY
+    return _SHAPE_UNRECOGNIZED
+
+
+def _consumed_non_degradable_symbols() -> frozenset[str]:
+    """本仓**已消费**码里归入不可降级族（`ZeroLinkNonDegradableError`）的那些**符号名**。
+
+    单一真相：族归属一律从 `client._CODE_TO_EXCEPTION` 现算，不再在多处手抄
+    （legacy skip 文案与 m9 反向守卫都要用，两处各算一次迟早分叉）。
+    """
+    from src.mcp.zero import client as zero_client
+
+    return frozenset(
+        symbol
+        for symbol in _EXPECTED_ZERO_ERROR_CODE_SYMBOLS
+        if issubclass(
+            zero_client._CODE_TO_EXCEPTION[getattr(zero_client, symbol)],
+            zero_client.ZeroLinkNonDegradableError,
+        )
+    )
+
+
+def _legacy_shape_skip_reason() -> str:
+    """legacy 形态的 skip 文案——**能力面按实际覆盖算**，不写「零回归的老部署」这种漂亮话。
+
+    ⚠ 订正（本轮）：旧文案写的是「这不是码表回归——兼容层仍消费该形态」，读起来像是 legacy 下
+    一切照旧。**不成立**：兼容层 `_LEGACY_UNKNOWN_SESSION_RE` 只覆盖 `unknown-session` 一个码，
+    其余码在裸前缀形态的 wire 上**根本不存在** ⇒ 全部落基类 ⇒ 连「上抛不吞」的不可降级族
+    也一并失效。故这里把 **可用/总数** 与**失效的不可降级码**逐个算出来写进文案，
+    数字随两侧集合自动更新，不会烂在注释里。
+    """
+    total = len(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS)
+    covered = sorted(_LEGACY_COMPAT_COVERED_SYMBOLS)
+    lost = sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS - _LEGACY_COMPAT_COVERED_SYMBOLS)
+    lost_non_degradable = sorted(_consumed_non_degradable_symbols().intersection(lost))
+    return (
+        f"[shape={_SHAPE_LEGACY}] Zero 工作副本处于**令牌换代前**形态："
+        f"无 {_ZERO_CODE_SYMBOL_PREFIX}* 常量 / 无 {_ZERO_CODE_REGISTRY_NAME} 登记表 / 无 "
+        f"{_ZERO_TOOL_ERROR_FUNC}()，只有裸前缀 `{_ZERO_LEGACY_ALIAS_NAME}`。\n"
+        f"  码表类断言此刻**没有比较对象** → 跳过；形态本身由 `test_error_code_mechanism_shape` "
+        f"正面断言（含「本仓兼容层仍能识别该形态」）。\n"
+        f"  🛑 但这**不等于老部署零回归**：该形态下本仓只有 **{len(covered)}/{total}** 个码可用"
+        f"（{covered}，靠 `_LEGACY_UNKNOWN_SESSION_RE` 兜底）；其余 {len(lost)} 个码在 wire 上"
+        f"根本不存在 ⇒ 全部落基类 ZeroLinkCallError，其中 {len(lost_non_degradable)} 个"
+        f"**不可降级**码的「上抛不吞」整体失效（{lost_non_degradable}）"
+        f"——它们会被 graceful_step 静默降级成 None。\n"
+        f"  即：legacy 是**能力残缺但可运行**的过渡态，不是「和换代后一样」。"
+        f"若要求所连 Zero 必须已换代，设 {STRICT_ENV}=1 重跑——本条即转 fail。"
+    )
+
+
+def _unrecognized_shape_message(tree: ast.Module) -> str:
+    """unrecognized 形态的红文案：与「码被删」的文案分属两句话，不混。
+
+    ⚠ 订正（本轮）：旧文案一律断言「半拉子形态 = 契约结构改了或改到一半」。**对早期 ref 是错的**
+    ——Zero 在令牌机制落地**之前**的历史 ref 里四个信号全为假，同样落 unrecognized，那不是
+    「改到一半」而是「压根还没有过这套机制」。成因不同、处置也不同（换 ref / 确认部署版本
+    vs 重核消费口径），故按信号分两支写，不再对近三分之一的历史 ref 给出错误归因。
+    """
+    signals = _zero_error_code_shape_signals(tree)
+    if not any(signals.values()):
+        cause = (
+            "  成因：**四个信号全为假 = 该副本从未有过任何机读错误码机制**"
+            "（令牌与裸前缀都不在）。\n"
+            "  这**不是**「改到一半」——Zero 在令牌机制落地之前的历史 ref 就长这样。\n"
+            "  处置：确认所连副本的版本 / 换到已落地机读码的 ref，本仓消费口径无从对接。"
+        )
+    else:
+        cause = (
+            "  成因：**部分信号为真 = 契约结构改了或改到一半**（有的部件在、有的不在）。\n"
+            "  处置：重核本仓消费口径（classify_zero_error 的令牌正则 + 旧裸前缀兼容层）"
+            "与 Zero 侧改动的对应关系。"
+        )
+    return (
+        f"[shape={_SHAPE_UNRECOGNIZED}] Zero 机读错误码机制**两套形态都认不出**"
+        f"（{_ZERO_SERVER_PY}）：\n"
+        f"  实测信号：{signals}\n"
+        f"  token 形态要求同时具备：{_ZERO_CODE_SYMBOL_PREFIX}* 常量 · "
+        f"{_ZERO_CODE_REGISTRY_NAME} 登记表 · 顶层 {_ZERO_TOOL_ERROR_FUNC}()；\n"
+        f"  legacy 形态要求三者全无、且 `{_ZERO_LEGACY_ALIAS_NAME}` 是顶层字符串字面量。\n"
+        f"{cause}\n"
+        "无论哪种成因，都**不得按任一形态放行**。"
+    )
+
+
+def _zero_token_shape_tree_or_skip() -> ast.Module:
+    """码表类断言的统一入口：token 形态才继续；legacy → skip（专用文案）；认不出 → 红。"""
+    tree = _zero_server_tree_or_skip()
+    shape = _zero_error_code_shape(tree)
+    if shape == _SHAPE_TOKEN:
+        return tree
+    if shape == _SHAPE_LEGACY:
+        pytest.skip(_legacy_shape_skip_reason())
+    pytest.fail(_unrecognized_shape_message(tree))
+
+
+def _warn_unconsumed_zero_codes(where: str, extra: Iterable[str]) -> None:
+    """Zero 侧**定义了但尚未产出**、且本仓未消费的码 → 日常告警，STRICT 下判红。
+
+    适用范围已收窄（本轮 blocker 的一半修法）：**真正会发到 wire 上的码**由
+    `test_produced_error_codes_are_all_consumed` 在**所有模式**下判红，不走本函数。
+    留给本函数的只是「定义了还没产出」的前瞻信号（`timeout-step` 就属此类：Zero 先登记、
+    我方先落归类）。这类码今天确实伤不到人，但它是**产出即将到来**的预告，
+    所以联调/发版门（`ZERO_LINK_E2E_STRICT=1`）上必须变成红，逼一次分类决策；
+    日常开发仍只出警告，零打扰。
+    """
+    from tests.mcp.conftest import zerorepo_strict_enabled
+
+    extras = sorted(extra)
+    if not extras:
+        return
+    message = (
+        f"Zero 定义了本仓尚未消费的机读错误码（{where}）：{extras}。"
+        "这些码**当前未出现在任何 `_tool_error(...)` 产出点**，故还伤不到消费侧"
+        "（真产出的码由 test_produced_error_codes_are_all_consumed 全模式判红）。"
+        "但登记通常意味着产出在路上：请判断它们各自的归类（可重试 / 须重开会话 / "
+        "调用方传参错 / 部署端问题），并同步 client._CODE_TO_EXCEPTION 与本文件 "
+        "_EXPECTED_ZERO_ERROR_CODE_SYMBOLS。"
+    )
+    if zerorepo_strict_enabled():
+        pytest.fail(
+            f"[{STRICT_ENV}] {message}\n"
+            f"（STRICT 是联调/发版门：跨仓码表的**任何**单边增量都要求当场表态，不接受挂账告警。"
+            f"确认这些码确实无需归类后，不设 {STRICT_ENV} 重跑。）"
+        )
+    warnings.warn(message, stacklevel=2)
+
+
 @pytest.mark.zerorepo
 class TestZeroErrorCodeCrosscheck:
-    """Zero 机读错误码全表跨仓一致——符号集 / 逐符号值 / 令牌格式 / 旧别名。
+    """Zero 机读错误码跨仓一致——形态诊断 / 已消费码在位 / 逐符号值 / 登记 / 令牌格式 / 旧别名。
 
-    D:\\Zero 或 server.py 不在位 → skip（不拖红）；**在位但结构对不上 → 红**。
+    D:\\Zero 或 server.py 不在位 → skip（环境缺口，不拖红）；**在位但结构对不上 → 红**。
+    Zero 处于换代前的 legacy 形态 → 码表类断言 skip（专用文案，STRICT 下转 fail），
+    形态本身仍由 `test_error_code_mechanism_shape` 正面断言。判定与理由见本节顶部长注释。
     """
 
-    def test_error_code_symbol_set_matches_expectation(self) -> None:
-        """① Zero 顶层 `ZERO_ERROR_CODE_*` 符号集 == 本仓独立期望集（改名/增删码即红）。"""
-        tree = _zero_server_tree_or_skip()
-        zero_symbols = frozenset(_zero_error_code_literals(tree))
+    def test_error_code_mechanism_shape(self) -> None:
+        """⓪ **形态诊断**：Zero 必须处于 token 或 legacy 之一；两者都认不出即红。
 
-        assert zero_symbols == _EXPECTED_ZERO_ERROR_CODE_SYMBOLS, (
-            f"Zero 机读错误码**符号集**跨仓漂移（{_ZERO_SERVER_PY}）：\n"
-            f"  Zero 有而本仓未期望：{sorted(zero_symbols - _EXPECTED_ZERO_ERROR_CODE_SYMBOLS)}\n"
-            f"  本仓期望而 Zero 无：{sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS - zero_symbols)}\n"
-            "两仓须协调：新增码要同步 client._CODE_TO_EXCEPTION 的归类（可重试 / 须重开会话 / "
-            "调用方传参错 / 部署端问题），否则新码落基类被静默降级。"
+        本条是双态化的**唯一** skip 豁免出口，故它自己不允许被形态门放行——它直接读树。
+        legacy 分支不是「什么都不查就绿」：还要正面核**本仓兼容层此刻确实认得该形态**，
+        否则「旧 ref 也绿」就退化成恒真式（pitfalls ⑥）。
+        """
+        tree = _zero_server_tree_or_skip()
+        shape = _zero_error_code_shape(tree)
+
+        assert shape in (_SHAPE_TOKEN, _SHAPE_LEGACY), _unrecognized_shape_message(tree)
+        if shape == _SHAPE_TOKEN:
+            return
+
+        # ── legacy 分支：绿的前提是「本仓兼容层还活着」，逐条正证 ──
+        from src.mcp.zero.client import ZERO_ERROR_CODE_UNKNOWN_SESSION, classify_zero_error
+
+        marker = _zero_module_str_literal(tree, _ZERO_LEGACY_ALIAS_NAME)
+        assert marker == ZERO_ERROR_CODE_UNKNOWN_SESSION, (
+            f"[shape={_SHAPE_LEGACY}] Zero 换代前形态的裸前缀 `{_ZERO_LEGACY_ALIAS_NAME}`="
+            f"{marker!r}，≠ 本仓兼容层认的 {ZERO_ERROR_CODE_UNKNOWN_SESSION!r}"
+            f"（{_ZERO_SERVER_PY}）。老部署形态也**不是**随便什么都收：值对不上即本仓识别不了。"
+        )
+        # 按 legacy 真 wire 形态渲染（FastMCP 会加 "Error executing tool <name>: " 外壳 ⇒
+        # 裸前缀在 wire 上**不在位置 0**，正是 `_LEGACY_UNKNOWN_SESSION_RE` 存在的理由）。
+        legacy_wire = f"Error executing tool zero.step: {marker}: 未知 session_id='s-1'"
+        assert classify_zero_error(legacy_wire) == ZERO_ERROR_CODE_UNKNOWN_SESSION, (
+            f"[shape={_SHAPE_LEGACY}] 本仓 classify_zero_error 已认不出换代前形态的 wire 文本："
+            f"{legacy_wire!r}。若本仓已撤 `_LEGACY_UNKNOWN_SESSION_RE` 兼容层，就**不能**再把 "
+            "legacy 形态当受支持部署放行——请把本节的 legacy 分支一并撤除（改判红）。"
+        )
+
+    def test_consumed_error_code_symbols_present_in_zero(self) -> None:
+        """① 本仓**已消费**的码符号必须在 Zero 侧全部在位（删/改名 ⇒ 红）。
+
+        单向包含而非等号：Zero 新增我方尚未消费的码 → 不红，改发 UserWarning（可见）。
+        「已消费」≡ `client._CODE_TO_EXCEPTION` 的键，这条等价由
+        `TestExpectedCodeSetMatchesConsumption` 钉死——否则本条放宽就会漏掉真回归。
+        """
+        tree = _zero_token_shape_tree_or_skip()
+        zero_symbols = frozenset(_zero_error_code_literals(tree))
+        missing = _EXPECTED_ZERO_ERROR_CODE_SYMBOLS - zero_symbols
+        extras = zero_symbols - _EXPECTED_ZERO_ERROR_CODE_SYMBOLS
+
+        # ⚠ 顺序：告警**先于** missing 断言。一次改动同时含「改名」与「新增」时（跨仓最常见的
+        # 形态），若 assert 先执行，新增信息永远打不出来，读的人只看见「某码没了」、看不见
+        # 「旁边多了个新码」——恰恰是判断「是删除还是改名/重切分」最关键的那半条线索。
+        # （STRICT 下本调用会 fail 而抢在 missing 前面；missing 不会因此丢失——
+        #   ② `test_error_code_values_match_client_constants` 对每个期望符号也断言在位。）
+        #
+        # ⚠ 只把「定义了但**没有产出点**」的那部分交给告警：已经会发到 wire 上的码归
+        # `test_produced_error_codes_are_all_consumed` 全模式判红，混进告警会让文案说谎
+        # （警告正文明写「当前未出现在任何 _tool_error 产出点」）。
+        produced, _ = _zero_produced_error_code_symbols(tree)
+        _warn_unconsumed_zero_codes("顶层常量：定义但无产出点", extras - produced)
+        assert not missing, (
+            f"本仓**已消费**的 Zero 机读错误码在 Zero 侧消失/改名（{_ZERO_SERVER_PY}）：\n"
+            f"  缺失符号：{sorted(missing)}\n"
+            f"  Zero 现有：{sorted(zero_symbols)}\n"
+            f"  其中本仓未消费的新码：{sorted(extras)}（改名/重切分的线索通常在这里）\n"
+            "这是**真回归**：本仓 client._CODE_TO_EXCEPTION 对这些码的归类将永远查不到 → "
+            "该类错误退化成基类 ZeroLinkCallError、重试/重开会话的判别静默失效。"
+        )
+
+    def test_produced_error_codes_are_all_consumed(self) -> None:
+        """①′ Zero **真会发到 wire 上**的码必须全部在本仓消费集内（全模式判红）。
+
+        🛑 本条是本轮补的**主守卫**，补的是「① 从等号放宽成单向包含」丢掉的那类真回归：
+        **Zero 把一个既有失效模式重新切分到新码**。
+
+        实证（Zero `daecce1` 真副本，纯新增变异：加 `ZERO_ERROR_CODE_STIM_INVALID = "stim-invalid"`
+        + 登记 + 把 `zero.step` 里「stim/external_priors 载荷不合法」那一支从 payload-invalid
+        改发新码）——注意这不是「多一条没归类的新错误」，而是**既有归类被掏空**：
+
+            payload-invalid → ZeroLinkCallerFaultError
+                              （NonDegradable，graceful_step 契约明写「上抛不吞」）
+            stim-invalid    → 查表落空 → 基类 ZeroLinkCallError（可降级）
+                            → 被 `except (ZeroLinkCallError, …)` 兜住 → **静默 return None**
+
+        即「调用方 bug 每轮被悄悄吞掉」，正是 graceful_step docstring 点名要避免的失效模式。
+        改造前的等号断言会红并强制两仓协调；只剩单向包含 + UserWarning 时**看板全绿**
+        （实测该变异下 ①②③④⑤ 6/6 全绿，仅多一条没人看的警告）。
+
+        为什么判据是「产出」而不是「定义」：定义了不产出是**双方认可的正常态**
+        （`timeout-step` 至今如此，Zero 只登记、我方先落归类），对它判红是纯噪音；
+        而任何进了 `_tool_error(...)` 的码都可能下一秒落到本仓查表上。
+        这条线把「不该红的单边升级」与「必须红的错误面变更」精确分开——
+        既没退回会假红的全表等号，也不再对真回归睁一只眼。
+        """
+        tree = _zero_token_shape_tree_or_skip()
+        produced, unresolvable = _zero_produced_error_code_symbols(tree)
+
+        assert not unresolvable, (
+            f"Zero `{_ZERO_TOOL_ERROR_FUNC}(...)` 的码实参**不是**可静态解析的 "
+            f"{_ZERO_CODE_SYMBOL_PREFIX}* 符号（{_ZERO_SERVER_PY}）：\n"
+            f"  {unresolvable}\n"
+            "这些出口发的是哪个码无法判定 ⇒ 本守卫对它们是瞎的，不能按「没问题」放行。"
+            "请与 Zero 协调保持产出点写死符号常量，或改本守卫的解析口径。"
+        )
+        # 防恒真式（pitfalls ⑥）：Zero 改掉 `_tool_error` 的名字会让产出集变空，
+        # 空集恒 ⊆ 任何集合 ⇒ 下面那条断言永远绿。空集必须自己先红。
+        assert produced, (
+            f"Zero 源码里找不到任何 `{_ZERO_TOOL_ERROR_FUNC}(<{_ZERO_CODE_SYMBOL_PREFIX}*>, …)` "
+            f"产出点（{_ZERO_SERVER_PY}）——但形态判定认为它处于 token 形态。"
+            "构造函数被改名/改签名了，本守卫的产出集会恒空、下面的包含断言退化成恒真式。"
+        )
+
+        literals = _zero_error_code_literals(tree)
+        undefined = sorted(symbol for symbol in produced if symbol not in literals)
+        assert not undefined, (
+            f"Zero 产出点用了**没有字面量定义**的码符号：{undefined}"
+            f"（{_ZERO_SERVER_PY}）。本仓无法核对其码值，跨仓契约不接受「大概是这个值」。"
+        )
+
+        unconsumed = sorted(produced - _EXPECTED_ZERO_ERROR_CODE_SYMBOLS)
+        assert not unconsumed, (
+            f"Zero 会**产出**、而本仓**未消费**的机读错误码（{_ZERO_SERVER_PY}）：\n"
+            f"  {[(symbol, literals[symbol]) for symbol in unconsumed]}\n"
+            f"  Zero 全部产出点：{sorted(produced)}\n"
+            f"  本仓消费集：{sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS)}\n"
+            "🛑 这**不是**「多一条没归类的新错误」那么轻：若该码接管的是某个既有失效模式"
+            "（Zero 把一支从旧码切到新码），本仓对那个失效模式的归类就被**掏空**——\n"
+            "  · 原本 ZeroLinkNonDegradableError（上抛不吞）"
+            "退化成基类 ZeroLinkCallError（可降级）；\n"
+            "  · graceful_step 的 `except (ZeroLinkCallError, …)` 把它兜住"
+            " → **每轮静默 return None**；\n"
+            "  · 观测上与「偶发抖动」不可区分，看板只见帧率下降、不见根因。\n"
+            "处置：为每个码在 client._CODE_TO_EXCEPTION 里做出**明确的族归属决定**"
+            "（可降级 / 不可降级），并同步本文件 _EXPECTED_ZERO_ERROR_CODE_SYMBOLS；"
+            "确属我方不调用的工具专有码时，也要在两处留下书面判断，不得靠一条警告挂账。"
+        )
+
+    def test_non_degradable_consumed_codes_are_still_produced_by_zero(self) -> None:
+        """①″ **反方向**：本仓标为**不可降级**的码，Zero 侧必须仍有产出点（撤产出点即红）。
+
+        🛑 补的是 m9——此前四条守卫全是「Zero 产出的码是否被我方消费」**单向**的，
+        「我方消费的码是否还有人产出」无人看。实测（Zero `daecce1` pin 副本 + 撤产出点变异）：
+        把 `deploy-env-invalid` 那个 `raise _tool_error(...)` 整个换成裸 `raise ValueError(...)`
+        —— 符号仍定义、仍登记、令牌前缀不动 ⇒ ①①′②③④⑤ **全绿**；而消费侧那条 wire 上
+        **没有令牌** ⇒ `classify_zero_error` 返回 None ⇒ `_exception_for_error_text` 直接回
+        基类 `ZeroLinkCallError`（NonDegradable=False）⇒ 被 `graceful_step` 的 except 元组兜住
+        ⇒ 「部署端 env 错」这类**改传参永远改不好**的故障被**每轮静默吞掉**，
+        观测上与偶发抖动不可区分——正是 `ZeroLinkNonDegradableError` docstring 点名要避免的。
+
+        **为什么只对不可降级族强制**（取舍要写清，不是图省事）：
+        - 对**全部**已消费码强制「必须有产出点」会当场假红：`timeout-step` 是双方明知的
+          「只登记不产出」正常态（Zero 执行超时尚未实现，我方先把分类落到位）。把它拖红
+          等于逼两仓为一个**已协商过**的状态返工，几轮之后这条守卫就会被加豁免名单架空。
+        - 可降级码撤产出点的后果是「本来就会降级的东西继续降级」——观测面不变，不值得判红。
+        - 不可降级族不同：它的**全部价值**就是「这条错误不许被吞」。产出点一旦消失，
+          该保证静默归零，且**没有任何其它守卫会红**。故这一族的产出点本身即契约的一部分。
+        - 方向上仍是**单向**的：只要求「我方标不可降级的码在 Zero 有产出点」，不要求反向；
+          Zero 加码/加产出点由 ①′ 管，不会因为对方演进而假红。
+        """
+        tree = _zero_token_shape_tree_or_skip()
+        produced, _ = _zero_produced_error_code_symbols(tree)
+
+        non_degradable = _consumed_non_degradable_symbols()
+        # 防恒真式（pitfalls ⑥）：若不可降级族恰好为空，下面的差集恒空 ⇒ 永远绿。空集必须自己先红。
+        assert non_degradable, (
+            "本仓已消费码里**一个不可降级码都没有**——本条断言会退化成恒真式。"
+            "若确已取消整个 ZeroLinkNonDegradableError 族，请连同本条一并重写。"
+        )
+
+        vanished = sorted(non_degradable - produced)
+        assert not vanished, (
+            f"本仓标为**不可降级**、而 Zero 侧已**没有任何产出点**的码（{_ZERO_SERVER_PY}）：\n"
+            f"  {vanished}\n"
+            f"  Zero 全部产出点：{sorted(produced)}\n"
+            "🛑 符号还在、登记还在、令牌格式也没变，所以其余几条守卫**都不会红**——"
+            "但那条 wire 上从此没有令牌：\n"
+            "  · classify_zero_error → None → _exception_for_error_text 回基类 "
+            "ZeroLinkCallError（可降级）；\n"
+            "  · graceful_step 的 `except (ZeroLinkCallError, …)` 兜住 → **每轮静默 "
+            "return None**；\n"
+            "  · 「上抛不吞」这条对不可降级族的**唯一**承诺就此静默失效。\n"
+            "处置：与 Zero 核实该失效模式是**真的没有了**（则两仓同步删码与归类），"
+            "还是被**改成了别的码 / 裸异常**（则要么恢复产出点，要么把新码纳入 "
+            "client._CODE_TO_EXCEPTION 并给出族归属）。"
         )
 
     def test_error_code_values_match_client_constants(self) -> None:
         """② **逐符号**比对码值：Zero 字面量 == 本仓 client 同名常量（值单边漂移即红）。
 
         本仓那份字面量独立写在 `src/mcp/zero/client.py`，故本条不是恒真式。
-        另断言两侧全表（值集合）相等——防「符号对上但登记表漏一条」。
+        全表方向也是**单向**：本仓 `ZERO_ERROR_CODES` ⊆ Zero 侧字面量全集
+        （本仓有而 Zero 无 → 红；Zero 多出 → 由 ① 告警，不红）。
         """
-        tree = _zero_server_tree_or_skip()
+        tree = _zero_token_shape_tree_or_skip()
         zero_literals = _zero_error_code_literals(tree)
 
         from src.mcp.zero import client as zero_client
 
         for symbol in sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS):
             assert symbol in zero_literals, (
-                f'Zero 未定义 `{symbol} = "…"`（{_ZERO_SERVER_PY}）——见符号集断言。'
+                f'Zero 未定义 `{symbol} = "…"`（{_ZERO_SERVER_PY}）——见 ① 已消费码在位断言。'
             )
             ours = getattr(zero_client, symbol, None)
             assert ours is not None, f"本仓 client 缺同名常量 `{symbol}`，两仓须同步。"
@@ -751,27 +1300,33 @@ class TestZeroErrorCodeCrosscheck:
                 f"本仓 client={ours!r}。改值会让本仓查表落空 → 归类退化成基类、静默降级。"
             )
 
-        assert frozenset(zero_literals.values()) == zero_client.ZERO_ERROR_CODES, (
-            f"机读码**全表**跨仓不等：Zero={sorted(zero_literals.values())}，"
-            f"本仓 ZERO_ERROR_CODES={sorted(zero_client.ZERO_ERROR_CODES)}。"
+        zero_values = frozenset(zero_literals.values())
+        assert zero_client.ZERO_ERROR_CODES <= zero_values, (
+            f"本仓 ZERO_ERROR_CODES 有而 Zero 侧不存在的码值："
+            f"{sorted(zero_client.ZERO_ERROR_CODES - zero_values)}"
+            f"（Zero={sorted(zero_values)}）。本仓在消费一个对方已不产出的码。"
         )
 
-    def test_zero_registry_lists_every_code_symbol(self) -> None:
-        """③ Zero 的 `ZERO_ERROR_CODES` 登记表列全所有码符号（防「定义了码却漏登记」）。
+    def test_zero_registry_lists_every_consumed_code_symbol(self) -> None:
+        """③ Zero 的 `ZERO_ERROR_CODES` 登记表列全**本仓已消费**的码符号。
 
-        Zero `_tool_error` 对未登记码构造即抛，故漏登记 = 该错误出口在 Zero 侧直接崩；
-        本仓也拿不到该码。两仓都受害，故此结构也要 pin。
+        Zero `_tool_error` 对未登记码构造即抛，故漏登记 = 该错误出口在 Zero 侧直接崩、
+        本仓也永远拿不到该码。两仓都受害，故此结构也要 pin。
+        Zero 登记了我方未消费的码 → 不红（① 已告警）；我方消费的码定义了却漏登记 → 红。
         """
-        tree = _zero_server_tree_or_skip()
+        tree = _zero_token_shape_tree_or_skip()
         registry = _zero_registry_symbols(tree)
 
         assert registry is not None, (
             f"Zero 未找到 `{_ZERO_CODE_REGISTRY_NAME} = frozenset({{…}})` 的可解析定义"
             f"（{_ZERO_SERVER_PY}）——契约结构变了，本仓消费/守卫都要跟。"
         )
-        assert frozenset(registry) == _EXPECTED_ZERO_ERROR_CODE_SYMBOLS, (
-            f"Zero `{_ZERO_CODE_REGISTRY_NAME}` 登记的符号 {sorted(registry)} "
-            f"≠ 本仓期望 {sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS)}。"
+        registered = frozenset(registry)
+        unregistered = _EXPECTED_ZERO_ERROR_CODE_SYMBOLS - registered
+        assert not unregistered, (
+            f"本仓已消费的码在 Zero `{_ZERO_CODE_REGISTRY_NAME}` 里**漏登记**："
+            f"{sorted(unregistered)}（Zero 登记了 {sorted(registered)}）。"
+            f"Zero `{_ZERO_TOOL_ERROR_FUNC}` 对未登记码构造即抛 ⇒ 该错误出口一触发就崩。"
         )
 
     def test_token_prefix_pinned(self) -> None:
@@ -779,7 +1334,7 @@ class TestZeroErrorCodeCrosscheck:
 
         这是**格式契约**本身：上一轮的死码正是「格式不对」而非「码值不对」，故必须单独 pin。
         """
-        tree = _zero_server_tree_or_skip()
+        tree = _zero_token_shape_tree_or_skip()
         prefix = _zero_tool_error_token_prefix(tree)
 
         assert prefix is not None, (
@@ -804,8 +1359,9 @@ class TestZeroErrorCodeCrosscheck:
 
         本仓仍导出同名别名（值相等）供历史调用点与本守卫引用；Zero 撤别名时本条红 →
         提醒同步撤除本仓别名与 `_LEGACY_UNKNOWN_SESSION_RE` 兼容分支。
+        限 token 形态：换代前形态里该名本就是字面量而非别名，那由 ⓪ 的 legacy 分支负责核。
         """
-        tree = _zero_server_tree_or_skip()
+        tree = _zero_token_shape_tree_or_skip()
         target = _zero_alias_target(tree, _ZERO_LEGACY_ALIAS_NAME)
 
         assert target == "ZERO_ERROR_CODE_UNKNOWN_SESSION", (
@@ -820,6 +1376,472 @@ class TestZeroErrorCodeCrosscheck:
 
         assert _UNKNOWN_SESSION_MARKER == ZERO_ERROR_CODE_UNKNOWN_SESSION, (
             "本仓别名与新常量值不等——两者须始终同值（Zero 侧亦然）。"
+        )
+
+
+class TestExpectedCodeSetMatchesConsumption:
+    """`_EXPECTED_ZERO_ERROR_CODE_SYMBOLS` ≡ 本仓**实际消费**的码集合（纯本仓，不需 D:\\Zero）。
+
+    这是把上面 ①②③ 从「等号」放宽成「单向包含」的**前提**：放宽后「Zero 缺我方期望的码 → 红」
+    只有在「期望集恰是我方消费集」时才等价于「真回归要红」。若有人往 client 加了新码归类却忘了
+    加进期望集，放宽后的 ① 不会红（Zero 有该码就是多出来的）——本条替它红。
+    """
+
+    def test_expected_symbols_are_exactly_the_consumed_codes(self) -> None:
+        """期望符号集映射出的码值 == `client._CODE_TO_EXCEPTION` 的键集合。"""
+        from src.mcp.zero import client as zero_client
+
+        missing_constants = sorted(
+            symbol
+            for symbol in _EXPECTED_ZERO_ERROR_CODE_SYMBOLS
+            if not hasattr(zero_client, symbol)
+        )
+        assert not missing_constants, (
+            f"本文件期望的码符号在 client 侧不存在：{missing_constants}。"
+            "期望集只应列本仓真持有常量的码。"
+        )
+
+        expected_values = {
+            getattr(zero_client, symbol) for symbol in _EXPECTED_ZERO_ERROR_CODE_SYMBOLS
+        }
+        consumed_values = set(zero_client._CODE_TO_EXCEPTION)
+        expected_only = sorted(expected_values - consumed_values)
+        consumed_only = sorted(consumed_values - expected_values)
+        assert expected_values == consumed_values, (
+            "跨仓期望集与本仓实际消费集不等——上面 ①②③ 的单向放宽会因此漏掉真回归：\n"
+            f"  期望而未消费（_CODE_TO_EXCEPTION 缺归类）：{expected_only}\n"
+            f"  已消费而未列入期望（跨仓守卫不会盯它）：{consumed_only}\n"
+            "两处须同增同减：client._CODE_TO_EXCEPTION 与本文件 "
+            "_EXPECTED_ZERO_ERROR_CODE_SYMBOLS。"
+        )
+
+    def test_each_consumed_code_keeps_its_degradability_family(self) -> None:
+        """每个已消费码的**可降级 / 不可降级**归属逐条 pin（本仓单边悄悄降级即红）。
+
+        ⚠ **诚实说明它接不住什么**：本条只读本仓 `_CODE_TO_EXCEPTION`，因此
+        **接不住**本轮 blocker（Zero 把既有失效模式重新切分到新码）——实测在那个变异下
+        `_CODE_TO_EXCEPTION['payload-invalid'] is ZeroLinkCallerFaultError` 依旧字面成立，
+        本条**全绿**；变的是「那个码再也不会到货」，只有读 Zero 产出点的
+        `test_produced_error_codes_are_all_consumed` 能看见。两条守的不是同一件事。
+
+        本条守的是**本仓自己**的漂移：把某个码从不可降级族挪进可降级族（或反过来）是一行改动，
+        后果却是 graceful_step 的「上抛不吞 / 静默降级」当场对调。
+
+        ── 覆盖域的修法（本轮）──────────────────────────────────────────────
+        旧写法只手抄一个 `expected_non_degradable` 集合、拿它跟实测的不可降级集比。
+        漏洞：**新增一个可降级码**时，它在两个集合里都不出现 ⇒ 静默通过 ⇒ 该码的族归属
+        从没有人表过态（而「没表态」正是 blocker 那类事故的温床）。
+        现改成一张**逐码表** `_EXPECTED_CODE_DEGRADABILITY`，并把**覆盖域从
+        `_CODE_TO_EXCEPTION` 推导**：client 里有而表里没有 → 红（逼当场表态）；
+        表里有而 client 没有 → 红（陈旧条目）。
+
+        ⚠ 为什么**值**仍然手写、不从 `_CODE_TO_EXCEPTION` 推导：那样 `expected == actual`
+        就是同一份数据自己比自己 = 恒真式（pitfalls ⑥），一行族归属改动照样全绿。
+        「自动耦合」只能作用在**覆盖域**上，不能作用在**期望值**上。
+        """
+        from src.mcp.zero import client as zero_client
+
+        missing_constants = sorted(
+            symbol for symbol in _EXPECTED_CODE_DEGRADABILITY if not hasattr(zero_client, symbol)
+        )
+        assert not missing_constants, (
+            f"族归属表列了 client 里不存在的码符号：{missing_constants}。"
+            "表只应列本仓真持有常量的码。"
+        )
+
+        expected = {
+            getattr(zero_client, symbol): is_nd
+            for symbol, is_nd in _EXPECTED_CODE_DEGRADABILITY.items()
+        }
+        actual = {
+            code: issubclass(exc_type, zero_client.ZeroLinkNonDegradableError)
+            for code, exc_type in zero_client._CODE_TO_EXCEPTION.items()
+        }
+
+        # ① 覆盖域从 _CODE_TO_EXCEPTION 推导——新增码没表态即红（旧写法在这里是瞎的）
+        undeclared = sorted(set(actual) - set(expected))
+        assert not undeclared, (
+            f"client._CODE_TO_EXCEPTION 新增了本表**未表态**的码：{undeclared}。\n"
+            "每个已消费码都必须显式声明其族归属（True=不可降级/上抛不吞，False=可降级/可被"
+            "graceful_step 吞成 None）——旧写法只比「不可降级集合」，新增可降级码在两个集合里"
+            "都不出现 ⇒ 静默通过 ⇒ 该码的行为从没人审过。请在 "
+            "_EXPECTED_CODE_DEGRADABILITY 补一行，并写清判据（是否每轮必复现且 client 无法自愈）。"
+        )
+        stale = sorted(set(expected) - set(actual))
+        assert not stale, (
+            f"本表列了 client._CODE_TO_EXCEPTION 里**已不存在**的码：{stale}。"
+            "码被撤时两处须同步（另见 _EXPECTED_ZERO_ERROR_CODE_SYMBOLS）。"
+        )
+
+        # ② 逐码比对族归属（期望值独立手持 ⇒ 非恒真式）
+        flipped = sorted(code for code, is_nd in actual.items() if expected[code] != is_nd)
+        assert not flipped, (
+            "机读码的**可降级性**归属变了（graceful_step 的上抛/吞行为随之对调）：\n"
+            + "\n".join(
+                f"  · {code!r}: 期望{'不可降级(上抛)' if expected[code] else '可降级(可吞)'}"
+                f"，实际{'不可降级(上抛)' if actual[code] else '可降级(可吞)'}"
+                f"（{zero_client._CODE_TO_EXCEPTION[code].__name__}）"
+                for code in flipped
+            )
+            + "\n改动 client._CODE_TO_EXCEPTION 的族归属属于**对外行为变更**，须与 Zero 侧语义"
+            "（该错误是否每轮必复现且 client 无法自愈）一并复核后再改本表。"
+        )
+
+
+# 形态分类器的**合成源码**四态样本：不依赖 D:\Zero，故这组判别力常驻可跑（Zero 不在位也跑）。
+# 每份都只保留形态判定关心的顶层结构，避免样本随 Zero 真源码演进而失效。
+_SYNTHETIC_TOKEN_SOURCE = '''
+"""合成：换代后（token）形态。"""
+ZERO_ERROR_CODE_UNKNOWN_SESSION = "unknown-session"
+ZERO_ERROR_CODES: frozenset[str] = frozenset({ZERO_ERROR_CODE_UNKNOWN_SESSION})
+_UNKNOWN_SESSION_MARKER = ZERO_ERROR_CODE_UNKNOWN_SESSION
+
+
+def _tool_error(code: str, message: str):
+    return ToolError(f"[zero:{code}] {message}")
+'''
+
+_SYNTHETIC_LEGACY_SOURCE = '''
+"""合成：换代前（裸前缀）形态——ZERO_ERROR_CODE_* / ZERO_ERROR_CODES / _tool_error 全无。"""
+_UNKNOWN_SESSION_MARKER = "unknown-session"
+
+
+async def step(session_id: str):
+    raise ToolError(f"{_UNKNOWN_SESSION_MARKER}: 未知 session_id={session_id!r}")
+'''
+
+_SYNTHETIC_NO_MECHANISM_SOURCE = '''
+"""合成：**完全没有**任何错误码机制（两套形态都不在）。"""
+DESCRIBE_CONFIG_VERSION = 1
+
+
+async def step(session_id: str):
+    raise ToolError("未知 session_id")
+'''
+
+_SYNTHETIC_HALF_TOKEN_SOURCE = '''
+"""合成：半拉子——有码常量与 _tool_error，但登记表名没了。"""
+ZERO_ERROR_CODE_UNKNOWN_SESSION = "unknown-session"
+
+
+def _tool_error(code: str, message: str):
+    return ToolError(f"[zero:{code}] {message}")
+'''
+
+
+def _shape_of_source(source: str) -> str:
+    """合成源码 → 形态标签（分类器是纯函数，故可脱离 D:\\Zero 逐形态实证）。"""
+    return _zero_error_code_shape(ast.parse(source))
+
+
+class TestZeroErrorCodeShapeClassifier:
+    """形态分类器的判别力——四态用**合成源码**常驻实证（不需 D:\\Zero 在位）。
+
+    没有这组，「legacy 形态放绿」就只能靠人肉一次性演练背书；有了它，分类器一旦被改松
+    （比如把 legacy 分支放宽成「什么都没有也算 legacy」）立刻红。
+    """
+
+    def test_token_shape_recognized(self) -> None:
+        """① 换代后形态 → token。"""
+        shape = _shape_of_source(_SYNTHETIC_TOKEN_SOURCE)
+        assert shape == _SHAPE_TOKEN, (
+            f"换代后形态（码常量 + 登记表 + _tool_error 齐备）被判成 {shape!r}——"
+            "码表类断言会被门控挡掉，跨仓覆盖静默归零。"
+        )
+
+    def test_legacy_shape_recognized(self) -> None:
+        """④-a 换代前形态 → legacy-bare-prefix（有正证据：裸前缀字面量在位）。"""
+        shape = _shape_of_source(_SYNTHETIC_LEGACY_SOURCE)
+        assert shape == _SHAPE_LEGACY, (
+            f"换代前形态（只有裸前缀 {_ZERO_LEGACY_ALIAS_NAME}）被判成 {shape!r}——"
+            "旧 ref / 回滚会变成结构性假红，正是本次双态化要消除的失效模式。"
+        )
+
+    def test_no_mechanism_is_unrecognized_not_legacy(self) -> None:
+        """④-b **完全没有**机制 → unrecognized（判红），不得被当成 legacy 放绿。
+
+        这条是「legacy 放绿不是恒真式」的机器化保证：绿的门槛是有正证据，不是「查不到就算了」。
+        """
+        shape = _shape_of_source(_SYNTHETIC_NO_MECHANISM_SOURCE)
+        assert shape == _SHAPE_UNRECOGNIZED, (
+            f"两套机制**都不在**的源码被判成 {shape!r}（应为 {_SHAPE_UNRECOGNIZED!r}）——"
+            f"若被判 {_SHAPE_LEGACY!r}，码表类断言会整体 skip，「Zero 根本没有这套机制」也全绿，"
+            "守卫退化成恒真式（pitfalls ⑥）。legacy 分支必须坚持要正证据。"
+        )
+
+    def test_half_token_shape_is_unrecognized(self) -> None:
+        """④-c 半拉子（有码常量、缺登记表）→ unrecognized，不得按 token 放行。"""
+        shape = _shape_of_source(_SYNTHETIC_HALF_TOKEN_SOURCE)
+        assert shape == _SHAPE_UNRECOGNIZED, (
+            f"半拉子形态（有 {_ZERO_CODE_SYMBOL_PREFIX}* 却无 {_ZERO_CODE_REGISTRY_NAME}）"
+            f"被判成 {shape!r}——改到一半的契约不得按任一形态放行。"
+        )
+
+    def test_extra_code_symbol_does_not_change_token_shape(self) -> None:
+        """③ Zero 新增我方未消费的码：形态仍是 token（不影响门控，只由 ① 告警）。"""
+        extended = _SYNTHETIC_TOKEN_SOURCE + '\nZERO_ERROR_CODE_BRAND_NEW = "brand-new"\n'
+        shape = _shape_of_source(extended)
+        assert shape == _SHAPE_TOKEN, (
+            f"Zero 单边加一个我方未消费的码，形态就从 token 变成 {shape!r}——"
+            "对方新增码不该改变门控（更不该判红）。"
+        )
+
+    def test_unconsumed_code_warns_and_lists_the_code(self) -> None:
+        """③ 未消费（且未产出）的新码走 UserWarning（可见）而非断言失败，且文案点名该码。
+
+        显式清掉 STRICT：本条断言的是**日常模式**行为，不能随外部 env 变脸。
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(STRICT_ENV, raising=False)
+            with pytest.warns(UserWarning, match="ZERO_ERROR_CODE_BRAND_NEW"):
+                _warn_unconsumed_zero_codes("顶层常量", ["ZERO_ERROR_CODE_BRAND_NEW"])
+
+    def test_unconsumed_code_fails_under_strict(self) -> None:
+        """③′ 同一批入参在 `ZERO_LINK_E2E_STRICT=1` 下**转红**（联调/发版门要求当场表态）。
+
+        与上一条构成同一函数的双态实证：日常告警、STRICT 判红。没有这一对，
+        「STRICT 下会红」就只是注释里的一句话。
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            with pytest.raises(pytest.fail.Exception, match="ZERO_ERROR_CODE_BRAND_NEW"):
+                _warn_unconsumed_zero_codes("顶层常量", ["ZERO_ERROR_CODE_BRAND_NEW"])
+
+    def test_no_extra_code_emits_no_warning(self) -> None:
+        """③ 反向：没有多出的码时不得发警告（否则「可见」退化成永远在响的噪音）。"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _warn_unconsumed_zero_codes("顶层常量", [])
+        assert caught == [], (
+            f"没有多出的码却发了警告：{[str(w.message) for w in caught]}。"
+            "「对方新增码可见」靠的是警告只在真有新码时响；无条件响 = 噪音 = 没人看。"
+        )
+
+    def test_no_extra_code_does_not_fail_under_strict(self) -> None:
+        """③′ 反向：STRICT 下**没有**多出的码时不得判红（否则 STRICT 门永远过不去）。"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            _warn_unconsumed_zero_codes("顶层常量", [])  # 不抛即通过
+
+    def test_unrecognized_message_distinguishes_never_had_from_half_done(self) -> None:
+        """⑤ unrecognized 红文案按信号分两支：「从未有过」≠「改到一半」。
+
+        Zero 早期有 5 个真实历史 ref 从来没有过任何机读码机制，它们同样落 unrecognized。
+        旧文案一律写「契约结构改了或改到一半」，对这批 ref 是**错误归因**。
+        """
+        never = _unrecognized_shape_message(ast.parse(_SYNTHETIC_NO_MECHANISM_SOURCE))
+        half = _unrecognized_shape_message(ast.parse(_SYNTHETIC_HALF_TOKEN_SOURCE))
+
+        # 按**成因断言句**判别，不按「改到一半」这种会出现在否定句里的裸词
+        # （never 支正文有一句「这**不是**『改到一半』」，裸词判别会把它误当成宣称）。
+        never_claim = "四个信号全为假 = 该副本从未有过任何机读错误码机制"
+        half_claim = "部分信号为真 = 契约结构改了或改到一半"
+
+        assert never_claim in never, f"「从未有过」支的成因句没写对：\n{never}"
+        assert half_claim not in never, (
+            f"对「从未有过任何机制」的历史 ref 仍宣称「改到一半」——错误归因：\n{never}"
+        )
+        assert half_claim in half, f"「半拉子」支的成因句丢了：\n{half}"
+        assert never_claim not in half, (
+            f"半拉子形态被说成「从未有过机制」——同样是错误归因：\n{half}"
+        )
+
+    def test_produced_symbols_extracted_from_tool_error_call_sites(self) -> None:
+        """⑥ 产出集提取：只收 `_tool_error(<SYM>, …)` 第一实参上的码符号。
+
+        判别力要点：**定义/登记了但没有产出点**的码**不得**被算进产出集
+        （否则「定义 vs 产出」的区分就没了，`timeout-step` 这类正常态会被误判成必须消费）。
+        """
+        source = _SYNTHETIC_TOKEN_SOURCE + (
+            '\nZERO_ERROR_CODE_DEFINED_ONLY = "defined-only"\n'
+            'ZERO_ERROR_CODE_PRODUCED = "produced"\n'
+            "\n\ndef boom():\n"
+            "    raise _tool_error(ZERO_ERROR_CODE_PRODUCED, 'x')\n"
+        )
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert unresolvable == [], f"合成源码里没有动态码实参，却报了：{unresolvable}"
+        assert produced == {"ZERO_ERROR_CODE_PRODUCED"}, (
+            f"产出集提取错：{sorted(produced)}。"
+            "只有出现在 _tool_error(...) 第一实参上的码才算产出；"
+            "ZERO_ERROR_CODE_DEFINED_ONLY 只定义未产出，混进来就等于把「先登记后产出」这一"
+            "双方认可的正常态误判成回归。"
+        )
+
+    def test_produced_extractor_flags_dynamic_code_argument(self) -> None:
+        """⑥ 码实参不是符号常量（变量/表达式）时必须报告为**解析不了**，不得静静漏掉。"""
+        source = _SYNTHETIC_TOKEN_SOURCE + (
+            "\n\ndef boom(code: str):\n    raise _tool_error(code, 'x')\n"
+        )
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert produced == set(), f"动态实参被当成码符号收了：{sorted(produced)}"
+        assert len(unresolvable) == 1, (
+            f"动态码实参未被标记为解析不了：{unresolvable}。"
+            "漏标 = 守卫对该出口是瞎的却报绿，正是「检查比消费方宽松」那类失效。"
+        )
+
+    def test_produced_extractor_reads_keyword_code_argument(self) -> None:
+        """⑥ **关键字实参**产出点必须与位置实参**同等**收进产出集（本轮 blocker 的机器化保证）。
+
+        旧实现 `if … or not node.args: continue` 让 `_tool_error(code=SYM, …)` 两个集合都不进：
+        主守卫全绿，且该符号反落进 ①「定义但无产出点」的告警——那条告警正文写死
+        「当前未出现在任何 `_tool_error(...)` 产出点」，此时是**假话**。
+        """
+        source = _SYNTHETIC_TOKEN_SOURCE + (
+            '\nZERO_ERROR_CODE_KWARG_ONLY = "kwarg-only"\n'
+            "\n\ndef boom():\n"
+            "    raise _tool_error(code=ZERO_ERROR_CODE_KWARG_ONLY, message='x')\n"
+        )
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert unresolvable == [], f"关键字实参被误判成解析不了：{unresolvable}"
+        assert produced == {"ZERO_ERROR_CODE_KWARG_ONLY"}, (
+            f"关键字实参产出点没被收进产出集：{sorted(produced)}。"
+            "位置/关键字是 Zero 的调用写法自由，守卫不能因此失明——"
+            "失明的后果是「既有失效模式被重切到新码」全绿放行（本轮 blocker）。"
+        )
+
+    def test_produced_extractor_mixes_positional_and_keyword_sites(self) -> None:
+        """⑥ 两种写法**混用**时产出集是并集（不是「有位置实参就不看关键字」）。"""
+        source = _SYNTHETIC_TOKEN_SOURCE + (
+            '\nZERO_ERROR_CODE_POS = "pos"\nZERO_ERROR_CODE_KW = "kw"\n'
+            "\n\ndef boom(flag: bool):\n"
+            "    if flag:\n"
+            "        raise _tool_error(ZERO_ERROR_CODE_POS, 'x')\n"
+            "    raise _tool_error(code=ZERO_ERROR_CODE_KW, message='y')\n"
+        )
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert unresolvable == [], f"混用写法报了解析不了：{unresolvable}"
+        assert produced == {"ZERO_ERROR_CODE_POS", "ZERO_ERROR_CODE_KW"}, (
+            f"混用位置/关键字实参时产出集不是并集：{sorted(produced)}"
+        )
+
+    def test_produced_extractor_flags_kwargs_splat(self) -> None:
+        """⑥ `_tool_error(**kw)` 定位不到码实参 ⇒ 必须报「解析不了」，**不得** continue 跳过。
+
+        判别力要点：跳过 = 两个集合都不进 = 守卫对该出口失明却报绿，正是 blocker 的形状。
+        """
+        source = _SYNTHETIC_TOKEN_SOURCE + (
+            "\n\ndef boom(kw: dict):\n    raise _tool_error(**kw)\n"
+        )
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert produced == set(), f"`**kwargs` 展开被当成码符号收了：{sorted(produced)}"
+        assert len(unresolvable) == 1 and "kwargs" in unresolvable[0], (
+            f"`**kwargs` 展开未被标记为解析不了：{unresolvable}"
+        )
+
+    def test_produced_extractor_flags_call_without_code_argument(self) -> None:
+        """⑥ 连码实参都没有的调用同样进「解析不了」（宁可红，不静静漏）。"""
+        source = _SYNTHETIC_TOKEN_SOURCE + ("\n\ndef boom():\n    raise _tool_error()\n")
+        produced, unresolvable = _zero_produced_error_code_symbols(ast.parse(source))
+
+        assert produced == set(), f"无实参调用被收进产出集：{sorted(produced)}"
+        assert len(unresolvable) == 1, f"无码实参的调用未被标记：{unresolvable}"
+
+    def test_produced_extractor_is_empty_when_tool_error_renamed(self) -> None:
+        """⑥ `_tool_error` 改名 ⇒ 产出集为空——空集恒 ⊆ 消费集，故用例侧必须有非空断言兜住。
+
+        本条把「恒真式风险」本身实证出来：提取器在此确实返回空集，
+        所以 `test_produced_error_codes_are_all_consumed` 里那条 `assert produced` 不是装饰。
+        """
+        renamed = _SYNTHETIC_TOKEN_SOURCE.replace("_tool_error", "_make_error")
+        produced, _ = _zero_produced_error_code_symbols(ast.parse(renamed))
+        assert produced == set(), f"改名后仍提到产出点？{sorted(produced)}"
+
+
+class TestZeroRepoRootOverride:
+    """`ZERO_REPO_ROOT` 覆盖口的两分支实证（纯函数，不需 D:\\Zero）。
+
+    存在理由：跨仓变异验证必须在 `git show <ref>:…` 取出的 **pin 副本**上做——Zero 工作树
+    随时被别的会话改动（本轮实测其工作树 5 个 M、`server.py` 在验证过程中被改），
+    读工作树的结论不可复现。没有覆盖口就只能去改对方的树，那是更坏的选择。
+    默认值不动（`D:/Zero`）⇒ 未设 env 时零回归。
+    """
+
+    def test_default_root_unchanged_when_env_absent(self) -> None:
+        """未设 env → 仍是 `D:/Zero`（零回归的正证据，不是「反正没人设」）。"""
+        assert _resolve_zero_root({}) == Path("D:/Zero")
+
+    def test_env_overrides_root(self) -> None:
+        """设了 env → 按 env 走（覆盖口真的生效，不是装饰）。"""
+        assert _resolve_zero_root({_ZERO_REPO_ROOT_ENV: "X:/pinned-zero"}) == Path("X:/pinned-zero")
+
+    def test_empty_env_falls_back_to_default(self) -> None:
+        """env 设成空串 → 回默认，而不是 `Path('.')`（空串 Path 会静默指向 cwd，是个坑）。"""
+        assert _resolve_zero_root({_ZERO_REPO_ROOT_ENV: ""}) == Path("D:/Zero")
+
+
+class TestLegacyShapeCompatCoverage:
+    """legacy（裸前缀）形态下本仓兼容层的**真实覆盖面**——纯本仓，不需 D:\\Zero。
+
+    存在理由：legacy 形态的 skip 文案曾写「这不是码表回归——兼容层仍消费该形态」，
+    读起来像「老部署零回归」。实际上兼容层只覆盖 `unknown-session` 一个码。
+    本类用**真 wire 文本**逐码实测把覆盖面钉死，让文案里的 `1/8` 无法烂掉：
+    兼容层扩了或撤了，本类立刻红，改文案与改集合被绑在一起。
+    """
+
+    @staticmethod
+    def _legacy_wire(code_value: str) -> str:
+        """换代前的真 wire 形态：FastMCP 加壳 + 裸前缀落在文案中部。"""
+        return f"Error executing tool zero.step: {code_value}: 人读文案"
+
+    def test_legacy_wire_recognition_is_exactly_the_documented_subset(self) -> None:
+        """legacy wire 下能被 classify_zero_error 认出的码 == `_LEGACY_COMPAT_COVERED_SYMBOLS`。"""
+        from src.mcp.zero import client as zero_client
+
+        recognized = {
+            symbol
+            for symbol in _EXPECTED_ZERO_ERROR_CODE_SYMBOLS
+            if zero_client.classify_zero_error(self._legacy_wire(getattr(zero_client, symbol)))
+            == getattr(zero_client, symbol)
+        }
+        assert recognized == _LEGACY_COMPAT_COVERED_SYMBOLS, (
+            f"legacy 形态下兼容层的实际覆盖面变了：实测 {sorted(recognized)}、"
+            f"本文件记的 {sorted(_LEGACY_COMPAT_COVERED_SYMBOLS)}。\n"
+            "两处必须同步：`_legacy_shape_skip_reason()` 的「N/8 可用」文案由该集合算出，"
+            "集合不准 = skip 文案在骗人（正是本轮订正的那句「兼容层仍消费该形态」）。"
+        )
+
+    def test_legacy_wire_collapses_non_degradable_family(self) -> None:
+        """未覆盖的码在 legacy wire 下**全落基类** ⇒ 「上抛不吞」整体失效（文案据此而写）。"""
+        from src.mcp.zero import client as zero_client
+
+        collapsed: list[str] = []
+        for symbol in sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS - _LEGACY_COMPAT_COVERED_SYMBOLS):
+            wire = self._legacy_wire(getattr(zero_client, symbol))
+            exc = zero_client._exception_for_error_text("zero.step", wire, "msg")
+            assert type(exc) is zero_client.ZeroLinkCallError, (
+                f"{symbol} 在 legacy wire 下被归成 {type(exc).__name__}——"
+                "若兼容层已扩到该码，请同步 `_LEGACY_COMPAT_COVERED_SYMBOLS` 与 skip 文案。"
+            )
+            if issubclass(
+                zero_client._CODE_TO_EXCEPTION[getattr(zero_client, symbol)],
+                zero_client.ZeroLinkNonDegradableError,
+            ):
+                collapsed.append(symbol)
+
+        assert collapsed, (
+            "没有任何不可降级码在 legacy 形态下失效？那 skip 文案里「上抛不吞整体失效」"
+            "这句就不成立，须重写文案（本断言存在的意义就是不让文案与事实脱钩）。"
+        )
+
+    def test_skip_reason_states_partial_capability_not_zero_regression(self) -> None:
+        """skip 文案必须点明「N/8 可用」，且不得再宣称这是零回归的老部署。"""
+        reason = _legacy_shape_skip_reason()
+        covered = len(_LEGACY_COMPAT_COVERED_SYMBOLS)
+        total = len(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS)
+
+        assert f"{covered}/{total}" in reason, (
+            f"文案未给出可用能力比例 {covered}/{total}：\n{reason}"
+        )
+        assert "上抛不吞" in reason and "失效" in reason, (
+            f"文案未点明不可降级族在该形态下失效：\n{reason}"
+        )
+        assert "不是码表回归" not in reason, (
+            f"文案仍在用「不是码表回归」这种让人以为一切照旧的说法：\n{reason}"
         )
 
 
