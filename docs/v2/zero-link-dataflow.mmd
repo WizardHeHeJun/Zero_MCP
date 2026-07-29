@@ -1,12 +1,16 @@
 flowchart LR
   subgraph sense["📥 感知输入（MCP → Zero）"]
     direction TB
-    ph["physio · NeuroKit2<br/>EDA/HRV → arousal（对 valence 盲）"]:::client
+    eda["EDA · SCL 窗间基线Δ<br/>纯 numpy 不依赖 NeuroKit2<br/>冷启动 ~4.5min 返 None"]:::client
+    hrv["HRV · NeuroKit2 RMSSD<br/>固定 ref 初版 · 待改造"]:::client
+    mrg["merge_physio_priors<br/>ω=0.5 协方差交叉<br/>Πa=0.175（对 valence 盲）"]:::client
     au["audio · audeering w2v2<br/>维度 SER → (v,a)"]:::client
     vi["vision · EmotiEffLib ONNX<br/>表情 → (v,a)"]:::client
-    hub["PerceptionHub<br/>多流独立 · 禁均值"]:::client
-    ep["external_priors<br/>逐维精度 · M3/M6 fail-fast"]:::client
-    ph --> hub
+    hub["PerceptionHub<br/>多流独立 · 禁均值<br/>prepare_all 串行预热"]:::client
+    ep["external_priors 出境守卫<br/>逐维精度 · M3/M6/M7<br/>Π 有限性先于上界"]:::client
+    eda --> mrg
+    hrv --> mrg
+    mrg --> hub
     au --> hub
     vi --> hub
     hub --> ep
@@ -18,9 +22,9 @@ flowchart LR
   subgraph express["📤 表达消费（Zero → MCP）"]
     direction TB
     router["ExpressionRouter<br/>spontaneous / voluntary 双通路"]:::sink
-    fmap["ArkitFacsMapper<br/>12 AU → ARKit 52 blendshape"]:::sink
+    fmap["ArkitFacsMapper<br/>12 AU + intensity 增益<br/>→ ARKit blendshape 稀疏输出"]:::sink
     pmap["LinearProsodyMapper<br/>→ SSML prosody"]:::sink
-    ymap["LinearPhysiologyMapper<br/>WESAD μS/°C → 动画维"]:::sink
+    ymap["Linear<br/>PhysiologyMapper<br/>WESAD μS/°C → 动画维"]:::sink
     frame["RenderFrame<br/>DUAL：含 spontaneous 微表情泄漏帧"]:::sink
     router --> fmap --> frame
     router --> pmap --> frame

@@ -1,0 +1,56 @@
+flowchart LR
+  sup["🧩 supervisor<br/>LLM 决策下一步<br/>只分发协调 · 不含业务"]:::proto
+
+  subgraph sense["👁️ 感知：两层可用 + 一层预留"]
+    direction TB
+    l1["L1 UIA 控件树<br/>窗口级定位"]:::client
+    hollow{"uia_hollow？"}:::client
+    l2["L2 RapidOCR 主通道<br/>PrintWindow 后台直取<br/>CPU 全功能兜底"]:::client
+    l3["L3 视觉 · 尚未开工<br/>visual_objects 恒空<br/>OmniParser 仅探测"]:::note
+    filt["sanitize_screen_text<br/>12 英文 + 23 中文越权词<br/>实测 FP=0/159"]:::engine
+    snap["ScreenSnapshot<br/>模型无关结构化文本<br/>屏幕绝对坐标 · is_untrusted"]:::client
+    l1 --> hollow
+    hollow -->|"否 · UIA 可用"| filt
+    hollow -->|"是 · 微信钉钉实测 ≈0%"| l2
+    l2 --> filt
+    filt --> snap
+    l3 -.->|"占位不产出"| snap
+  end
+
+  subgraph guard["🛡️ 安全门：确认前严格只读"]
+    direction TB
+    risk["classify_risk 三级白名单<br/>不在表内一律升 DESTRUCTIVE"]:::engine
+    toc["toctou_verify 二次截图<br/>动作坐标局部裁剪比对<br/>画面被改则 abort"]:::engine
+    itr{{"lg_interrupt<br/>人工确认门"}}:::engine
+    risk --> toc --> itr
+  end
+
+  act["🖱️ 操控原语 control.py<br/>坐标点击 / 文本输入<br/>快捷键 / 窗口操作"]:::client
+  stall["⏱️ stall_detect<br/>phash 未变 + 动作重复<br/>超 STALL_MAX_STEPS 判停滞"]:::proto
+  err["🚨 error_report<br/>incident.json + 截图<br/>INCIDENT_DIR 空 = Noop"]:::note
+  memf["🧠 memory_flush<br/>任务完成节点唯一<br/>写记忆（节流）"]:::memory
+  pw["playwright 占位节点<br/>浏览器任务 · 未实现"]:::note
+  ckpt["🗄️ Checkpointer 运行态<br/>断点续跑 Command(resume=)"]:::storage
+
+  sup -->|"perceive"| l1
+  sup -->|"control"| risk
+  sup -->|"is_browser_task"| pw
+  sup -->|"任务完成"| memf
+  sup -->|"异常"| err
+  snap --> stall
+  itr ==>|"批准 · 写操作唯一出口"| act
+  toc -.->|"篡改 → abort"| stall
+  act --> stall
+  stall -->|"未停滞 · 继续"| sup
+  stall -->|"停滞超阈"| err
+  pw --> err
+  err --> memf
+  sup <-.->|"每步 checkpoint"| ckpt
+  itr <-.->|"中断挂起 / 恢复"| ckpt
+
+  classDef client fill:#F0F4FC,stroke:#5178C6,color:#1F2329
+  classDef memory fill:#DFF5E5,stroke:#509863,color:#1F2329
+  classDef storage fill:#EAE2FE,stroke:#8569CB,color:#1F2329
+  classDef proto fill:#FEF1CE,stroke:#D4B45B,color:#1F2329
+  classDef engine fill:#FEE3E2,stroke:#D25D5A,color:#1F2329
+  classDef note fill:#FFF9E6,stroke:#D4B45B,color:#8A6D1B

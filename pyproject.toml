@@ -1,5 +1,6 @@
 # Zero_MCP · Python 侧依赖与工具配置（骨架）
-# conda 管解释器与环境（environment.yml，环境名 ai-harness）；Python 包用 uv 管理本文件。
+# conda 管解释器与环境（environment.yml:15，环境名 **affective-expression**，与 D:\Zero 共用；
+# ⚠ 切勿 `conda env update --prune`，会删掉 D:\Zero 的依赖）；Python 包用 uv 管理本文件。
 # 运行依赖随 src/ 实现补充（当前多数注释占位）；构建/打包待代码落地后定。
 
 [project]
@@ -50,7 +51,12 @@ physio = [
     "neurokit2>=0.2",
     "pandas>=2.0",
     "numpy>=1.24",
-    "cvxopt>=1.3",  # cvxEDA 分解（rate>4Hz）；缺则 EdaChannel 自动降级 highpass（rate≤4Hz）
+    # ⚠ cvxopt：**EDA v2 起已不再使用**。EdaChannel 唯一度量改为 scl_baseline_delta，
+    # 不做 phasic 分解、不依赖 neurokit2（src/mcp/zero/channels/physio_channel.py:104-108、246），
+    # 全仓 src/ 已无任何 cvxopt/cvxEDA 调用。保留此行仅为不改动既有装包行为，且它属
+    # neurokit2 的 cvxEDA 可选依赖链（neurokit2 本身仍被 HrvChannel 用于 RMSSD，
+    # physio_channel.py:379）。背景见 notes/2026-07-28-eda-metric-redesign-blueprint.md。
+    "cvxopt>=1.3",
 ]
 # zero-link §5.1 语音感知通道（AudioChannel）：audeering w2v2 维度 SER（torch/transformers）。
 # 权重走 .env ZERO_AUDIO_MODEL_PATH；librosa 仅 I/O 适配层加载 wav 用，Channel 核心不需。
