@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.agents.models.zero_affect import (
     FACS_KEYS,
@@ -204,6 +205,60 @@ class TestModalityPriorValidation:
         """mu 恰好 -1.0 / 1.0 合法。"""
         prior = ModalityPrior(modality="physio", mu=(-1.0, 1.0), precision=(0.1, 0.1))
         assert prior.mu == (pytest.approx(-1.0), pytest.approx(1.0))
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_mu_raises(self, bad: float) -> None:
+        """NaN/±inf 的 μ 被构造期拒绝。
+
+        判别力见 `test_non_finite_mu_rejection_is_load_bearing`——本例单独绿不足以
+        证明是 `_validate_ranges` 在挡（可能是 pydantic 顺手拒的），故配对照组。
+        """
+        with pytest.raises(ValidationError):
+            ModalityPrior(modality="vision", mu=(bad, 0.0), precision=(0.5, 0.5))
+
+    def test_non_finite_mu_rejection_is_load_bearing(self) -> None:
+        """判别性对照：去掉 `_validate_ranges` 的孪生模型**接受** NaN μ。
+
+        证明上一例的绿由我方 validator 承担，而非 pydantic 对 float 的默认行为
+        （pydantic v2 默认 `allow_inf_nan=True`，裸 float 字段照收 NaN）。
+        本仓沉淀「绿灯必须先证明它能红」的标准做法：可疑的绿必须能指出谁在挡。
+        """
+
+        class TwinWithoutValidator(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
+            modality: str
+            mu: tuple[float, float]
+            precision: tuple[float, float]
+
+        twin = TwinWithoutValidator(modality="vision", mu=(float("nan"), 0.0), precision=(0.5, 0.5))
+        assert math.isnan(twin.mu[0]), "对照模型应当接受 NaN——否则上一例的绿与 validator 无关"
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_precision_raises(self, bad: float) -> None:
+        """NaN/±inf 的 Π 被构造期拒绝。
+
+        ⚠ 这条曾是**双侧全漏**：我方 `pv <= 0.0` 与 Zero 的 `affect_math.py:1052/:1058`
+        判据对 NaN 皆恒 False，而 Zero M7 只守 μ 不守 Π → NaN 精度会静默进入融合数学
+        产出 NaN 后验，两侧都不 fail-fast（对比：越界 μ 至少被 Zero M7 响亮 raise）。
+        故此校验由我方单边兜住，删掉它不会有任何其它防线接住。
+        """
+        with pytest.raises(ValidationError):
+            ModalityPrior(modality="audio", mu=(0.0, 0.0), precision=(bad, 0.5))
+
+    def test_frozen_blocks_post_construction_mutation(self) -> None:
+        """构造后赋值被拒（frozen）。
+
+        动机：构造期校验只在**构造那一刻**成立；此前本类是同仓唯一未上锁的契约模型
+        （兄弟 ProsodyParams / PhysiologyParams 均 frozen=True），实测
+        `prior.mu = (5.0, -9.0)` 静默生效并一路穿到发往 Zero 的载荷里。
+        ⚠ frozen 挡不住 model_construct / 鸭子类型伪造，**不能替代**出境侧 M7 守卫
+        （见 tests/mcp/test_zero_external_priors.py::TestM7MuDomain）。
+        """
+        prior = ModalityPrior(modality="vision", mu=(0.5, 0.5), precision=(0.2, 0.2))
+        with pytest.raises(ValidationError):
+            prior.mu = (5.0, -9.0)  # type: ignore[misc]
+        assert ModalityPrior.model_config.get("frozen") is True
 
     def test_coping_field_optional(self) -> None:
         """coping 默认 None，显式设置合法值通过。"""

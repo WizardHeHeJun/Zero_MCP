@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -91,7 +92,12 @@ class ModalityPrior(BaseModel):
     as_stream() 输出对齐 Zero affect_core streams 形状（三元组）。
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # frozen：构造后不可变。同仓兄弟模型（mappers/prosody.py::ProsodyParams、
+    # mappers/physiology.py）本就是 frozen，本类此前是唯一漏锁的——实测 `prior.mu = (5.0, -9.0)`
+    # 静默生效并一路穿过 build_external_priors_override 进入发往 Zero 的载荷。
+    # ⚠ frozen 只堵「构造后赋值」，堵不住 model_construct/model_copy/鸭子类型伪造，
+    # 故**不能替代**出境侧的 M7 守卫（external_priors.py）。两道都要。
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     modality: str
     mu: tuple[float, float] = Field(
@@ -100,7 +106,7 @@ class ModalityPrior(BaseModel):
     )
     precision: tuple[float, float] = Field(
         ...,
-        description="(Π_v, Π_a)，各维 > 0",
+        description="(Π_v, Π_a)，各维 > 0 且有限",
     )
     coping: float | None = Field(default=None, ge=-1.0, le=1.0)
 
@@ -110,6 +116,12 @@ class ModalityPrior(BaseModel):
         if not (-1.0 <= v <= 1.0 and -1.0 <= a <= 1.0):
             raise ValueError("mu 各维必须在 [-1, 1] 内")
         pv, pa = self.precision
+        # ⚠ 必须用 isfinite 显式判 NaN：`pv <= 0.0` 对 NaN **恒 False**，NaN 精度会静默通过。
+        # 而 Zero 侧同样漏（affect_math.py:1052 `pi_v <= 0.0`、:1058 `pi_v > cap` 皆 NaN-恒 False，
+        # 其 M7 只守 μ 不守 Π）→ 两侧都不 fail-fast，NaN 精度会直接进 Zero 融合数学产出 NaN 后验。
+        # 对比：越界 μ 至少会被 Zero M7 响亮 raise。故这一条由我方单边兜住。
+        if not (math.isfinite(pv) and math.isfinite(pa)):
+            raise ValueError("precision 各维必须为有限值（NaN/inf 会静默污染 Zero 融合后验）")
         if pv <= 0.0 or pa <= 0.0:
             raise ValueError("precision 各维必须 > 0")
         return self

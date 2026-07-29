@@ -21,6 +21,11 @@ from typing import Any
 import pytest
 
 from src.mcp.zero.external_priors import (
+    _RECOMMENDED_PRECISION_DEFAULTS,
+    MIN_PRECISION,
+    PHYSIO_MERGE_OMEGA_DEFAULT,
+    PHYSIO_PRECISION_A_SELF_IGNITE_BOUND,
+    PHYSIO_SUBSOURCE_PRECISION_A,
     ModalityKind,
     ModalityPrior,
     merge_physio_priors,
@@ -800,24 +805,38 @@ class TestPhysiologyDecoderOnlineConstantsPin:
 # 本类不是「缺陷断言」而是**契约级事实的特征化**。同时把 Zero 必 ping 清单里尚无自动守卫的
 # 三项（σ 标度 / precision α·β / 点燃门常量）一并 pin。
 #
-# ⚠ **本类全绿 ≠ Zero 认可现判据**。Zero 科学家议会 2026-07-28 终裁（其
-# `notes/2026-07-28-ignition-gate-external-priors-council.md` §六 Q1 + `PRP/外部多模态先验流注入口/
-# design.md` §五附）已判定 `hypot(μ)·mean(Π)` 是**范畴错误**（同一数字既当齐次相对权重又当非齐次
-# 绝对判据），修法=按轴加权马氏距离 `D=sqrt(Πv·μv²+Πa·μa²)` + `θ'=0.28`，须走完整 PRP、近期不落地。
-# 绿只表示**旧判据尚未被替换**。
+# ⚠ **Zero 的最终方案与本节旧注释所写的完全不同**（2026-07-29 重写；此前三段均已过时，勿参照）。
+#   曾经写的是「改判据公式为按轴加权马氏距离 D + θ'=0.28，须走完整 PRP、近期不落地」——
+#   该方案被 Zero **第三轮终裁整体推翻**，且新方案**已合入其 main `9617372`**（PR #46）：
+#     · 数值通路：`ignite()` 拆两路，`fusion_terms` 用**所有流的原生 (μ,Π)**，不乘任何 gate/D 因子；
+#     · 报告通路：θ' 降级为**纯报告阈值**（只决定 `ignited_streams` 标签，不影响任何后验数值）；
+#     · **跨流归一化被正面否决**（数学席证该路线无解），不再是待办；
+#     · **θ' 的值不必再 pin**（Zero 明言标定压力已消失）。
+#   三个开关**全部默认关**，`SALIENCE_THRESHOLD=0.18` 与旧式 `hypot(μ)·mean(Π)` **原样保留**：
+#     · `ZERO_IGNITION_GATE_FUSION`  默认 **`True` = 门关**
+#       （⚠ 方向与其它旋钮相反，勿按字面读成 False）
+#     · `ZERO_EXCLUDE_PHYSIO_FUSION` 默认 **`True` = 排除 physio**（Zero 应我方 WESAD 反号简报所作
+#       承诺 D7 的兑现物，其单边可控、解除前会 ping 我方）
+#     · `ZERO_PRECISION_COMMENSURABLE` 默认 `False`
+#   ⚠ 由此推出一条**易错的跨仓语义**：**「点燃（可报告）≠ 参与数值融合」**——两条通路已解耦。
+#   即使点燃门全开，physio 仍被排除开关挡在数值通路外；**两个开关都翻**才会真正参与后验。
 #
-# ⚠ **本类探测得到什么、探测不到什么**（前一版注释在此处写了兑现不了的承诺，已订正）：
-#   探测得到：常量**值**漂移（`_ZERO_GATE_CONSTANTS` 逐值 pin）、本仓推荐精度/子源可靠度改动。
-#   探测**不到**：判据**公式**被替换。因为 `_mean_precision` 是旧式的**手抄镜像**，从不读 Zero
-#   `stream_salience` 的函数体；而终裁明令新公式以 **default-off 新增** selector + **新** θ' 常量
-#   落地、`SALIENCE_THRESHOLD=0.18` 与旧式**原样保留**（对标 fuse_independence_correct 先例）
-#   → Zero PRP 落地当天本类**全绿通过**。届时须按新公式重标，而非把绿当作「无事发生」。
+# ⚠ **本类探测得到什么、探测不到什么**（据 2026-07-29 实测更新）：
+#   探测得到：常量**值**漂移（`_ZERO_GATE_CONSTANTS` 逐值 pin）；本仓推荐精度/子源可靠度改动；
+#     **以及 `fast_survival_prior` 被改成门控多分支形态**——`test_survival_stream_always_ignites`
+#     的多分支断言在 Zero 落地当天**如期变红**（实测：解析出两条 arousal 分支，基线 `[0.0, 0.5]`）。
+#     ⚠ 这一条来之不易：**旧正则只认 `+` 基线，会匹配到 legacy 分支解析出 0.5、断言照过 →
+#     静默全绿**，我方将完全不知道 Zero 已动手。
+#     2026-07-28 把守卫从「结构变更即 skip（黄灯）」改成「三形态皆红」
+#     正是为此，今天恰好接住了真事件——判别力实证不是形式主义，它就是这条守卫有没有用的分界线。
+#   探测**不到**：`stream_salience` 判据**公式**被替换。`_mean_precision` 是旧式的**手抄镜像**，
+#     从不读 Zero 函数体；而新架构以 default-off 开关落地、旧式原样保留 → 公式若真被换掉本类仍全绿。
+#     此为**已知盲区**，靠 Zero 的人工 ping 兜底（其 PRP tasks 已列 ping 义务）。
 #
-# ⚠ **待重标（Zero 07-28 二轮回执，等最终形态 ping 后动手）**：去地板+注入本仓 wire 载荷实测
-#   D=sqrt(0.175·0.845714²)=0.3538 ≥ θ'=0.28（本仓真 merge_physio_priors 复算一致）→
-#   「physio 恒不可点燃」「兜底分支结构性不可达」两条特征化届时**双双失效**；且归一化从
-#   「推后」改为「与去地板打包必做」（否则 physio 低精度单流独占后验，arousal 被拉到 0.846）。
-#   Zero 将 ping 最终公式+θ'+是否含归一化+建议 pin 项；落地前本节保持现状=特征化旧世界。
+# 📌 **当前状态（2026-07-29 实测，非推断）**：本分支对 Zero main `9617372`
+#   `ZERO_LINK_E2E_STRICT=1 pytest -m zerorepo` = **45 passed / 0 skipped**；
+#   而本仓 `main` 分支上**是红的**（尚未跟上重标，属结构性假红，合并后即消）。
+#   → **回答「跨仓守卫绿不绿」必须带 ref 限定**，两个 ref 的答案不同。
 # ---------------------------------------------------------------------------
 
 _ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
@@ -869,6 +888,45 @@ _ZERO_SURVIVAL_FUNC_RE = re.compile(
 )
 
 
+def _extract_function_body(source: str, name: str) -> str | None:
+    """按**符号名**切出顶层函数体（含 def 行），不依赖行号。
+
+    Zero 侧行号漂移剧烈（`4760dfb` 一次就增约 190 行），跨仓守卫一律按符号名锚定；
+    行号只出现在人读的注释里，且不作断言依据。找不到返回 None → 调用方 skip。
+    """
+    match = re.search(
+        rf"^def {re.escape(name)}\(.*?(?=\n(?:@|def |class )|\Z)", source, re.DOTALL | re.MULTILINE
+    )
+    return match.group(0) if match else None
+
+
+def _split_if_block(body: str, header: str) -> tuple[str, str] | None:
+    """按**缩进**把 `header`（如 `if gate_fusion:`）的块体与其后的同级代码切开。
+
+    返回 (块体, 块后剩余)；`header` 不在 body 里返回 None。
+
+    为什么按缩进而不按 `partition("return ")`：后者在「真分支不再 return」这种改动下会
+    落到函数**末尾**那个 return 上、把切点挪走，守卫照样绿——实测确认（本仓
+    pitfalls「绿灯必须先证明它能红」同族）。缩进是块结构的定义本身，不会被这样绕过。
+    """
+    idx = body.find(header)
+    if idx < 0:
+        return None
+    header_indent = len(body[:idx].rsplit("\n", 1)[-1])
+    lines = body[idx:].split("\n")[1:]  # 跳过 header 行本身
+    block: list[str] = []
+    for pos, line in enumerate(lines):
+        if line.strip() and len(line) - len(line.lstrip()) <= header_indent:
+            return "\n".join(block), "\n".join(lines[pos:])
+        block.append(line)
+    return "\n".join(block), ""
+
+
+# 我方实际发往 Zero 的 physio 流名（合并态 / 未合并态）。用于核对 Zero 的 D7 前缀排除
+# 是否真的覆盖我方载荷——「对方加了排除」不等于「排除到我方头上」。
+_MCP_PHYSIO_STREAM_NAMES = ("physio", "eda/sc", "hrv/rmssd")
+
+
 def _survival_arousal_floors(source: str) -> list[float] | None:
     """列出 fast_survival_prior 函数体内**所有** arousal 式的基线（地板）。
 
@@ -899,6 +957,15 @@ class TestIgnitionGateReachabilityCrosscheck:
         if not _ZERO_AFFECT_MATH_PY.is_file():
             pytest.skip(f"Zero affect_math.py 不存在（{_ZERO_AFFECT_MATH_PY}），跳过")
         return _ZERO_AFFECT_MATH_PY.read_text(encoding="utf-8")
+
+    def _zero_module_source(self, *parts: str) -> str:
+        """读 Zero 侧任意模块源码；不在位则 skip（不拖红）。"""
+        if not _zero_available():
+            pytest.skip(f"D:\\Zero\\src 不存在（{_ZERO_SRC}），跳过跨仓断言")
+        path = _ZERO_SRC.joinpath(*parts)
+        if not path.is_file():
+            pytest.skip(f"Zero 模块不存在（{path}），跳过")
+        return path.read_text(encoding="utf-8")
 
     def test_gate_and_boundary_constants_pinned(self) -> None:
         """Zero 门控/边界常量逐值 pin（必 ping：点燃门 + σ/精度边界）。"""
@@ -1047,11 +1114,22 @@ class TestIgnitionGateReachabilityCrosscheck:
             )
 
     def test_survival_stream_always_ignites(self) -> None:
-        """SURVIVAL_PRECISION ⊗ SALIENCE_THRESHOLD **绑定**：survival 恒过阈。
+        """SURVIVAL_PRECISION ⊗ SALIENCE_THRESHOLD **绑定**：默认配置下 survival 恒过阈。
 
-        推论：`ignite` 的 `if not fired: fired=[max by salience]` 兜底分支**结构性不可达**
-        （survival arousal 恒 ≥0.5、Π 恒 (0.4,0.4) → salience ≥0.200 > 0.18）。故外部亚阈
-        先验永远等不到「全场亚阈时当选 max」的逃逸机会。两常量任一动即须同评。
+        推论（**仅门关，即默认配置**）：`_select_fired` 的 `top = max(scored, key=salience)`
+        兜底分支不可达（survival arousal 恒 ≥0.5、Π 恒 (0.4,0.4) → salience ≥0.200 > 0.18）。
+        故外部亚阈先验等不到「全场亚阈时当选 max」的机会。两常量任一动即须同评。
+
+        ⚠ **2026-07-29 两次修订**：
+        1. Zero 落 `arousal_floor_fix` 门控（`4760dfb`「线A」）→ 本例按上一版结构断言如期
+           变红（设计意图），改为基线集合逐值 pin + 默认值 pin。
+        2. **随后跨仓核验推翻了当时同步写下的推论**：门开后并非「max-fallback 变可达」。
+           `ignite()` 只在 `gate_fusion=True` 分支调 `_select_fired`；门开走的是「全流原生
+           (μ,Π) 进融合」分支，**既无阈值比较也无 fallback**——门一开不是让 fallback 生效，
+           而是让它从数值通路上整条消失。且门开分支随即按 `_PHYSIO_PREFIXES` 把 physio
+           剔出 fusion（`exclude_physio_fusion` 默认 True，Zero 的 D7 跨仓承诺）。
+           详见下方 `test_gate_open_branch_has_no_fallback_and_excludes_physio`。
+        故本例的适用范围就是**门关**这一支，不必再谈门开——门开由那条独立守卫刻画。
         """
         source = self._source()
         consts = {}
@@ -1062,31 +1140,31 @@ class TestIgnitionGateReachabilityCrosscheck:
             consts[name] = float(match.group(1))
 
         # ⚠ 此处**从 Zero 源码读** fast_survival_prior 的 arousal 基线系数，不再手抄。
-        # Zero 07-28 二轮回执：去地板（→clamp(0.5|I|)）已列必改，且明确要求本例在其
-        # 落地当天变红=跨仓信号（勿改宽松）。届时红了是**正确行为**，重标须等 Zero
-        # 最终形态 ping（去地板与跨流归一化打包），勿见红即放宽断言。
-        #
-        # 三种落地形态都要能红（Zero 复议纪要 §六(e):186 裁定 floor 修复**与 D formula
-        # 共用同一 default-off 总开关**、「关闭时旧行为逐字不变」——即最可能的落地不是
-        # 直接改这一行，而是**新增分支/条件**。若只断言「基线值 == 0.5」，门控落地当天
-        # 走 legacy 分支照样绿，正是本仓 pitfalls ② 那个失败模式的复发）：
-        #   裸改（无门控）→ 基线解析 0.0 → 主断言红；
-        #   多分支门控   → len>1     → 结构断言红；
-        #   条件表达式   → 解析不出   → 空列表断言红。
+        # 现行形态（Zero 复议 §六(e):186 裁定的 default-off 门控）：两分支，基线 {0.0, 0.5}。
+        # 仍要求「形态一变就红」：任何第三种分支、或基线集合变化，都落到下面的逐值断言上。
         floors = _survival_arousal_floors(source)
         if floors is None:
             pytest.skip("未找到 fast_survival_prior 函数体，Zero 结构可能大改，跳过")
-        assert floors, (
-            "fast_survival_prior 在位但 arousal 式解析不出（可能改成条件表达式/门控形态）"
-            "——须按 Zero 最终形态重标本守卫，勿放宽（Zero 07-28 二轮：去地板已列必改）。"
+        assert sorted(floors) == [0.0, 0.5], (
+            f"fast_survival_prior 的 arousal 分支基线集合变为 {sorted(floors)}（期望 "
+            "[0.0, 0.5] = 门开去地板 / 门关带地板两分支）——Zero 又动了 survival 证据式，"
+            "须重新核对默认路径走哪条，勿放宽本断言。"
         )
-        assert len(floors) == 1, (
-            f"fast_survival_prior 出现 {len(floors)} 个 arousal 分支形态（基线 {floors}）"
-            "——与 Zero 复议 §六(e) 的 default-off 门控落地形状一致。此时「哪条是默认路径」"
-            "本守卫判不了，须按 Zero ping 的最终形态重标（含门开关默认值 pin）。"
+
+        # 默认路径 pin：`arousal_floor_fix` 形参默认 False = 走**带地板**分支。
+        # 这一条是「哪条是默认」的唯一真相；只 pin 基线集合而不 pin 默认值，Zero 把默认翻成
+        # True 的那天本例照样绿——正是本仓 pitfalls ② 的失败模式。
+        default_match = re.search(r"arousal_floor_fix\s*:\s*bool\s*=\s*(True|False)", source)
+        assert default_match is not None, (
+            "未找到 arousal_floor_fix 形参默认值——门控形态又变了，须按新形态重标。"
         )
+        assert default_match.group(1) == "False", (
+            "arousal_floor_fix 默认值翻为 True（去地板成为默认路径）——survival 在 I=0 时"
+            "salience=0，ignite 的 max-fallback 变为默认可达，本仓可达性结论须整体重评。"
+        )
+
         # intensity=0 时取基线项；斜率项 ≥0 故基线即下确界（clamp 下界 0.0 不咬合）
-        min_survival_arousal = floors[0]
+        min_survival_arousal = max(floors)  # 默认分支 = 带地板那条
 
         min_survival_salience = min_survival_arousal * consts["SURVIVAL_PRECISION"]
         assert min_survival_salience > consts["SALIENCE_THRESHOLD"], (
@@ -1094,6 +1172,289 @@ class TestIgnitionGateReachabilityCrosscheck:
             f"{consts['SALIENCE_THRESHOLD']}——ignite 的 max-fallback 分支变为可达，"
             "外部亚阈先验可能在全场亚阈时被保留，本仓可达性结论须重评。"
         )
+
+    def test_survival_subthreshold_boundary_when_floor_removed(self) -> None:
+        """**去地板分支内** survival 单流的亚阈边界特征化：`|goal| < 0.18/(0.4·0.6) = 0.75`。
+
+        ⚠ **本边界不通向「physio 被保留」**（2026-07-29 跨仓核验订正）。它只是「去掉 0.5
+        地板后 survival 这一条流还剩多少条件才亚阈」的算术刻画，三重限定必须一起读：
+
+        1. **只管 survival 单流**。「全场亚阈」的绑定约束是 **appraisal**（Π≈8.16·gain，
+           I=0 时需 `|goal| < 0.0374`），比这里严 20 倍；可行窗口仅约占 (goal,I)∈[-1,1]²
+           面积的 0.12%。0.75 从来不是全场亚阈的 binding constraint。
+        2. **只在 `precision_commensurable=False` 下成立**。同开线B（`ZERO_PRECISION_
+           COMMENSURABLE`，与线A 同日落地）时 Π 由 0.4 变 4.9383（I=0），边界收到 0.0608。
+        3. **去地板 ⟺ 门开，而门开时数值通路上根本没有 fallback**（见
+           `test_gate_open_branch_has_no_fallback_and_excludes_physio`）。故即便真落进这个
+           窗口，也不会发生「physio 当选 max」——那条路在该分支不存在。
+
+        留着这条的价值是**逐值 pin 去地板分支的两个系数**（arousal 无基线项、valence 0.6）：
+        Zero 若给去地板分支补回下限或改 valence 系数，本例立刻红。
+        """
+        source = self._source()
+        consts = {}
+        for name in ("SURVIVAL_PRECISION", "SALIENCE_THRESHOLD"):
+            match = re.search(rf"^{name}\s*=\s*({_NUM})", source, re.MULTILINE)
+            if match is None:
+                pytest.skip(f"未找到 {name}，跳过")
+            consts[name] = float(match.group(1))
+        threshold = consts["SALIENCE_THRESHOLD"]
+        precision = consts["SURVIVAL_PRECISION"]
+
+        floors = _survival_arousal_floors(source)
+        if floors is None:
+            pytest.skip("未找到 fast_survival_prior 函数体，Zero 结构可能大改，跳过")
+        assert sorted(floors) == [0.0, 0.5], f"分支基线集合变为 {sorted(floors)}，须重标"
+
+        # valence 系数从源码读（不手抄）：`valence = clamp(0.6 * goal, -1.0, 1.0)`
+        func_match = _ZERO_SURVIVAL_FUNC_RE.search(source)
+        assert func_match is not None
+        v_match = re.search(rf"valence\s*=\s*clamp\(\s*({_NUM})\s*\*\s*goal", func_match.group(0))
+        if v_match is None:
+            pytest.skip("survival valence 式形态变更，跳过（须按新形态重标）")
+        valence_coef = float(v_match.group(1))
+
+        # 去地板分支 = 无基线项那条 → intensity=0 时 arousal=0，salience = |coef·goal|·Π。
+        assert min(floors) == 0.0, "去地板分支不再是「无基线」形态，须重标"
+        goal_bound = threshold / (precision * valence_coef)
+        assert goal_bound == pytest.approx(0.75, abs=1e-9), (
+            f"去地板分支的 survival 亚阈边界漂移：|goal| < {goal_bound:.4f}（期望 0.75="
+            f"{threshold}/({precision}·{valence_coef})）——系数被改动，须跨仓同评。"
+        )
+
+        # 反面对照（非冗余）：带地板分支下**任何** goal 都过阈——0.5·Π=0.200 > 0.18 与 goal 无关。
+        # 即可达性的翻转完全由门决定，不由输入决定。
+        assert max(floors) * precision > threshold, (
+            "带地板分支下 survival 已非恒过阈——与 test_survival_stream_always_ignites 冲突，"
+            "两例须同评。"
+        )
+
+        # 门与门的绑定：floor_fix 不是独立旋钮，而是 gate_fusion 的取反（Zero 议会 D5 强制
+        # 共用同一开关）。这条绑定一旦解开，两个门可各自独立开合 → 组合态爆炸，本仓的
+        # 二态刻画（门关/门开）不再充分。
+        core_source = self._zero_module_source("agents", "affect_core.py")
+        assert "arousal_floor_fix=not state.gate_fusion" in core_source, (
+            "affect_core 不再把 arousal_floor_fix 绑定为 `not gate_fusion`——两门可独立开合，"
+            "本仓「门关/门开」二态刻画不再充分，须按新组合态重标可达性结论。"
+        )
+
+    def test_gate_open_branch_has_no_fallback_and_excludes_physio(self) -> None:
+        """门开分支的**结构** pin：无阈值筛选、无 max-fallback，且默认按前缀剔除 physio。
+
+        这条是 2026-07-29 跨仓核验的直接产物——它推翻了本仓当天写下的
+        「门一开 → max-fallback 生效 → physio 先验获得被保留的路径」。真相是：
+
+        - `ignite()` 只在 `if gate_fusion:` 分支里调 `_select_fired`（阈值筛选 + fallback
+          都在那个 helper 内），随后**提前 return**；门开走的是「全流原生 (μ,Π) 进融合」
+          分支，那里没有 threshold、没有 fired、没有 fallback。
+        - 门开分支紧接着按 `_PHYSIO_PREFIXES` 把 physio 剔出 fusion，开关
+          `exclude_physio_fusion` **默认 True**——这正是 Zero 应我方「EDA 反号，宁可继续
+          门掉」请求所落的 D7 跨仓承诺。故开门对 physio 的净效果是**被点名排除**。
+
+        本例只 pin 结构与默认值，不 pin 行号（Zero 侧行号漂移剧烈）。Zero 若把 fallback
+        挪进门开分支、或把 `exclude_physio_fusion` 默认翻成 False，本例即红。
+        """
+        source = self._source()
+
+        # ① fallback 与阈值筛选都在 _select_fired 内；ignite 只在 gate_fusion 真分支调它。
+        select_fired = _extract_function_body(source, "_select_fired")
+        if select_fired is None:
+            pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
+        assert "max(" in select_fired, "_select_fired 内已无 max-fallback，可达性结论须重评"
+
+        ignite_body = _extract_function_body(source, "ignite")
+        if ignite_body is None:
+            pytest.skip("未找到 ignite，Zero 结构可能大改，跳过")
+        assert "if gate_fusion:" in ignite_body, (
+            "ignite 不再以 `if gate_fusion:` 二分——门控形态变了，须按新形态重标"
+        )
+        # 按**缩进**切出 `if gate_fusion:` 块体与其后的门开分支（不按 return 切，理由见
+        # `_split_if_block` docstring：按 return 切会被「真分支不再 return」绕过）。
+        split = _split_if_block(ignite_body, "if gate_fusion:")
+        assert split is not None
+        gate_closed_part, gate_open_only = split
+        # ⚠ 切分有效性守卫：两侧都非空才谈得上「分支归属」；否则下面的 `not in` 恒真=空断言
+        # （本仓 pitfalls「绿灯必须先证明它能红」第 ⑥ 例正是这么踩的）。
+        assert gate_closed_part.strip() and gate_open_only.strip(), (
+            "切不出 ignite 的门关/门开两分支——结构变了，须按新形态重标（勿让本例退化成空断言）"
+        )
+        assert "_select_fired" in gate_closed_part, (
+            "gate_fusion 真分支里已无 _select_fired——阈值通路被重构，须重标"
+        )
+        # 真分支必须**提前 return**：否则会落穿到门开分支，两条路径同时执行，
+        # 「门关不走融合分支」这个前提就不成立了（按 return 切分时抓不到这种改动）。
+        closed_statements = [ln.strip() for ln in gate_closed_part.split("\n") if ln.strip()]
+        assert closed_statements and closed_statements[-1].startswith("return "), (
+            f"gate_fusion 真分支不再以 return 收尾（末句 {closed_statements[-1:]!r}）"
+            "——会落穿到门开分支，本仓的门关/门开二态刻画须重评。"
+        )
+        assert "_select_fired" not in gate_open_only, (
+            "门开分支里出现了 _select_fired——max-fallback 被挪回数值通路，"
+            "本仓「门开时 physio 不经 fallback」的结论须撤回并重评。"
+        )
+
+        # ② D7：门开分支默认按前缀剔 physio。默认值 pin 与前缀集 pin 都要。
+        exclude_default = re.search(r"exclude_physio_fusion\s*:\s*bool\s*=\s*(True|False)", source)
+        assert exclude_default is not None, "未找到 exclude_physio_fusion 形参默认值，须重标"
+        assert exclude_default.group(1) == "True", (
+            "exclude_physio_fusion 默认翻为 False——D7「physio 不进数值通路」的跨仓承诺"
+            "已被解除，我方 physio 先验会在门开时真正参与后验，须立即跨仓确认。"
+        )
+        # 允许类型注解形态 `_PHYSIO_PREFIXES: tuple[str, ...] = (...)`
+        prefixes = re.search(r"^_PHYSIO_PREFIXES\b[^=\n]*=\s*\(([^)]*)\)", source, re.MULTILINE)
+        assert prefixes is not None, "未找到 _PHYSIO_PREFIXES，须重标"
+        prefix_set = set(re.findall(r'"([^"]+)"', prefixes.group(1)))
+        assert {"physio", "eda", "hrv"} <= prefix_set, (
+            f"_PHYSIO_PREFIXES={prefix_set} 不再覆盖我方流名前缀——我方发出的 "
+            f"{_MCP_PHYSIO_STREAM_NAMES} 可能漏出 D7 排除，须跨仓确认。"
+        )
+        # 我方实际发出的流名必须落进该前缀集，否则 D7 对我方载荷根本不生效
+        for name in _MCP_PHYSIO_STREAM_NAMES:
+            assert name.lower().startswith(tuple(prefix_set)), (
+                f"我方流名 {name!r} 不匹配 Zero 的 _PHYSIO_PREFIXES={prefix_set}，D7 排除对该流失效"
+            )
+
+    def test_soft_gate_bypasses_physio_exclusion(self) -> None:
+        """**D7 承诺的已知覆盖缺口**（特征化，非缺陷断言）：软门分支不施 physio 排除。
+
+        `_select_fired` 在 `soft_beta`（`ZERO_IGNITION_BETA` / `state.ignition_beta`）非
+        None 时走软门：**全部流含 physio 一律进 fuse_terms**（精度乘 logistic gate），
+        没有阈值筛除。而 `exclude_physio_fusion` 的过滤只写在**门开**分支里，管不到软门
+        ——软门位于 `gate_fusion=True` 通路内。
+
+        即：`gate_fusion=True`（默认）+ `ignition_beta` 非 None ⇒ 反号 physio 真进数值后验。
+        默认 `IGNITION_BETA=None` 故当前未触发；且 `ignition_beta` **不在** Zero 的 MCP
+        治理门控白名单内，理论上 MCP client 可经 config overrides 自行打开。
+
+        本例把这个缺口做成**可执行记录**：若 Zero 日后在软门分支内也施加 physio 排除
+        （缺口被堵），本例变红 → 提示我们更新跨仓认知并撤下相关风险提示。
+        """
+        source = self._source()
+        select_fired = _extract_function_body(source, "_select_fired")
+        if select_fired is None:
+            pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
+
+        assert "soft_beta" in select_fired, (
+            "_select_fired 内已无 soft_beta 分支——软门被移除，本缺口记录可撤下"
+        )
+        assert "_PHYSIO_PREFIXES" not in select_fired, (
+            "_select_fired 内出现了 physio 前缀过滤——D7 覆盖缺口已被堵上（好事），"
+            "请更新本例文案与跨仓风险提示后再放行"
+        )
+        # 默认值 pin：缺口当前不被触发，靠的是 IGNITION_BETA 默认 None
+        beta_default = re.search(r"^IGNITION_BETA\s*[:=][^=\n]*=\s*(\S+)", source, re.MULTILINE)
+        assert beta_default is not None, "未找到 IGNITION_BETA 默认值，须重标"
+        assert beta_default.group(1).rstrip(",") == "None", (
+            "IGNITION_BETA 默认值不再是 None——软门成为默认路径，反号 physio 会进数值后验，"
+            "须立即跨仓确认"
+        )
+
+    def test_physio_default_precision_stays_below_self_ignite_bound(self) -> None:
+        """我方默认 physio 精度须低于自点燃硬上界——否则单边绕过 Zero 的 D7 跨仓承诺。
+
+        D7（`exclude_physio_fusion` 默认 True）只写在 Zero 的**门开**分支里；门关（默认）
+        走硬门阈值路径，D7 管不到。故「physio 不以反号参与数值」在门关下**不是 Zero 保证的**，
+        而是我方 Πa 默认值小于阈值所致——是自律，不是结构约束。本例把这条自律做成可执行守卫：
+        任何人（含未来的我）调高 `EXTERNAL_PHYSIO_PRECISION_A` 默认值到越界，立刻红。
+
+        上界从 Zero 源码的 `SALIENCE_THRESHOLD` 现算，不手抄。
+        """
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        threshold = float(match.group(1))
+
+        # physio: μv 恒 0 → hypot(μ)=|μa|≤1；Πv 恒 MIN。salience 上界 = (MIN+Πa)/2。
+        bound = 2 * threshold - MIN_PRECISION
+        assert bound == pytest.approx(PHYSIO_PRECISION_A_SELF_IGNITE_BOUND, abs=1e-9), (
+            f"自点燃上界随 Zero 阈值漂移：现算 {bound:.4f}、常量 "
+            f"{PHYSIO_PRECISION_A_SELF_IGNITE_BOUND}——须同步更新常量与其 docstring 推导。"
+        )
+
+        for kind, ceiling in ((ModalityKind.PHYSIO, bound),):
+            _, pi_a = _RECOMMENDED_PRECISION_DEFAULTS[kind]
+            assert pi_a < ceiling, (
+                f"{kind} 默认 Πa={pi_a} 已达自点燃上界 {ceiling:.4f}——我方 physio 先验将在"
+                "Zero **默认配置**下自行过阈进入数值后验，绕过 D7 跨仓承诺（D7 只管门开分支）。"
+                "调高前必须跨仓确认。"
+            )
+
+        # 合并态（生产实际发出的形状）同样要低于上界：Πa = ω·Π_eda + (1-ω)·Π_hrv
+        merged_pi_a = (
+            PHYSIO_MERGE_OMEGA_DEFAULT * PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+            + (1 - PHYSIO_MERGE_OMEGA_DEFAULT) * PHYSIO_SUBSOURCE_PRECISION_A["hrv"]
+        )
+        assert merged_pi_a < bound, (
+            f"合并后 Πa={merged_pi_a} 已达自点燃上界 {bound:.4f}——线上载荷会自行过阈，"
+            "须跨仓确认（本仓 pitfalls ① 已实证抬子源可靠度会让线上 salience 冲到 0.3896）。"
+        )
+
+    def test_gate_branch_guard_goes_red_on_structural_relocation(self) -> None:
+        """判别性自证：门开分支结构守卫对三种「真会发生的改法」都能红，不是恒绿。
+
+        「绿灯必须先证明它能红」同族第 ⑦ 例。上一版按 `partition("return ")` 切分支，
+        实测对「真分支不再 return」**绿**——切点会落到函数末尾那个 return 上，把改动
+        整个跳过去。改用缩进切块 + 显式断言真分支以 return 收尾后，三态全红：
+
+        (1) fallback 被挪进门开分支 → 门开分支出现 `_select_fired` → 红；
+        (2) 真分支去掉提前 return（落穿，两条路径同时执行）→ 末句非 return → 红；
+        (3) `if gate_fusion:` 二分被拆掉 → 无二分 → 红。
+
+        不依赖 `D:\\Zero` 在位（用合成源码），判别力常年在测。
+        """
+        base = (
+            "def ignite(streams, *, threshold=0.18, gate_fusion=True):\n"
+            "    scored = _score_streams(streams)\n"
+            "    if gate_fusion:\n"
+            "        selected = _select_fired(scored, threshold=threshold)\n"
+            "        return [(mu, prec) for _, mu, prec in selected]\n"
+            "\n"
+            "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
+            "    if exclude_physio_fusion:\n"
+            "        fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
+            "    return fusion\n"
+        )
+
+        def evaluate(source: str) -> str:
+            """复刻主守卫的判定，返回 '绿' 或红的原因（与主例逻辑一一对应）。"""
+            body = _extract_function_body(source, "ignite")
+            if body is None or "if gate_fusion:" not in body:
+                return "红:无 gate 二分"
+            split = _split_if_block(body, "if gate_fusion:")
+            if split is None:
+                return "红:切分失败"
+            closed, opened = split
+            if not (closed.strip() and opened.strip()):
+                return "红:切分有效性"
+            if "_select_fired" not in closed:
+                return "红:门关分支无 _select_fired"
+            statements = [ln.strip() for ln in closed.split("\n") if ln.strip()]
+            if not (statements and statements[-1].startswith("return ")):
+                return "红:真分支未提前 return"
+            if "_select_fired" in opened:
+                return "红:门开分支出现 _select_fired"
+            return "绿"
+
+        assert evaluate(base) == "绿", "现行形态应绿——否则守卫对 Zero 当前源码就是假阳性"
+
+        relocated = base.replace(
+            "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]",
+            "    fusion = _select_fired(scored, threshold=threshold)",
+        )
+        assert evaluate(relocated) == "红:门开分支出现 _select_fired", (
+            "fallback 被挪进门开分支时守卫必须红——这正是本仓结论赖以成立的那条结构前提"
+        )
+
+        fallthrough = base.replace(
+            "        return [(mu, prec) for _, mu, prec in selected]", "        pass"
+        )
+        assert evaluate(fallthrough) == "红:真分支未提前 return", (
+            "真分支落穿时守卫必须红——上一版按 return 切分在此**实测为绿**，是真盲点"
+        )
+
+        no_gate = base.replace("    if gate_fusion:", "    if True:")
+        assert evaluate(no_gate) == "红:无 gate 二分", "二分被拆掉时守卫必须红"
 
     def test_survival_floor_guard_goes_red_not_skip_on_confirmed_change(self) -> None:
         """判别性自证：对 Zero 已确认必改的去地板形态，上例走**红**（断言失败）而非 skip。
@@ -1104,11 +1465,13 @@ class TestIgnitionGateReachabilityCrosscheck:
         (1) 现行地板形态解析 [0.5]——且 decoy 在场不被抢注（反例非假想：首版可选基线正则
         就被 occ_prior 的多行 clamp(0.4·|I|+…) 全文件抢先匹配、把真地板误读成 0.0，
         Zero 未动手先假阳性红，07-28 实踩）；(2) 裸去地板形态解析 **[0.0] 而非 None**
-        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) **门控多分支形态**（Zero
-        复议 §六(e):186 裁定 floor 与 D formula 共用 default-off 总开关、「关闭时旧行为
-        逐字不变」→ 最可能的落地是新增分支而非改这一行）→ 两元素 → 结构断言红，而非
-        「走 legacy 分支照样绿」（那正是本仓 pitfalls ② 失败模式的复发）；(4) 条件表达式
-        等不可解析形态 → **空列表**（非 None）→ 断言红；(5) 函数整体缺位 → None → skip。
+        （不再逃进 skip，主断言 0.0·0.4 ≤ 0.18 必失败=红）；(3) **门控多分支形态**必须解析出
+        **两个**元素而非只取第一个匹配——2026-07-29 Zero 已按此形态落地（commit 4760dfb），
+        上例遂改为「基线集合逐值 pin + 默认值 pin」；只取首个匹配会让「走 legacy 分支照样绿」，
+        即 default-off 落地当天守卫失明（本仓 pitfalls ② 失败模式）；(4) 条件表达式等不可解析
+        形态 → **空列表**（非 None）→ 断言红；(5) 函数整体缺位 → None → skip。
+        (6) **默认值翻转**（`arousal_floor_fix: bool = True`）→ 默认值 pin 断言红——这是重标后
+        新增的一格：门控形态已成既定事实，此后唯一能悄悄改变默认路径的就是翻这个默认值。
         如实标注守不住什么：(5) 这一格（Zero 整个重命名/删除 fast_survival_prior）本守卫
         只能 skip、靠 STRICT 兜底转红。不依赖 D:\\Zero 在位，判别力常年在测。
         """
@@ -1160,6 +1523,19 @@ class TestIgnitionGateReachabilityCrosscheck:
             "不可解析形态须返回空列表（→上例断言红），返回 None 会逃进 skip"
         )
         assert _survival_arousal_floors(decoy_occ_prior) is None
+
+        # (6) 默认值 pin 的判别力：门控形态既已落地，唯一能悄悄改默认路径的就是翻这个默认值。
+        # 用与上例**同一条正则**跑两份合成源码，证明它分得开 False / True，而非恒绿。
+        default_re = r"arousal_floor_fix\s*:\s*bool\s*=\s*(True|False)"
+        legacy_sig = "def fast_survival_prior(features, *, arousal_floor_fix: bool = False):\n"
+        flipped_sig = "def fast_survival_prior(features, *, arousal_floor_fix: bool = True):\n"
+        legacy_match = re.search(default_re, legacy_sig)
+        flipped_match = re.search(default_re, flipped_sig)
+        assert legacy_match is not None and legacy_match.group(1) == "False"
+        assert flipped_match is not None and flipped_match.group(1) == "True", (
+            "默认值翻为 True 时正则须解析出 True（→上例断言红）；解析不出会逃进"
+            "「未找到默认值」那条 assert，同样是红，但归因会指错方向"
+        )
 
 
 # ---------------------------------------------------------------------------

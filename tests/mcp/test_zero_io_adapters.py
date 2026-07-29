@@ -278,9 +278,7 @@ class TestSyntheticEdaInjectionSmoke:
     async def test_eda_source_injected_into_eda_channel(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """合成 EDA source 注入 EdaChannel，channel.sense() 产出 ModalityPrior 非 None。"""
-        import pandas as pd
-
+        """合成 EDA source 注入 EdaChannel，攒够基线后 sense() 产出 ModalityPrior 非 None。"""
         from src.mcp.zero.channels.physio_channel import EdaChannel
 
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
@@ -290,18 +288,36 @@ class TestSyntheticEdaInjectionSmoke:
             duration=5, sampling_rate=4, scr_number=3, random_state=0
         )
 
-        # mock neurokit2（对齐 test_zero_physio_channel.py::_make_nk_mock 模式）
-        nk_mock = MagicMock()
-        nk_mock.standardize.return_value = np.zeros(20)
-        nk_mock.eda_phasic.return_value = pd.DataFrame({"EDA_Phasic": [0.5] * 10})
-
-        ch = EdaChannel(sampling_rate=4, signal_source=eda_source)
-        with patch.dict("sys.modules", {"neurokit2": nk_mock}):
-            result = await ch.sense()
+        # 注入时钟：通道按**真实秒数**判冷启动，注入后无需真等待即可跨过双门
+        now = [0.0]
+        ch = EdaChannel(sampling_rate=4, signal_source=eda_source, clock=lambda: now[0])
+        for _ in range(3):
+            await ch.sense()
+            now[0] += 200.0
+        result = await ch.sense()
 
         assert result is not None
         assert result.modality == "eda/sc"
         assert -1.0 <= result.mu[1] <= 1.0
+
+    async def test_eda_source_reaches_channel_on_cold_start(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """首窗返 None 是**冷启动**而非接线断——两者用基线历史区分。
+
+        判别性：若接线断（source 未被调用/返回 None），`baseline_history` 会**保持为空**；
+        接线通则首窗虽返 None，历史里已落一条。
+        """
+        from src.mcp.zero.channels.physio_channel import EdaChannel
+
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        eda_source = make_synthetic_eda_source(
+            duration=5, sampling_rate=4, scr_number=3, random_state=0
+        )
+        ch = EdaChannel(sampling_rate=4, signal_source=eda_source)
+
+        assert await ch.sense() is None  # 冷启动：无基线证据
+        assert len(ch.baseline_history) == 1, "signal_source 未被取到（接线断），非冷启动"
 
 
 # ---------------------------------------------------------------------------

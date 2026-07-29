@@ -174,9 +174,21 @@ class TestPerceptionToZeroE2E:
         async def _vision_src() -> np.ndarray | None:
             return vision_crop
 
+        # --- EdaChannel v2（蓝图任务 8 后的默认）需先暖机 ---
+        # v2 出首个读数要求「≥min_observations 条历史 **且** 跨度 ≥ horizon×cover=270s」，
+        # 单发 collect() 必然返回 None（冷启动，非故障）。此处注入可控时钟真实预热，
+        # 使本 E2E 验的是**新默认路径**而非退回 v1。
+        _eda_time = {"now": 0.0}
+        eda_channel = EdaChannel(
+            sampling_rate=4, signal_source=_eda_src, clock=lambda: _eda_time["now"]
+        )
+        for _ in range(2):
+            await eda_channel.sense()
+            _eda_time["now"] += 300.0  # >270s，两步即跨过覆盖率门
+
         # --- 真 PerceptionHub.collect()：各通道跑真模型出真先验，不可用者 graceful 跳过 ---
         channels: list[Any] = [
-            EdaChannel(sampling_rate=4, signal_source=_eda_src),
+            eda_channel,
             HrvChannel(sampling_rate=256, signal_source=_ecg_src),
         ]
         if audio_ok:
