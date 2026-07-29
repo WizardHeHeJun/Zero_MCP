@@ -608,6 +608,10 @@ _EXPECTED_ZERO_ERROR_CODE_SYMBOLS: frozenset[str] = frozenset(
         "ZERO_ERROR_CODE_PAYLOAD_INVALID",
         "ZERO_ERROR_CODE_CONFIG_INVALID",
         "ZERO_ERROR_CODE_DEPLOY_ENV_INVALID",
+        # 超时两码（本仓第二轮回件 §2.1 建议、Zero 2026-07-29 采纳）：重试语义相反故分码；
+        # timeout-step Zero 侧只登记不产出（执行超时未实现），消费侧分类先一次到位。
+        "ZERO_ERROR_CODE_TIMEOUT_LOCK",
+        "ZERO_ERROR_CODE_TIMEOUT_STEP",
     }
 )
 # 令牌构造前缀：本仓消费正则 `\[zero:([a-z][a-z0-9-]*)\]` 的依据。
