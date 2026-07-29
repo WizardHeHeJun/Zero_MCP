@@ -72,7 +72,11 @@ def _enable_channel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestSymmetricNormalize:
-    """对称归一化：与 `_linear_normalize` **不可互换**（零输入必须映到 0.0 而非 -1.0）。"""
+    """对称归一化：与「非负输入 → [0,ref] 映到 [-1,1]」那类单侧公式**不可互换**。
+
+    零输入必须映到 0.0 而非 -1.0；该单侧公式（v1 的 `_linear_normalize`，已随 HRV 改造删除）
+    还需配 `max(0.0, ·)` 地板，把整个低唤醒半边压成常数。
+    """
 
     def test_zero_maps_to_neutral(self) -> None:
         assert _symmetric_normalize(0.0, 1.0) == 0.0

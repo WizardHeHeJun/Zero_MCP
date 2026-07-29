@@ -174,10 +174,13 @@ class TestPerceptionToZeroE2E:
         async def _vision_src() -> np.ndarray | None:
             return vision_crop
 
-        # --- EdaChannel v2（蓝图任务 8 后的默认）需先暖机 ---
-        # v2 出首个读数要求「≥min_observations 条历史 **且** 跨度 ≥ horizon×cover=270s」，
-        # 单发 collect() 必然返回 None（冷启动，非故障）。此处注入可控时钟真实预热，
-        # 使本 E2E 验的是**新默认路径**而非退回 v1。
+        # --- 两条 physio 通道都需先暖机（EDA 2026-07-28 起 / HRV 2026-07-29 起同构）---
+        # 二者出首个读数都要求「≥min_observations 条历史 **且** 跨度 ≥ horizon×cover=270s」，
+        # 单发 collect() 必然返回 None（冷启动，非故障；两条同时 None 时该轮**完全没有
+        # physio 家族流**，这是已跨仓报备的 R5.1-bis 形状）。此处各注入一个可控时钟真实
+        # 预热，使本 E2E 验的是**新默认路径**而非退回任何旧度量。
+        # 暖机喂的是与正式轮相同的信号 ⇒ Δ=0 ⇒ μa=0：`build_recommended_prior` 无阈值，
+        # 读数为 0 仍会出流，故下面的「流在场」断言成立且不依赖信号强度。
         _eda_time = {"now": 0.0}
         eda_channel = EdaChannel(
             sampling_rate=4, signal_source=_eda_src, clock=lambda: _eda_time["now"]
@@ -186,10 +189,18 @@ class TestPerceptionToZeroE2E:
             await eda_channel.sense()
             _eda_time["now"] += 300.0  # >270s，两步即跨过覆盖率门
 
+        _hrv_time = {"now": 0.0}
+        hrv_channel = HrvChannel(
+            sampling_rate=256, signal_source=_ecg_src, clock=lambda: _hrv_time["now"]
+        )
+        for _ in range(2):
+            await hrv_channel.sense()
+            _hrv_time["now"] += 300.0  # 同门：1800×0.15=270s
+
         # --- 真 PerceptionHub.collect()：各通道跑真模型出真先验，不可用者 graceful 跳过 ---
         channels: list[Any] = [
             eda_channel,
-            HrvChannel(sampling_rate=256, signal_source=_ecg_src),
+            hrv_channel,
         ]
         if audio_ok:
             channels.append(AudioChannel(signal_source=_audio_src))

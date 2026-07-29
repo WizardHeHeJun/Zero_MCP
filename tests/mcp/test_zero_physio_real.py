@@ -17,8 +17,11 @@ marker：pytest.importorskip("neurokit2")——缺库自动 skip，不阻断 CI�
   本环境（conda affective-expression）未装 cvxopt。EdaChannel 已不做 phasic 分解、不依赖
   neurokit2，故不受影响；HRV 侧不涉及 cvxEDA。
 
-HRV 合法性测试（不要求判别力，验证真路径不崩）：
-  不同心率合成 ECG，HrvChannel → 至少一条产出合法 ModalityPrior。
+HRV 合法性测试（不要求度量有效性，验证真路径不崩 + 符号方向不反）：
+  合成 ECG 暖机建立基线后，**同一实例内**改变心率看 μa 方向。⚠ 2026-07-29 起 HrvChannel
+  同样是基线相对度量，跨实例比 μa 已无意义（各实例基线不同），旧的「每心率新建通道单发
+  sense」形态已按语义重整。判别力仍只在 WESAD 真被试上验：
+  `evals/wesad_hrv_v2_acceptance_gates.py`。
 """
 
 from __future__ import annotations
@@ -55,10 +58,6 @@ class _StepClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
-
-
-def _hrv_ch(rate: int = 256) -> HrvChannel:
-    return HrvChannel(sampling_rate=rate)
 
 
 @pytest.fixture(autouse=True)
@@ -132,13 +131,40 @@ class TestEdaChannelRealPathValidity:
 # ---------------------------------------------------------------------------
 
 
-class TestHrvChannelRealValidity:
-    """HrvChannel 真 NeuroKit2 路径：合成 ECG → 出合法 ModalityPrior，不崩。
+def _ecg(heart_rate: int, rate: int = 256, duration: int = 30, seed: int = 42) -> np.ndarray:
+    """合成一段 ECG（duration 秒保证足够 R-R 间期数——RMSSD 需多个心跳）。"""
+    return np.asarray(
+        nk.ecg_simulate(
+            duration=duration, sampling_rate=rate, heart_rate=heart_rate, random_state=seed
+        ),
+        dtype=np.float64,
+    )
 
-    ECG 合成唤醒语义较弱（heart_rate 与 arousal 关联不如 EDA 直接），
-    故合法性断言（physio 前缀、Πv==MIN、μa∈[-1,1]、μv==0）是主要契约；
-    W5 补弱单调断言：高心率 μa ≥ 低心率 μa - 0.1，容忍 nk 版本 offset，
-    但若反转逻辑整体方向坏了（如 RMSSD 取反丢失），差距会远超 0.1 而被捕获。
+
+async def _warm_hrv(ch: HrvChannel, clock: _StepClock, sig: np.ndarray, rate: int) -> None:
+    """按注入时钟喂若干窗，把通道推过冷启动双门（≥2 窗且跨度 ≥ horizon×coverage=270s）。
+
+    时钟步长 100s 只为跨过覆盖率门，与真实采集节拍无关（生产里步长 ≈ 窗长）。
+    """
+    for _ in range(3):
+        await ch.sense(signal={"ecg_or_ppg": sig, "sampling_rate": rate})
+        clock.advance(100.0)
+
+
+class TestHrvChannelRealValidity:
+    """HrvChannel 真 NeuroKit2 路径：合成 ECG → 出合法 ModalityPrior，方向不反。
+
+    ⚠ **2026-07-29 语义重整**：改造前这几条是「每个心率新建一个通道、单发 sense、**跨实例**
+    比 μa」。基线相减后跨实例比较**语义上已失效**——各实例的基线由它自己看过的历史决定，
+    两个实例的 μa 是相对不同零点的量，比大小没有意义（且单发必返回 None）。后继形态是
+    **同一实例内**的方向性守卫：先暖机建立基线，再改变心率看 μa 怎么动。这比原来的
+    「跨实例 ±0.1 容忍」**更强**——可以要求**严格**大于/小于，无需容忍阈值。
+
+    ⚠ **这里是 `nk.ecg_simulate` 合成信号**，只能证「真路径不崩 + 方向不反」，
+    **不得**用于标定任何常量、也**不构成度量有效性证据**：`heart_rate` 参数不等于 arousal，
+    本类依赖的只是合成信号自带的「高心率 → 短 R-R → 低 RMSSD」这一机械关系。
+    度量有效性由 WESAD 真被试验收：`evals/wesad_hrv_v2_acceptance_gates.py`。
+    （EDA v1 正是在合成信号上长期全绿、接真数据后才暴露反号。）
     """
 
     @pytest.mark.parametrize(
@@ -150,16 +176,23 @@ class TestHrvChannelRealValidity:
         ],
     )
     async def test_hrv_real_ecg_produces_valid_prior(self, heart_rate: int, label: str) -> None:
-        """真 ECG（不同心率）→ HrvChannel → 合法 ModalityPrior。"""
+        """真 ECG（不同心率）→ 暖机后 → 合法 ModalityPrior，且**绝对水平无关**。
+
+        暖机与读数用同一段信号 ⇒ Δ=0 ⇒ μa **恒为 0.0**，无论该心率下 RMSSD 的绝对值是多少。
+        这一条同时是跨被试可比性在真路径上的直接体现（v1 的固定 ref 下三档心率会给出三个
+        差异极大的读数：实测 0.579 / 0.852 / 0.928）。
+        """
         rate = 256
-        duration = 30  # 秒，保证足够 R-R 间期数（RMSSD 需多个心跳）
-        ecg_sig = nk.ecg_simulate(
-            duration=duration,
-            sampling_rate=rate,
-            heart_rate=heart_rate,
-            random_state=42,
+        clock = _StepClock()
+        ch = HrvChannel(sampling_rate=rate, clock=clock)
+        ecg_sig = _ecg(heart_rate, rate=rate)
+
+        assert await ch.sense(signal={"ecg_or_ppg": ecg_sig, "sampling_rate": rate}) is None, (
+            f"{label}：首窗应因无基线返回 None"
         )
-        ch = _hrv_ch(rate=rate)
+        clock.advance(100.0)
+        await _warm_hrv(ch, clock, ecg_sig, rate)
+
         result = await ch.sense(signal={"ecg_or_ppg": ecg_sig, "sampling_rate": rate})
 
         print(
@@ -169,82 +202,68 @@ class TestHrvChannelRealValidity:
             f"  Πv = {result.precision[0] if result else None}"
         )
 
-        assert result is not None, f"{label}：HrvChannel 未产出 ModalityPrior（路径崩溃）"
+        assert result is not None, f"{label}：暖机后 HrvChannel 未产出 ModalityPrior（路径崩溃）"
         assert result.modality == "hrv/rmssd", f"modality 应为 hrv/rmssd，实际 {result.modality}"
         assert result.precision[0] == pytest.approx(MIN_PRECISION), "Πv 应 == MIN_PRECISION"
         assert result.mu[0] == pytest.approx(0.0), "μv 应 == 0.0（valence 盲）"
         assert -1.0 <= result.mu[1] <= 1.0, f"μa={result.mu[1]} 超出 [-1,1]"
         assert result.precision[1] > 0.0, "Πa 应 > 0"
+        assert result.mu[1] == pytest.approx(0.0, abs=1e-9), (
+            f"{label}：信号未变（Δ=0）却读出 μa={result.mu[1]}——度量不再是「相对自身基线」，"
+            "绝对水平又漏进了读数"
+        )
 
-    async def test_hrv_monotone_direction_weak_assertion(self) -> None:
-        """W5：高心率 μa ≥ 低心率 μa - 0.1（宽容单调断言，锁定 RMSSD 反转方向）。
+    async def test_hrv_direction_within_one_instance(self) -> None:
+        """**同一实例内**方向性：基线建于 60bpm，喂 120bpm → μa **严格上升**；反向亦然。
 
-        实测（random_state=42）：60→0.579、90→0.852、120→0.928，差值远大于 0.1。
-        容忍阈值 0.1 允许 nk 版本间的 RMSSD 数值 offset，但若反转逻辑方向整体坏了
-        （如取反符号丢失导致高心率反而映射低 μa），差距会超过 0.1 被捕获。
+        依据：高心率 → 短 R-R 间期 → RMSSD 降低；本度量 Δ = 基线 − 当前 ⇒ μa 升。
+        这是符号方向的真路径守卫（另两重：`_process` 就近注释 + 单测
+        `TestHrvSignDirection` + evals 的 G-Sign 门）。
+        判别力已实证：把产品码 `baseline - rmssd_ms` 反号为 `rmssd_ms - baseline`，本例在
+        第一条方向断言处即红（实测 60bpm 基线 → 120bpm 读出 **−0.174** 而非 +0.174；
+        pytest 在首条断言失败即终止，故第二个方向在同一次运行里观测不到，但两侧读数严格
+        互为相反数，反向断言必同红）。
+
+        ⚠ 不是度量有效性证据（见类 docstring）：`heart_rate` ≠ arousal。
         """
         rate = 256
-        duration = 30
-        heart_rates = [60, 90, 120]
-        mu_a_by_hr: dict[int, float] = {}
+        calm, active = _ecg(60, rate=rate), _ecg(120, rate=rate)
 
-        for hr in heart_rates:
-            ecg_sig = nk.ecg_simulate(
-                duration=duration, sampling_rate=rate, heart_rate=hr, random_state=42
-            )
-            ch = _hrv_ch(rate=rate)
-            result = await ch.sense(signal={"ecg_or_ppg": ecg_sig, "sampling_rate": rate})
-            assert result is not None, f"hr={hr}bpm 未产出先验"
-            mu_a_by_hr[hr] = result.mu[1]
-            print(f"  HrvChannel(hr={hr}bpm, random_state=42) → μa = {mu_a_by_hr[hr]:.6f}")
+        # ① 静息基线 → 高心率：μa 必须严格上升（且越过中性 0）
+        clock_up = _StepClock()
+        ch_up = HrvChannel(sampling_rate=rate, clock=clock_up)
+        await _warm_hrv(ch_up, clock_up, calm, rate)
+        calm_read = await ch_up.sense(signal={"ecg_or_ppg": calm, "sampling_rate": rate})
+        clock_up.advance(100.0)
+        active_read = await ch_up.sense(signal={"ecg_or_ppg": active, "sampling_rate": rate})
 
-        mu_a_60, mu_a_90, mu_a_120 = mu_a_by_hr[60], mu_a_by_hr[90], mu_a_by_hr[120]
+        # ② 高心率基线 → 静息：μa 必须严格下降（反向对照，排除「读数恒正」这类退化解释）
+        clock_down = _StepClock()
+        ch_down = HrvChannel(sampling_rate=rate, clock=clock_down)
+        await _warm_hrv(ch_down, clock_down, active, rate)
+        active_base = await ch_down.sense(signal={"ecg_or_ppg": active, "sampling_rate": rate})
+        clock_down.advance(100.0)
+        calm_after = await ch_down.sense(signal={"ecg_or_ppg": calm, "sampling_rate": rate})
 
-        # W5 宽容单调断言：容忍 ±0.1 的 nk 版本 offset，锁定整体方向
-        tolerance = 0.1
-        assert mu_a_90 >= mu_a_60 - tolerance, (
-            f"[W5 方向断言] hr=90 μa={mu_a_90:.4f} 应 ≥ hr=60 μa={mu_a_60:.4f} - {tolerance}；"
-            "差值超出容忍范围，RMSSD 反转逻辑可能方向坏了"
-        )
-        assert mu_a_120 >= mu_a_90 - tolerance, (
-            f"[W5 方向断言] hr=120 μa={mu_a_120:.4f} 应 ≥ hr=90 μa={mu_a_90:.4f} - {tolerance}；"
-            "差值超出容忍范围，RMSSD 反转逻辑可能方向坏了"
-        )
-        assert mu_a_120 >= mu_a_60 - tolerance, (
-            f"[W5 方向断言] hr=120 μa={mu_a_120:.4f} 应 ≥ hr=60 μa={mu_a_60:.4f} - {tolerance}；"
-            "差值超出容忍范围，RMSSD 反转逻辑可能方向坏了"
+        assert calm_read is not None and active_read is not None
+        assert active_base is not None and calm_after is not None
+        print(
+            f"\n[HRV 同实例方向性] 60bpm 基线：{calm_read.mu[1]:+.6f} → 120bpm "
+            f"{active_read.mu[1]:+.6f}\n"
+            f"                    120bpm 基线：{active_base.mu[1]:+.6f} → 60bpm "
+            f"{calm_after.mu[1]:+.6f}"
         )
 
-    async def test_hrv_different_heart_rates_print_mu_a(self) -> None:
-        """打印不同心率对应 μa，供人工复查 HRV 反转逻辑（高心率≈低 RMSSD≈高 arousal）。
-
-        W5：在打印基础上补弱单调断言——最高档 μa ≥ 最低档 μa - 0.1，
-        确保反转逻辑方向整体正确；容忍 nk 版本间的 RMSSD 数值 offset。
-        """
-        rate = 256
-        heart_rates = [60, 75, 90, 110]
-        mu_a_values: list[float] = []
-
-        for hr in heart_rates:
-            ecg_sig = nk.ecg_simulate(
-                duration=30, sampling_rate=rate, heart_rate=hr, random_state=0
-            )
-            ch = _hrv_ch(rate=rate)
-            result = await ch.sense(signal={"ecg_or_ppg": ecg_sig, "sampling_rate": rate})
-            assert result is not None, f"hr={hr}bpm 未产出先验"
-            mu_a = result.mu[1]
-            mu_a_values.append(mu_a)
-            print(f"  HrvChannel(hr={hr}bpm) → μa = {mu_a:.6f}")
-
-        # W5 宽容单调断言：最高心率(110) μa ≥ 最低心率(60) μa - 0.1
-        # 实测：60→0.305、75→0.790、90→0.877、110→0.911，差值 ~0.6，远大于容忍阈值
-        mu_a_lowest_hr = mu_a_values[0]  # hr=60
-        mu_a_highest_hr = mu_a_values[-1]  # hr=110
-        tolerance = 0.1
-        assert mu_a_highest_hr >= mu_a_lowest_hr - tolerance, (
-            f"[W5 方向断言] hr=110 μa={mu_a_highest_hr:.4f} 应 ≥ hr=60 μa={mu_a_lowest_hr:.4f} "
-            f"- {tolerance}；差值超出容忍范围，RMSSD 反转逻辑（高心率→低 RMSSD→高 μa）可能坏了"
+        assert active_read.mu[1] > calm_read.mu[1], (
+            f"心率 60→120（RMSSD 降）μa 未上升：{calm_read.mu[1]:.6f} → {active_read.mu[1]:.6f}"
+            "——Δ 的减法方向很可能写反了（EDA v1 系统性反号病的复刻形态）"
         )
+        assert active_read.mu[1] > 0.0, "相对静息基线的高心率窗应读出**正**唤醒"
+        assert calm_after.mu[1] < active_base.mu[1], (
+            f"心率 120→60（RMSSD 升）μa 未下降：{active_base.mu[1]:.6f} → {calm_after.mu[1]:.6f}"
+            "——低唤醒半边可能又被单侧地板压平了"
+        )
+        assert calm_after.mu[1] < 0.0, "相对高心率基线的静息窗应读出**负**唤醒（地板已删）"
 
 
 # ---------------------------------------------------------------------------

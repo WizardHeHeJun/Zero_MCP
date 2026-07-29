@@ -422,15 +422,19 @@ class TestPerceptionHubPrepareAll:
         assert hub.prepared is True
 
     async def test_real_heavy_channels_expose_prepare(self) -> None:
-        """真通道（audio/vision）须实现 prepare()——否则修复对生产路径不生效。
+        """真通道（audio/vision/**hrv**）须实现 prepare()——否则修复对生产路径不生效。
 
         判别性守卫：若日后有人删掉 AudioChannel.prepare，本例红；仅靠上面的假通道测试
         无法发现（假通道自带 prepare）。
+        ⚠ HrvChannel 是 ``prepare_all`` docstring 里那条 traceback 的**受害方**（其
+        ``nk.hrv_time → scipy`` 会探测半成品 torch），却长期没有 prepare()——2026-07-29
+        补齐并纳入本守卫。EdaChannel 不在其列：它不依赖 neurokit2，无重依赖可预热。
         """
         from src.mcp.zero.channels.audio_channel import AudioChannel
+        from src.mcp.zero.channels.physio_channel import HrvChannel
         from src.mcp.zero.channels.vision_channel import VisionChannel
 
-        for cls in (AudioChannel, VisionChannel):
+        for cls in (AudioChannel, VisionChannel, HrvChannel):
             assert callable(getattr(cls, "prepare", None)), (
                 f"{cls.__name__} 缺 prepare()——并发首次 import 竞态会复活"
             )
