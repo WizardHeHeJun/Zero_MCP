@@ -228,6 +228,22 @@ _RECOMMENDED_PRECISION_DEFAULTS: dict[ModalityKind, tuple[float, float]] = {
     ModalityKind.PHYSIO: (MIN_PRECISION, 0.18),
 }
 
+PHYSIO_PRECISION_A_SELF_IGNITE_BOUND: float = 0.359
+"""**自点燃硬上界**：physio 的 Πa 一旦 ≥ 此值，我方 physio 流可自行越过 Zero 的点燃门。
+
+推导（Zero `stream_salience` = hypot(μ)·mean(Π)、`SALIENCE_THRESHOLD` = 0.18）：
+physio 的 μv 恒 0（Kreibig 2010 + Zero M2），故 hypot(μ)=|μa| ≤ 1；Πv 恒 MIN_PRECISION。
+最坏情形 |μa|=1 时 salience = (MIN_PRECISION + Πa)/2 ≥ 0.18 ⟺ Πa ≥ 0.36 − 1e-3 = 0.359。
+
+⚠ **为什么这条要写成常量而不是注释**：Πa 由 env ``EXTERNAL_PHYSIO_PRECISION_A`` 控，
+Zero 侧只有 cap=0.8 的宽上界。而 Zero 的 D7 承诺（`exclude_physio_fusion` 默认 True，
+按前缀把 physio 剔出融合）**只写在门开分支里**——门关（默认）走硬门阈值路径，D7 管不到。
+即：我方单方面把 Πa 调过本值，就能在默认配置下让被判定为反号的 physio 真正进入 Zero 的
+数值后验，绕过 Zero 应我方之请所做的跨仓承诺。这不是 Zero 能拦的，只能我方自律。
+守卫见 `tests/mcp/test_zero_contract_crosscheck.py` 的
+``test_physio_default_precision_stays_below_self_ignite_bound``（推荐态与合并态双查）。
+"""
+
 # 各模态精度的 env 覆盖键（与 Zero .env.example 同名，供两仓一致调参）。
 # ⚠ 新增 ModalityKind 成员时须同步补齐本 dict 与 _RECOMMENDED_PRECISION_DEFAULTS。
 _PRECISION_ENV_KEYS: dict[ModalityKind, tuple[str, str]] = {
@@ -583,8 +599,19 @@ def build_external_priors_override(
 
     # EDA/HRV 预合并（Zero 议会 2026-07-28 终裁：**默认开**）。二者高度相关，作两条独立流
     # 注入会把合并精度虚增 2 倍（Σπ=0.35）。默认开而非默认关的理由：这不是「新增能力」而是
-    # **载荷构造的正确性修正**，且在 Zero 当前判据下 physio 流本就恒不点燃 → 今日**零可观测
-    # 回归**，待 Zero 按轴加权公式落地后自动生效正确语义。需保留旧行为传 merge_physio=False。
+    # **载荷构造的正确性修正**，且在 Zero 默认配置下 physio 流恒亚阈 → 今日**零可观测回归**。
+    # 需保留旧行为传 merge_physio=False。
+    #
+    # ⚠ 2026-07-29 跨仓核验订正：原注释写的「待 Zero 按轴加权公式落地后自动生效正确语义」
+    # **不成立**。「按轴加权 D + θ'=0.28」方案已在 Zero 议会第三轮被「硬门摘出数值通路
+    # （线A，ZERO_IGNITION_GATE_FUSION）」取代；且 Zero 落的是 **D7 默认排除 physio**
+    # （`ignite` 门开分支按 `_PHYSIO_PREFIXES` 剔除，`exclude_physio_fusion` 默认 True，
+    # 系应我方「EDA 反号，宁可继续门掉」之请）。故不存在「自动生效」——门开后 physio 反而
+    # 被显式剔出融合，须 Zero 单边显式关闭 exclude_physio_fusion 才可能参与数值。
+    # 另注：「恒亚阈」是**默认精度下的性质、非结构保证**——Πa 走 env
+    # ZERO_EXTERNAL_PHYSIO_PRECISION_A、Zero 侧仅有 cap=0.8 的上界，抬到 ≥0.359 时
+    # physio 在**门关**硬门下即可自行过阈进入融合，且该路径不受 D7 排除保护（见下方
+    # PHYSIO_PRECISION_A_SELF_IGNITE_BOUND）。
     # M6 流数校验置于合并**之后**：合并减少流数，按最终注入形状计数才是 Zero 实际收到的。
     if merge_physio:
         priors = merge_physio_priors(priors)
