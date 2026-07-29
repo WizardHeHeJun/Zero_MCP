@@ -13,6 +13,14 @@ M3/M6 客户端 fail-fast（早于 Zero 报错、消息更清晰，阈值默认�
 生理流的效价精度 Πv 在 Zero 侧 M2 被无条件覆写为 MIN_PRECISION，故客户端 M3 校验按 MIN 计
 （不因 MCP 透传的高 Πv 误报），MCP 侧仍原样透传由 Zero 权威覆写。
 
+出网收口点另有两条 physio 专属 fail-fast，**覆盖面不相交、互不顶替**：
+- M8 **MCP 侧单边**自律守卫（Zero 无对应旋钮、也拦不住）——「**配置越顶**」：出线 physio 流的
+  Πa 不得高到使该流**不经开门动作**即越过 Zero 点燃门 `SALIENCE_THRESHOLD`。判据按最坏情形
+  现算而非比常量，见 `PHYSIO_PRECISION_A_SELF_IGNITE_BOUND` / `_physio_self_ignite_salience`。
+- M9 **跨仓协议**守卫——「**契约违反**」：出线 physio 流的 μv 必须恒 0.0（「生理对效价盲」，
+  我方回件 §6-8 已入协议，Zero 侧同步落 `mu=(0.0, mu[1])`）。非零 μv 能在不换取任何后验
+  影响力的前提下单买点燃资格，而 Πa 配得低时 M8 完全看不见它。
+
 各模态推荐精度默认（design.md §五·三席调和，env EXTERNAL_* 可调）经 recommended_precision /
 build_recommended_prior 提供，供感知侧盖精度时参考。
 
@@ -49,7 +57,7 @@ EXTERNAL_PRIOR_SCHEMA_VERSION: int = 1
 """
 
 # ---------------------------------------------------------------------------
-# Zero 侧校验默认值镜像（M3 精度上界 / M6 流数上界 / MIN_PRECISION）
+# Zero 侧校验默认值镜像（M3 精度上界 / M6 流数上界 / MIN_PRECISION / 点燃门阈值）
 # ---------------------------------------------------------------------------
 
 MIN_PRECISION: float = 1e-3
@@ -66,6 +74,22 @@ ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT: float = 0.8
 （`Field(default=0.8, gt=0.0)`，env ZERO_EXTERNAL_PRIOR_PRECISION_CAP 默认 0.8）。
 修改须与 Zero 侧协调（M3，防默认值漂移；
 跨仓回归 assertEqual 此值与 Zero 侧 AffectState 字段默认）。
+"""
+
+ZERO_SALIENCE_THRESHOLD: float = 0.18
+"""点燃门阈值，镜像 Zero `src/agents/affect_math.py::SALIENCE_THRESHOLD`（现场核验 2026-07-29）。
+
+Zero 的判据是 `_select_fired` 里的 ``s >= threshold``——**取等即点燃**，故本仓 M8 守卫的
+比较也必须用 ``>=``（见 `_physio_self_ignite_salience`）。
+
+⚠ **这是本模块唯一一个「Zero 侧阈值」镜像，漂移风险实在**：Zero 改 SALIENCE_THRESHOLD 时
+本常量不会自动跟随。防漂移靠两道既有锚点，**不是**靠这句注释：
+- `tests/mcp/test_zero_contract_crosscheck.py::_ZERO_GATE_CONSTANTS` 逐值 pin Zero 源码里的
+  `SALIENCE_THRESHOLD`（Zero 一改即红）；
+- 同文件 ``test_physio_default_precision_stays_below_self_ignite_bound`` 从 Zero 源码**现算**
+  上界并与 `PHYSIO_PRECISION_A_SELF_IGNITE_BOUND` 对账。
+本常量另有一条直接 pin（``test_mirrored_salience_threshold_matches_zero_source``）把「产品码里
+的镜像值」与 Zero 源码绑死——前两道锚点只覆盖测试侧的现算，覆盖不到产品码这个新镜像。
 """
 
 ZERO_MAX_EXTERNAL_STREAMS_DEFAULT: int = 5
@@ -249,25 +273,128 @@ Zero `expand_external_priors` 的 M2 分支（按 `_PHYSIO_PREFIXES` 命中）**
 `src/mcp/zero/channels/physio_channel.py` 的 `EdaChannel` 与 `HrvChannel` 各一处 `mu_v = 0.0`，
 以及本模块 `merge_physio_priors` 出线的 `mu=(0.0, mu_merged_a)`。
 ⇒ 一旦任一 physio 流带**非零 μv**（v2 改口径 / 未来 RSP 子源 / 合并式产出新 μv），
-hypot(μ) 最大到 √2，真实自点燃上界**收紧到 ≈0.2536**（= 2·0.18/√2 − MIN_PRECISION）；
-届时 0.359 会**松约 30%**，而现有守卫按 μv≡0 的闭式复算、**不会报错**——即文案说的缺口在、
-断言却测不到。故三处硬写锚点**不得删注释**，改口径时必须成对复算本常量与守卫里的现算式。
-本轮（R7）**只订正归因与风险陈述，不动 0.359 这个数值**——是否把「physio 前缀流强制
-μ=(0.0, μa)」写进跨仓协议（写进 = 把上界从两仓自律升级为单侧结构保证）待双方拍板。
-前提的守卫分布在三处（对应三处硬写）：通道侧 EDA/HRV 见
+hypot(μ) 最大到 √2，真实自点燃上界**收紧到 `2·SALIENCE_THRESHOLD/√2 − MIN_PRECISION`**
+（今日阈值下真值 **0.2535584412271571**；对外文书里的 `0.2536` 是**向上取整的口径**，
+差 4.16e-5）；届时 0.359 会**松约 30%**。故三处硬写锚点**不得删注释**。
+⚠ **禁止手抄 0.2536 当判据**（回件 §6-8 数值订正 1，两仓同款约定）：钉一个比真界**松**的常量
+等于守卫自带一条永远测不到的缝。凡进入断言/比较的地方一律从 `ZERO_SALIENCE_THRESHOLD`
+现算；`0.2536` 只可出现在叙述性文字里，且须标明是向上取整口径。
+
+✅ **该缺口已于 2026-07-29 堵上**（本条原文案为「现有守卫按 μv≡0 的闭式复算、**不会报错**
+——即文案说的缺口在、断言却测不到」，现按实际实现如实改写）：出网收口点新增的 **M8 运行期
+守卫**（`build_external_priors_override` 内，助手 `_physio_self_ignite_salience`）**不复算
+本常量、也不与本常量比较**，而是对每条出线 physio 流按 ``hypot(μv, 1.0)·mean(Π)`` **现算**
+最坏情形 salience 再与 `ZERO_SALIENCE_THRESHOLD` 比。**μv 取出线实测值、不假定其为 0**，
+故 μv 一旦变非零，守卫施加的 Πa 硬顶**自动**从 0.359 收紧到 2·0.18/hypot(μv,1) − MIN
+（μv=±1 时即上文 0.2535584412271571），无需任何人记得回来改数。0.359 因此降级为
+「μv=0 这一特例下的闭式解 + 对外承诺的口径」，**不再是守卫的判据来源**——判据只有
+Zero 阈值这一个镜像。
+
+⚠ **不依赖 Zero 侧 μv 归零**：现场核验（2026-07-29，Zero main `69f9e88`，工作树对
+affect_math.py 无改动）发现 Zero 已在 M2 分支补上 ``mu = (0.0, mu[1])``，即 μv≡0 **今天**
+也是 Zero 侧的结构保证了。M8 **仍按未归零算**，两条理由：① 该归零是当日新增，而「把判别力
+挂在对方当前处于哪一态」是本仓已立案的跨仓硬教训（同 M3′ isfinite 一条，实测对方状态可在
+一天内变三次）；② 按未归零算只会**更保守**（我方今天出线 μv 恒 0，两种算法逐位同值，
+零回归），代价为零。前提的守卫分布在三处（对应三处硬写）：通道侧 EDA/HRV 见
 tests/mcp/test_zero_physio_channel.py 的 `test_mu_v_is_zero` / `test_hrv_mu_v_is_zero`；
 合并出线见 tests/mcp/test_zero_external_priors.py::TestPhysioOutboundMuVZeroPremise；
 通道→wire 端到端见 tests/mcp/test_zero_physio_channel.py::
 `test_channel_priors_reach_wire_with_zero_mu_v`。
+
+✅ **「写不写进跨仓协议」已拍板，不再是待议项**（原文案写「仍待双方拍板」，与我方**已发出**的
+回件矛盾，2026-07-29 如实改写）：我方在
+`notes/2026-07-29-mcp-reply-to-zero-asks.md` §6-8 **选 (a) 入协议**——Zero 在 M2 里对 physio
+前缀流强制 `mu = (0.0, mu[1])`，**且我方同时在出境侧加 fail-fast**，不让对方一家兜。落地状态：
+- **Zero 那半：已落**（其 `src/agents/affect_math.py` M2 分支现有 `mu = (0.0, mu[1])`，
+  commit `8043176`，其 message 直接引用本仓回件 §6-5A/§6-8）。
+- **我方那半：本次补齐 = M9**（`build_external_priors_override` 出网收口点，出线 μv≠0 即 raise；
+  回归面见 tests/mcp/test_zero_external_priors.py::TestM9PhysioValenceContract）。
+理由（回件原话）：合并产出的新 μ、`model_construct`/鸭子类型绕过口**只有我方出境侧看得见**；
+两侧各封一半，μv≡0 才成为**两侧各自的**结构不变量。
+⚠ **主句限定**（同 §6-8）：这只对**我方载荷**把 0.359 升为不变量；任何**其它** MCP client 仍可
+向 Zero 送非零 μv，故 **Zero 侧的通用真界仍是 0.2535584412271571**。
+⚠ **M8 的算法不因此改动**：它继续按「未归零」现算（μv 取实测），两条理由同上 ①②。M9 在前
+使这条通路上 μv 恒 0，M8 的一般性成为纵深余量而非死码——M9 一旦被放宽/摘除，M8 自动按 √2
+收紧而不是静默按 0.359 放行。
 
 ⚠ **为什么这条要写成常量而不是注释**：Πa 由 env ``EXTERNAL_PHYSIO_PRECISION_A`` 控，
 Zero 侧只有 cap=0.8 的宽上界。而 Zero 的 D7 承诺（`exclude_physio_fusion` 默认 True，
 按前缀把 physio 剔出融合）**只写在门开分支里**——门关（默认）走硬门阈值路径，D7 管不到。
 即：我方单方面把 Πa 调过本值，就能在默认配置下让被判定为反号的 physio 真正进入 Zero 的
 数值后验，绕过 Zero 应我方之请所做的跨仓承诺。这不是 Zero 能拦的，只能我方自律。
-守卫见 `tests/mcp/test_zero_contract_crosscheck.py` 的
-``test_physio_default_precision_stays_below_self_ignite_bound``（推荐态与合并态双查）。
+
+⚠ **两条运行期守卫的覆盖面是两条不相交的轴，一条顶不了另一条**（读到这里最容易犯的错）：
+
+===========  ==========================  ================================================
+守卫          管什么                       它**接不住**什么（须由另一条接）
+===========  ==========================  ================================================
+**M8**       **配置越顶**：μv 合规（=0）   μv=0.9、Πa=0.05 的伪造流——最坏 salience≈0.034
+             但 Πa 高到该流不经开门动作     ≪0.18，**M8 全程放行**，却违反「physio 对效价盲」
+             即可自行越过点燃门             这条被承诺要 fail-fast 的契约
+**M9**       **契约违反**：出线 μv≠0.0     Πa 被调到 0.39（μv 正常为 0）——**M9 全程放行**，
+             （该流根本不该带效价）         只有 M8 拦得住
+===========  ==========================  ================================================
+
+即：M8 只看「这个 Πa 危不危险」，M9 只看「这条流该不该有 μv」；两条**各自**都存在整类
+它看不见的失效。M9 的完整论述见 `build_external_priors_override` 内 M9 处的块注释。
+
+M8 这一条自身又分**两道**，缺一不可（覆盖面不同，别当重复）：
+- **常量态**（`tests/mcp/test_zero_contract_crosscheck.py::`
+  ``test_physio_default_precision_stays_below_self_ignite_bound``，推荐态与合并态双查）：
+  只看 `_RECOMMENDED_PRECISION_DEFAULTS` 与子源可靠度这两个**源码常量**，
+  故对 ``EXTERNAL_PHYSIO_PRECISION_A=0.39`` 这类 **env 覆盖恒绿**——这正是 Zero 18:25 裁定件
+  点的那条缺口（我方交付 hrv 残差 σ=1.6 ⇒ Πa=0.39 时只核了 Zero 的 cap=0.8，漏了本硬顶）。
+- **运行期态**（M8，`build_external_priors_override` 出网收口点）：校验**最终出线值**，
+  env / 显式入参 / 合并产出 / `model_construct` 伪造 **四条通路全覆盖**。
 """
+
+
+def _physio_self_ignite_salience(
+    mu: tuple[float, float],
+    pi_v_effective: float,
+    pi_a: float,
+) -> tuple[float, float]:
+    """现算一条出线 physio 流的**最坏情形 salience** 及其对应的 Πa 硬顶（M8 判据核心）。
+
+    镜像 Zero `src/agents/affect_math.py::stream_salience`::
+
+        salience = hypot(μv, μa) · (Πv + Πa)/2
+
+    与之的**两点刻意偏离**（都是「按最坏情形定，不按当轮读数定」的同一个决定）：
+
+    1. **|μa| 一律按域上界 1.0 代入，不用当轮实测 μa**。M8 要拦的是**配置**级危险
+       （「这个 Πa 使该流*有能力*自点燃」），不是「本轮这条载荷恰好越了线」。按实测 μa 算
+       会让 ``Πa=0.39`` 这种越顶配置在低唤醒时段一路绿灯上线，只在某个高唤醒瞬间才首次
+       触发——那时它已经在生产里了。按最坏情形算则**配置一落地就红**。
+       代价是拦下「配了高 Πa 但恰好这轮 μa 小」的载荷；这正是意图，不是误报。
+    2. **μv 取出线实测值，不假定为 0**（见 `PHYSIO_PRECISION_A_SELF_IGNITE_BOUND` 的
+       「不依赖 Zero 侧 μv 归零」段）。今天出线 μv 恒 0 ⇒ hypot=1 ⇒ 硬顶恰为 0.359；
+       μv 一旦变非零，hypot>1 ⇒ 硬顶**自动收紧**（μv=±1 时收到 2·T/√2 − MIN
+       = 0.2535584412271571，即对外口径向上取整写的那个 0.2536），守卫无需改一个字。
+       ⚠ 自 M9 落地起，`build_external_priors_override` 这条通路上 physio 的非零 μv 会被 M9
+       先行拒绝，故本函数的非零-μv 分支在**该通路**上不可达；判别力改由本函数的**纯函数级**
+       用例直接覆盖（见 tests 里对本函数的逐格调用）。保留该一般性是**有意的纵深**：M9 若被
+       放宽/摘除，硬顶自动收紧，而不是静默退回 0.359。
+
+    `pi_v_effective` 由调用方按 Zero M2 镜像给出（physio 恒 MIN_PRECISION）：Zero 对 physio
+    无条件覆写 Πv=MIN，故用 wire 上的原始 Πv 会**比 Zero 更严**（与 M3 的 `_triggers_zero_m2`
+    豁免同理）；而 wire Πv 若小于 MIN，Zero 反而把它抬到 MIN——取 MIN 两个方向都不低估。
+
+    Args:
+        mu:             出线 (μv, μa)（**已过 M7 域校验**，故必为 [-1,1] 内的有限数）。
+        pi_v_effective: 按 Zero M2 镜像后的效价精度（physio 恒 MIN_PRECISION）。
+        pi_a:           出线唤醒度精度（**已过 M3 有限性校验**）。
+
+    Returns:
+        ``(最坏情形 salience, 该 μv 下的 Πa 硬顶)``。硬顶 = 使最坏 salience 恰等于阈值的
+        Πa，即 ``2·threshold/hypot(μv,1) − Πv_eff``；salience ≥ 阈值 ⟺ Πa ≥ 硬顶。
+    """
+    # |μa| 打满到域上界 1.0（最坏情形），μv 取实测——见上文偏离说明
+    deviation = math.hypot(mu[0], 1.0)
+    worst_salience = deviation * 0.5 * (pi_v_effective + pi_a)
+    pi_a_ceiling = 2.0 * ZERO_SALIENCE_THRESHOLD / deviation - pi_v_effective
+    return worst_salience, pi_a_ceiling
+
 
 # 各模态精度的 env 覆盖键（与 Zero .env.example 同名，供两仓一致调参）。
 # ⚠ 新增 ModalityKind 成员时须同步补齐本 dict 与 _RECOMMENDED_PRECISION_DEFAULTS。
@@ -629,6 +756,22 @@ def build_external_priors_override(
         计**（镜像 Zero M2-先于-M3 顺序）——MCP 透传的高 Πv 不会在此误报，Zero 侧才权威
         覆写为 MIN；生理流的 Πa 仍照常校验上界。
 
+    M8 自点燃硬顶 fail-fast（**MCP 侧单边自律，Zero 拦不住**）：
+        每条**出线** physio 流按 ``hypot(μv, 1.0)·mean(Π)`` 现算最坏情形 salience，
+        ≥ Zero `SALIENCE_THRESHOLD`（0.18）即 raise ValueError。等价于对 Πa 施加硬顶
+        （μv=0 时即 `PHYSIO_PRECISION_A_SELF_IGNITE_BOUND`=0.359，μv≠0 时自动收紧）。
+        与 M3 的关系是**互补而非冗余**：Zero 的 cap=0.8 宽得多、根本接不住这条，且越过
+        点火阈值**不报错、只静默放行**（Zero 2026-07-29 裁定件原话要点）。详见
+        `PHYSIO_PRECISION_A_SELF_IGNITE_BOUND` 与 `_physio_self_ignite_salience`。
+
+    M9 physio 效价契约 fail-fast（跨仓协议·**我方那半**）：
+        每条**出线** physio 流的 μv 必须恒 0.0（「生理信号对效价盲」），否则 raise ValueError。
+        我方回件 §6-8 已选 (a) 入协议，Zero 侧同步在 M2 落 `mu = (0.0, mu[1])`（commit
+        8043176）；本条是我方承诺的出境侧那半，**不依赖对方状态**。
+        与 M8 **不可互相顶替**：M8 只看 Πa 危不危险，对「μv=0.9 但 Πa=0.05」的伪造流
+        （最坏 salience≈0.034 ≪ 0.18）全程放行；M9 只看该流该不该带 μv，对「μv=0 但 Πa=0.39」
+        全程放行。同时违反时**先报 M9**（契约违反是根因，按不该存在的 μv 去调 Πa 只修症状）。
+
     M2 命名建议：
         生理模态先验（EDA/HRV/瞳孔/SCR）的 ModalityPrior.modality 应以
         PHYSIO_STREAM_PREFIXES 中的前缀命名，以触发 Zero 侧效价精度覆写（M2）。
@@ -648,7 +791,10 @@ def build_external_priors_override(
         即传给 ``session.step(state_overrides=...)`` 的 dict 载荷（精度原样透传）。
 
     Raises:
-        ValueError: len(priors) > max_streams（M6）；或某条先验 Πv/Πa > precision_cap（M3）。
+        ValueError: len(priors) > max_streams（M6）；某条出线先验 μ 越 [-1,1] 域（M7）；
+            某条出线 physio 流的 μv ≠ 0.0（M9）；Πv/Πa 非有限或 > precision_cap（M3）；
+            或某条出线 physio 流的 Πa 达到自点燃硬顶（M8）。**M3/M7/M8/M9 均校验合并后的
+            出线值**，不是入参 priors。逐流内的执行序为 M7 → M9 → M3 → M8。
 
     典型用法（未来 Zero MCP client 接入后，当前不做真调用）::
 
@@ -705,12 +851,58 @@ def build_external_priors_override(
                     "（镜像 Zero expand_external_priors 的 M7 μ 域 fail-fast）。"
                     "注意本校验作用于合并后的出线值，请检查 ModalityPrior 构造或合并输入。"
                 )
-        # M3：精度上界。镜像 Zero M2-先于-M3——生理流 Πv 会被 Zero 覆写为 MIN，故校验时按 MIN
-        # 计（不因 MCP 透传的高 Πv 误报），MCP 侧仍原样透传由 Zero 权威覆写。生理流判定用
-        # _triggers_zero_m2（忠实镜像 Zero 的 name.lower().startswith）而非 is_physio_stream，
-        # 确保客户端不比 Zero 更严（大写/裸前缀流名也正确豁免）。
+        # 生理流判定用 _triggers_zero_m2（忠实镜像 Zero 的 name.lower().startswith）而非
+        # is_physio_stream，确保「Zero 认定是 physio 的流」与「我方施加额外约束的流」**完全同集**
+        # ——下方 M3 豁免、M8、M9 三处共用这一个判定，任何一处换判定都会造成两仓认定错位。
+        # effective_pi_v：Zero M2 对 physio 无条件覆写 Πv=MIN，三处论断一律按覆写后的值算。
         triggers_m2 = _triggers_zero_m2(name)
         effective_pi_v = MIN_PRECISION if triggers_m2 else pi_v
+
+        # M9：physio「对效价盲」契约 fail-fast —— 我方 2026-07-29 回件
+        # `notes/2026-07-29-mcp-reply-to-zero-asks.md` §6-8 承诺的**我方那半**，本次补齐落码。
+        # 协议内容：physio 前缀流的出线 μv 恒 0.0。Zero 已落它那半（其
+        # `src/agents/affect_math.py::expand_external_priors` 的 M2 分支现有 `mu = (0.0, mu[1])`，
+        # commit 8043176 的 message 直接引用本仓回件 §6-5A/§6-8）；我方**不依赖对方当前处于
+        # 哪一态**——合并产出的新 μ、`model_construct`/鸭子类型伪造这两类绕过口**只有我方出境侧
+        # 看得见**，两侧各自封一半，μv≡0 才成为**两侧各自的**结构不变量（回件 §6-8 原话）。
+        #
+        # **与 M8 的分工（覆盖面不相交，别当重复）**：
+        # - M9 = **契约违反**：这条流根本不该带 μv，与 Πa 配得多低无关。μv=0.9、Πa=0.05 的伪造
+        #   流最坏 salience≈0.034 ≪ 0.18，**M8 全程放行**，只有 M9 接得住。
+        # - M8 = **配置越顶**：μv 合规（=0）但 Πa 高到该流不经开门动作就能自行过点燃门。
+        #
+        # **为什么 M9 排在 M8 之前**：两条同时被违反时（μv≠0 且 Πa 越顶），M8 的消息会按那个
+        # **本就不该存在**的 μv 现算出一个收紧后的硬顶，把结论导向「把 Πa 降到 0.2535… 以下」；
+        # 照做则契约违反原样上 wire，只是不再点燃——修掉了症状、留下了病。M9 的消息直指根因
+        # （μv 不该非零），且 μv 归 0 后 M8 的硬顶自动放回 0.359，原 Πa 配置往往当场即合规。
+        # **但 M7 仍先于 M9**：μv=NaN/越域时 M7 的诊断更具体（域错误），且 M9 的 `!= 0.0` 要有
+        # 意义，前提正是 M7 已确立 mu[0] 是 [-1,1] 内的有限数（`nan != 0.0` 恒 True，若无 M7 在
+        # 前，NaN μv 会被误报成「契约违反」而非「域错误」）。
+        # 与 M7/M3/M8 同理，校验的是 as_stream() 的**出线值**而非入参 priors：合并会产出新 μ，
+        # 而 ModalityPrior 的构造期校验有四条绕过路径，出网函数是唯一必经收口点。
+        if triggers_m2 and mu[0] != 0.0:
+            raise ValueError(
+                f"M9 physio 效价契约违反：先验流[{i}] {name!r} 的出线 μv={mu[0]} ≠ 0.0。"
+                "「生理信号对效价盲」是本仓已发出的跨仓协议条款（回件 §6-8），physio 流的 μv "
+                "必须恒为 0.0。⚠ 归因（勿再写反）：Kreibig 2010 只是**建模依据**；真正把它落成 "
+                "μv=0.0 的是**我方通道侧硬写**（EdaChannel / HrvChannel 各一处 `mu_v = 0.0`，"
+                "加 merge_physio_priors 出线的 `mu=(0.0, μa)`），**不是** Zero M2 的保证"
+                "——M2 只覆写 Πv。Zero 已按 §6-8 在其 M2 分支一并归零（commit 8043176），但本"
+                "守卫**不依赖对方状态**：合并产出的新 μ 与 model_construct/鸭子类型伪造只有我方"
+                "出境侧看得见，两侧各封一半，μv≡0 才是**两侧各自的**结构不变量。"
+                f"危害：非零 μv 能在**不换取任何后验影响力**的前提下（Πv_eff={effective_pi_v} "
+                "已把效价贡献压到可忽略）**单买点燃资格**——Zero 的 "
+                "stream_salience=hypot(μv,μa)·mean(Π) 里 μv 只经 hypot 进入，与 Πv 无关；本条把"
+                f"偏离模长从 |μa|={abs(mu[1]):.6g} 抬到 hypot={math.hypot(mu[0], mu[1]):.6g}，"
+                "与越界 μ「买到本不该有的点燃资格」是同一失效模式换了个入口。"
+                "怎么办：查上游通道/合并式是否改了 μv 口径，或调用方是否绕过 ModalityPrior 的"
+                "构造期校验伪造了先验；确需让 physio 携带效价，须先跨仓与 Zero 重开 §6-8——"
+                "这是契约级语义变更，不是本仓可单方面决定的参数调整。"
+            )
+
+        # M3：精度上界。镜像 Zero M2-先于-M3——生理流 Πv 会被 Zero 覆写为 MIN，故校验时按 MIN
+        # 计（不因 MCP 透传的高 Πv 误报），MCP 侧仍原样透传由 Zero 权威覆写；生理流的 Πa 照常
+        # 校验上界。豁免用的 triggers_m2/effective_pi_v 已在上方求出（客户端不得比 Zero 更严）。
         for dim, value in (("Πv", effective_pi_v), ("Πa", pi_a)):
             # 有限性先于上界：`value > cap` 对 NaN **恒 False**，NaN 精度会静默穿过本关。
             # 本条是 MCP 侧**单边收口，与对方状态解耦**：Zero
@@ -734,12 +926,57 @@ def build_external_priors_override(
                     f"precision_cap={resolved_cap}（默认对齐 Zero "
                     "ZERO_EXTERNAL_PRIOR_PRECISION_CAP）。请降低精度或调高上界。"
                 )
-        streams.append(stream)
+        # M8：physio 自点燃硬顶（Zero 2026-07-29 18:25 裁定件点名的缺口 → 本仓承诺落码）。
+        # 位置**必须**在 M7/M3 之后：M7 保证 μ 有限且 ∈[-1,1]、M3 保证 Π 有限，M8 才敢做算术
+        # （NaN 会让 `>=` 恒 False，守卫静默塌缩——与 M3 有限性先于上界是同一条教训）。
+        # 也在 M9 之后（见 M9 处「为什么 M9 排在 M8 之前」）。**一条后果要显式承认**：M9 在前
+        # ⇒ 凡走到这里的 physio 流 μv 必为 0.0 ⇒ hypot(μv,1)≡1 ⇒ 本函数这条通路上 M8 的硬顶
+        # 恒为 0.359，其「按实测 μv 自动收紧」的一般性**在这条通路上不再可达**。仍保留不改，
+        # 因为那正是纵深：M9 若被放宽/摘除（协议重开、或有人只删这一条），M8 会**自动**改按
+        # √2 收紧到 2·T/√2 − MIN 而不是静默按 0.359 放行——判据留在 `_physio_self_ignite_salience`
+        # 的纯函数层，那里对非零 μv 仍逐格可测（见其测试）。
+        # 落在出网函数内、逐条校验 `as_stream()` 的**出线值**，而非入参 priors：本函数默认
+        # merge_physio=True 会产出**新的** μ 与 Πa（子源可靠度合并），校验入参根本看不到它；
+        # 且 ModalityPrior 的构造期校验有四条绕过路径（构造后赋值 / model_construct /
+        # model_copy / 鸭子类型伪造），出网函数是唯一必经收口点。
+        # 只对 physio 流施加：vision/audio 过阈点燃是它们的本职（face 推荐精度下最坏
+        # salience=0.16，本就贴着 0.18），而 physio 才是那条「Zero 应我方之请门掉、
+        # 却只在门开分支兑现」的流。判定用 _triggers_zero_m2（忠实镜像 Zero 的前缀判定，
+        # 与 M3 豁免同一套），确保「Zero 认定是 physio 的流」与「我方施加硬顶的流」完全同集。
         if triggers_m2:
+            worst_salience, pi_a_ceiling = _physio_self_ignite_salience(mu, effective_pi_v, pi_a)
+            # `>=` 而非 `>`：Zero `_select_fired` 的判据是 `s >= threshold`——**取等即点燃**。
+            # 实测 Πa 恰为 0.359 时 salience 逐位等于 0.18（浮点无残差），故 0.359 本身必红。
+            if worst_salience >= ZERO_SALIENCE_THRESHOLD:
+                raise ValueError(
+                    f"M8 physio 自点燃越界：先验流[{i}] {name!r} 的 Πa={pi_a} 已达自点燃硬顶 "
+                    f"{pi_a_ceiling:.6g}——该流出线 μv={mu[0]}，|μa| 打满到域上界 1.0 时 "
+                    f"salience={worst_salience:.6g} ≥ Zero 点燃门阈值 "
+                    f"{ZERO_SALIENCE_THRESHOLD}（硬顶 = 2·阈值/hypot(μv,1) − Πv_eff，"
+                    f"Πv_eff={effective_pi_v} 为 Zero M2 覆写后的值）。"
+                    "后果：该 physio 流**不经任何开门动作**就能在 Zero 默认配置（硬门、"
+                    "IGNITION_BETA=None）下自行过阈进入数值后验，绕过 Zero 应我方"
+                    "「EDA 反号、宁可继续门掉」之请所落的 D7 承诺——D7 按前缀剔除 physio "
+                    "**只写在门开分支里**，门关这条默认路径它管不到。"
+                    "⚠ 归因：先撞到的是 Zero 的**点火阈值** SALIENCE_THRESHOLD"
+                    f"={ZERO_SALIENCE_THRESHOLD}，**不是**它的精度上界 "
+                    f"cap={resolved_cap}——cap 宽得多、接不住这一条，而且越过点火阈值"
+                    "**不会报错**，只会**静默**让 physio 过门。故只能由本仓在出网口自拦。"
+                    "怎么办：调低 Πa（env EXTERNAL_PHYSIO_PRECISION_A / 子源常量 "
+                    "PHYSIO_SUBSOURCE_PRECISION_A / 显式传入的 ModalityPrior.precision）；"
+                    "确需抬到硬顶之上，须先跨仓与 Zero 确认——这是契约级语义变更，"
+                    "不是本仓可单方面决定的参数调整。"
+                )
             logger.debug(
-                "流 %r 匹配生理类前缀，Zero 将触发 M2 效价精度覆写（Πv→MIN_PRECISION）",
+                "流 %r 匹配生理类前缀，Zero 将触发 M2 效价精度覆写（Πv→MIN_PRECISION）；"
+                "M8 自点燃余量：最坏 salience=%.6g < 阈值 %s（Πa=%.6g，硬顶 %.6g）",
                 name,
+                worst_salience,
+                ZERO_SALIENCE_THRESHOLD,
+                pi_a,
+                pi_a_ceiling,
             )
+        streams.append(stream)
 
     logger.debug(
         "build_external_priors_override: %d 条先验流（max_streams=%d, precision_cap=%s）",

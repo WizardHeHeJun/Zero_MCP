@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import math  # 自点燃硬顶的期望值一律现算（禁手抄 0.2536，回件 §6-8 数值订正 1）
 from typing import Any
 
 import pytest
@@ -30,12 +31,16 @@ from src.mcp.zero.external_priors import (
     MIN_PRECISION,
     PHYSIO_MERGE_OMEGA_DEFAULT,
     PHYSIO_MERGED_MODALITY,
+    PHYSIO_PRECISION_A_SELF_IGNITE_BOUND,
     PHYSIO_STREAM_PREFIXES,
     PHYSIO_SUBSOURCE_PRECISION_A,
     ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT,
     ZERO_MAX_EXTERNAL_STREAMS_DEFAULT,
+    ZERO_SALIENCE_THRESHOLD,
     ModalityKind,
     _assert_merge_arity_invariant,
+    _physio_self_ignite_salience,
+    _triggers_zero_m2,
     build_external_priors_override,
     build_recommended_prior,
     is_physio_stream,
@@ -161,14 +166,19 @@ class TestBuildExternalPriorsOverride:
         assert len(prec) == 2
 
     def test_physio_prior_passes_through_unchanged(self) -> None:
-        """生理类先验（eda 前缀）的值原样传出，MCP 侧不做精度覆写（Zero 侧才覆写）。"""
-        prior = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(0.9, 0.7))
+        """生理类先验（eda 前缀）的值原样传出，MCP 侧不做精度覆写（Zero 侧才覆写）。
+
+        ⚠ Πa 取 0.20（原为 0.70）：M8 自点燃硬顶落地后，physio 流的 Πa 上界不再是 M3 的
+        cap=0.8 而是 ~0.359。本例的**被测语义是「Πv 原样透传、MCP 不覆写」**，Πa 只是陪跑
+        取值，故按新契约取一个合法值即可——不是放宽断言，透传断言逐值不变。
+        """
+        prior = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(0.9, 0.20))
         result = build_external_priors_override([prior])
         name, mu, prec = result["external_priors"][0]
         assert name == "eda/sc"
         assert mu == pytest.approx((0.0, 0.8))
         # MCP 侧不覆写：Πv 保持原值（0.9），Zero 侧才覆写为 MIN_PRECISION
-        assert prec == pytest.approx((0.9, 0.7))
+        assert prec == pytest.approx((0.9, 0.20))
 
     def test_empty_priors_returns_empty_list(self) -> None:
         """空先验列表 → {"external_priors": []}。"""
@@ -483,17 +493,26 @@ class TestM3PrecisionCap:
         with pytest.raises(ValueError, match="有限值"):
             build_external_priors_override([rogue])
 
+    # ⚠ 下面三条 physio「高 Πv 豁免」用例的 Πa 由 0.5 降为 0.20：M8 自点燃硬顶落地后
+    # physio 的 Πa 上界是 ~0.359 而非 M3 的 cap=0.8。三条的**被测语义都是 Πv 那一维的
+    # M3 豁免**（0.9 > cap 仍放行），Πa 只是陪跑；保持 0.5 会让它们红在 M8 上，反而**测不到
+    # 原本要测的 M3 豁免**。故降 Πa 是为保住判别力，不是放宽断言——Πv=0.9>cap 逐值不变。
     def test_physio_high_pi_v_passes_mirrors_zero_m2(self) -> None:
         """生理流高 Πv（0.9>cap）不 raise：按 MIN 计（Zero M2 会覆写）；且原值透传。"""
-        prior = _make_prior("eda/sc", mu=(0.0, 0.6), precision=(0.9, 0.5))
+        prior = _make_prior("eda/sc", mu=(0.0, 0.6), precision=(0.9, 0.20))
         result = build_external_priors_override([prior])
         # 原 Πv 透传（0.9），Zero 侧才覆写为 MIN
-        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.5))
+        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.20))
 
     def test_physio_high_pi_a_over_cap_raises(self) -> None:
-        """生理流 Πa 超上界仍 raise（Πa 不被 M2 覆写，照常校验）。"""
+        """生理流 Πa 超上界仍 raise（Πa 不被 M2 覆写，照常校验）。
+
+        ⚠ Πa=0.9 现在**同时**越 M3 cap（0.8）与 M8 自点燃硬顶（~0.359），两条守卫都会拦。
+        故断言必须 `match="M3"` 钉住是**哪一条**在拦——否则本例会在 M3 被误删时靠 M8 假绿，
+        变成一条测不到自己名字里那条守卫的用例。M3 在循环里先于 M8 执行，此为其执行序 pin。
+        """
         prior = _make_prior("hrv/rmssd", mu=(0.0, 0.6), precision=(0.5, 0.9))
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="M3 精度超上界"):
             build_external_priors_override([prior])
 
     def test_uppercase_physio_high_pi_v_passes(self) -> None:
@@ -501,10 +520,10 @@ class TestM3PrecisionCap:
 
         回归 BLOCK 1——客户端不得比 Zero 更严：Zero M2 大小写不敏感会先覆写 Πv=MIN 必过 M3。
         """
-        prior = _make_prior("EDA/SC", mu=(0.0, 0.6), precision=(0.9, 0.5))
+        prior = _make_prior("EDA/SC", mu=(0.0, 0.6), precision=(0.9, 0.20))
         result = build_external_priors_override([prior])
         # 原值透传，Zero 侧才覆写
-        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.5))
+        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.20))
 
     def test_raw_prefix_physio_high_pi_v_passes(self) -> None:
         """裸前缀生理流名（'edax'，无分隔符）高 Πv 不 raise：镜像 Zero 裸 startswith。
@@ -512,9 +531,9 @@ class TestM3PrecisionCap:
         回归 BLOCK 1——Zero M2 用 name.lower().startswith(前缀)（无需 '/'/'_' 分隔符），
         'edax' 在 Zero 侧触发覆写；客户端 M3 豁免须一致，否则误拒。
         """
-        prior = _make_prior("edax", mu=(0.0, 0.6), precision=(0.9, 0.5))
+        prior = _make_prior("edax", mu=(0.0, 0.6), precision=(0.9, 0.20))
         result = build_external_priors_override([prior])
-        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.5))
+        assert result["external_priors"][0][2] == pytest.approx((0.9, 0.20))
 
     def test_explicit_precision_cap_lower_raises(self) -> None:
         """显式 precision_cap=0.3，Πv=0.5>0.3 → raise。"""
@@ -977,8 +996,14 @@ class TestPhysioOutboundMuVZeroPremise:
     `src/agents/affect_math.py::expand_external_priors` 的 M2 分支**只覆写 Πv、从不碰 μ**，
     紧邻的 M7 也只做 μ∈[-1,1] 域校验。μv≡0 完全来自**我方三处硬写**——EdaChannel /
     HrvChannel 各一处 `mu_v = 0.0`，以及 `merge_physio_priors` 出线的 `mu=(0.0, mu_merged_a)`。
-    前提一旦破，hypot(μ) 最大到 √2，真实自点燃上界收紧到 ≈0.2536（0.359 松约 30%），
-    而按 μv≡0 闭式复算的既有跨仓守卫**不会报错**——文案说缺口在、断言却测不到。
+    前提一旦破，hypot(μ) 最大到 √2，真实自点燃上界收紧到 `2·T/√2 − MIN`（0.359 松约 30%；
+    今日阈值下 = 0.2535584412271571，对外文书写作 0.2536 是**向上取整口径**，判据一律现算）。
+
+    ⚠ **本类的定位已随 M8/M9 落地而变（2026-07-29）**：原文案说「按 μv≡0 闭式复算的既有守卫
+    不会报错——文案说缺口在、断言却测不到」，那是 M8/M9 之前的事实。今天出网口有两道运行期
+    守卫（M8 按实测 μv 现算收紧、M9 直接拒绝非零 μv），前提破了会**当场红**。本类保留的价值
+    是守在**更上游**：`merge_physio_priors` 这一层的硬写锚点本身（出网口之前），且它是三处
+    μv 硬写里唯一由本仓算式产出的一处。
 
     ⚠ 本类补的是一处**实测存在的恒真式缺口**：既有
     `test_merge_precision_matches_council_value` 给两条入参的 μv 都写 0.0，故其
@@ -1002,8 +1027,465 @@ class TestPhysioOutboundMuVZeroPremise:
         assert len(merged) == 1, f"EDA+HRV 应合并为单条，实际 {[p.modality for p in merged]}"
         assert merged[0].mu[0] == 0.0, (
             f"合并出线 μv={merged[0].mu[0]} ≠ 0 —— PHYSIO_PRECISION_A_SELF_IGNITE_BOUND=0.359 "
-            "的前提已破。须按 hypot(μ)≤√2 把上界收紧到 ≈0.2536，并**成对**修改跨仓守卫里的"
-            "现算式（只改常量或只改现算式都会红，两者都不改而只改文案则是假绿）。"
+            "的前提已破，且**违反跨仓协议 §6-8「physio 对效价盲」**（出网口的 M9 会当场拒绝"
+            "整条载荷）。若这是有意的口径变更，须先跨仓重开 §6-8，再按 hypot(μ)≤√2 把上界"
+            "收紧到 2·T/√2 − MIN（≈0.2536 是向上取整的对外口径，判据现算不手抄）。"
         )
         # μa 仍按 CI 加权正常产出（证明本用例观测的是 μv 那一维，不是「整个 mu 被清空」）
         assert merged[0].mu[1] != 0.0
+
+
+# ---------------------------------------------------------------------------
+# M8：physio 自点燃硬顶 —— 出网收口点的运行期守卫
+#
+# 背景（Zero 2026-07-29 18:25 裁定件）：我方交付 hrv 残差 σ=1.6 ⇒ Πa=0.39，只核了 Zero 的
+# `ZERO_EXTERNAL_PRIOR_PRECISION_CAP=0.8`，漏了本仓自己这条更低的硬顶 0.359。裁定件原话要点：
+# **「真正先撞到的是点火阈值，不是精度上界，而后者不会报错、只会静默让 physio 过门。」**
+# 本节把那句承诺变成可执行守卫的回归面。
+#
+# ⚠ 恒真式防线（本仓 pitfalls ⑥）：本节所有「不该红」的用例都必须先证明**被观测量存在**
+# （载荷里真有 physio 流 / 真走了合并路径），否则「没有 physio 流时断言恒真」会让整节假绿。
+# ---------------------------------------------------------------------------
+
+
+def _physio_streams(payload: dict[str, list[Any]]) -> list[Any]:
+    """从载荷里取出会触发 Zero M2 的 physio 流（按 Zero 的裸前缀判定，非 advisory 命名）。"""
+    return [s for s in payload["external_priors"] if _triggers_zero_m2(s[0])]
+
+
+class TestM8PhysioSelfIgniteBound:
+    """出线 physio 流的 Πa 不得高到使其**不经开门动作**即越过 Zero 点燃门。"""
+
+    # -- 判据本身（纯函数层）------------------------------------------------
+
+    def test_bound_reproduces_the_cross_repo_constant_at_zero_mu_v(self) -> None:
+        """μv=0 时现算硬顶逐值等于对外承诺的 0.359，且此时 salience 恰好等于阈值。
+
+        这条把「现算式」与「跨仓承诺的常量」焊在一起：任何一侧漂移都红。
+        """
+        worst, ceiling = _physio_self_ignite_salience(
+            (0.0, 0.0), MIN_PRECISION, PHYSIO_PRECISION_A_SELF_IGNITE_BOUND
+        )
+        assert ceiling == pytest.approx(PHYSIO_PRECISION_A_SELF_IGNITE_BOUND, abs=1e-12), (
+            f"μv=0 下现算硬顶 {ceiling} ≠ 对外承诺常量 "
+            f"{PHYSIO_PRECISION_A_SELF_IGNITE_BOUND}——两者须成对修改。"
+        )
+        # 取等即点燃（Zero `_select_fired` 判据是 `s >= threshold`）
+        assert worst == pytest.approx(ZERO_SALIENCE_THRESHOLD, abs=1e-12)
+
+    def test_ceiling_tightens_automatically_when_mu_v_nonzero(self) -> None:
+        """**选项 B 的核心收益**：μv 变非零 → 硬顶自动收紧，无需任何人回来改常量。
+
+        μv=±1 时 hypot(μv,1)=√2 ⇒ 硬顶 = 2·T/√2 − MIN，即 0.359 松了约 30%。
+        原 docstring 说的「缺口在、断言却测不到」正是这一格；按常量比（选项 A）测不到它。
+
+        ⚠ 期望值**现算不手抄**（回件 §6-8 数值订正 1，两仓同款约定）：`0.2536` 是向上取整的
+        对外口径、比真值 0.2535584412271571 松 4.16e-5，手抄它等于给断言留一条测不到的缝；
+        且 Zero 调 SALIENCE_THRESHOLD 时手抄值不会跟随。现算后容差可收到 1e-12。
+        """
+        _, ceiling_at_zero = _physio_self_ignite_salience((0.0, 0.0), MIN_PRECISION, 0.1)
+        _, ceiling_at_one = _physio_self_ignite_salience((1.0, 0.0), MIN_PRECISION, 0.1)
+        _, ceiling_at_half = _physio_self_ignite_salience((0.5, 0.0), MIN_PRECISION, 0.1)
+
+        expected_at_one = 2 * ZERO_SALIENCE_THRESHOLD / math.sqrt(2) - MIN_PRECISION
+        assert ceiling_at_one == pytest.approx(expected_at_one, abs=1e-12), (
+            f"μv=±1 下硬顶应收紧到现算值 {expected_at_one}，实际 {ceiling_at_one}"
+        )
+        # 单调收紧：|μv| 越大 → 硬顶越低（不是只有端点对）
+        assert ceiling_at_zero > ceiling_at_half > ceiling_at_one
+        # 负 μv 与正 μv 对称（hypot 取模，符号无关）
+        _, ceiling_at_neg_one = _physio_self_ignite_salience((-1.0, 0.0), MIN_PRECISION, 0.1)
+        assert ceiling_at_neg_one == pytest.approx(ceiling_at_one, abs=1e-12)
+
+    def test_guard_is_inclusive_at_the_bound(self) -> None:
+        """边界语义 pin：**≥ 硬顶即红**（不是 >），因 Zero `_select_fired` 用 `s >= threshold`。
+
+        逐值三态：0.359 红 / 略低于界绿 / 略高于界红。中间那一格排除「守卫恒红」这一竞争解释。
+        """
+        at_bound = _make_prior(
+            "physio",
+            mu=(0.0, 0.5),
+            precision=(MIN_PRECISION, PHYSIO_PRECISION_A_SELF_IGNITE_BOUND),
+        )
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界"):
+            build_external_priors_override([at_bound])
+
+        just_below = _make_prior(
+            "physio",
+            mu=(0.0, 0.5),
+            precision=(MIN_PRECISION, PHYSIO_PRECISION_A_SELF_IGNITE_BOUND - 1e-6),
+        )
+        payload = build_external_priors_override([just_below])
+        assert _physio_streams(payload), "正控：恰低于界的用例里必须真有 physio 流被观测到"
+
+        just_above = _make_prior(
+            "physio",
+            mu=(0.0, 0.5),
+            precision=(MIN_PRECISION, PHYSIO_PRECISION_A_SELF_IGNITE_BOUND + 1e-6),
+        )
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界"):
+            build_external_priors_override([just_above])
+
+    # -- env 通路（裁定件点名的那条）----------------------------------------
+
+    def test_env_precision_a_over_bound_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**判别力①**：env EXTERNAL_PHYSIO_PRECISION_A=0.39（=hrv σ=1.6 的交付值）必红。
+
+        这正是 Zero 裁定件点名的缺口：既有跨仓守卫只看源码常量
+        `_RECOMMENDED_PRECISION_DEFAULTS`，对 env 覆盖**恒绿**。
+        """
+        monkeypatch.setenv("EXTERNAL_PHYSIO_PRECISION_A", "0.39")
+        # 正控：env 确实生效了（否则下面的红可能来自别处）
+        assert recommended_precision(ModalityKind.PHYSIO)[1] == pytest.approx(0.39)
+
+        prior = build_recommended_prior("hrv/rmssd", (0.0, 0.4), ModalityKind.PHYSIO)
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界") as exc:
+            build_external_priors_override([prior])
+
+        message = str(exc.value)
+        # 原因串必须可读且带归因，不是干巴巴一句
+        assert "0.39" in message, f"错误消息未给出实测 Πa：{message}"
+        assert "点火阈值" in message and "cap" in message, (
+            f"错误消息缺「先撞到的是点火阈值而非精度上界 cap」这句归因：{message}"
+        )
+        assert "静默" in message, f"错误消息未说明 cap 不会报错、只会静默放行：{message}"
+        assert "D7" in message, f"错误消息未说明越界后果（绕过 D7 跨仓承诺）：{message}"
+
+    def test_env_precision_a_below_bound_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**判别力②**：env EXTERNAL_PHYSIO_PRECISION_A=0.35（< 0.359）必绿。
+
+        与 ① 只差 0.04，证明守卫拦的是**越界**而非「凡 env 覆盖就拦」。
+        """
+        monkeypatch.setenv("EXTERNAL_PHYSIO_PRECISION_A", "0.35")
+        assert recommended_precision(ModalityKind.PHYSIO)[1] == pytest.approx(0.35)
+
+        prior = build_recommended_prior("hrv/rmssd", (0.0, 0.4), ModalityKind.PHYSIO)
+        payload = build_external_priors_override([prior])
+        # 正控：被观测量存在——载荷里真有一条 physio 流走过了 M8
+        streams = _physio_streams(payload)
+        assert len(streams) == 1, f"正控失败：载荷里没有 physio 流 {payload}"
+        assert streams[0][2][1] == pytest.approx(0.35)
+
+    # -- 零回归主证 ---------------------------------------------------------
+
+    def test_default_recommended_and_merged_precision_stay_green(self) -> None:
+        """**零回归主证**：默认推荐态（Πa=0.18）与合并态（Πa=0.175）都不触发。
+
+        两态都带正控，避免「没有 physio 流 ⇒ 恒绿」。
+        """
+        single = build_recommended_prior("eda/sc", (0.0, 0.9), ModalityKind.PHYSIO)
+        payload = build_external_priors_override([single])
+        streams = _physio_streams(payload)
+        assert len(streams) == 1 and streams[0][2][1] == pytest.approx(0.18), (
+            f"正控失败：推荐态 physio 流未出现在载荷里 {payload}"
+        )
+
+        eda = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(MIN_PRECISION, 0.18))
+        hrv = _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18))
+        merged_payload = build_external_priors_override([eda, hrv])
+        merged_streams = _physio_streams(merged_payload)
+        assert len(merged_streams) == 1, f"正控失败：合并路径未产出 physio 流 {merged_payload}"
+        assert merged_streams[0][0] == PHYSIO_MERGED_MODALITY
+        assert merged_streams[0][2][1] == pytest.approx(0.175), (
+            "正控失败：合并态 Πa 不是议会确切值 0.175，本例已不在测合并路径"
+        )
+
+    def test_no_physio_stream_never_false_positives(self) -> None:
+        """**判别力④**：无 physio 流时不误报——即便 Πa 远高于硬顶。
+
+        vision/audio 过阈点燃是它们的本职，M8 只管 physio。Πa=0.7 ≫ 0.359 但 < cap 0.8。
+        """
+        vision = _make_prior("vision", mu=(0.0, 1.0), precision=(0.7, 0.7))
+        audio = _make_prior("audio/prosody", mu=(0.9, 0.9), precision=(0.7, 0.7))
+        payload = build_external_priors_override([vision, audio])
+
+        # 正控：确认这两条**确实**不被判为 physio（否则本例变成「因为没流所以不红」的恒真式）
+        assert _physio_streams(payload) == [], "vision/audio 不应被判为 physio 流"
+        assert len(payload["external_priors"]) == 2
+        # 且它们的 Πa 确实越过了 physio 硬顶——证明「不误报」不是因为取值本来就合规
+        for _name, _mu, prec in payload["external_priors"]:
+            assert prec[1] > PHYSIO_PRECISION_A_SELF_IGNITE_BOUND, (
+                "本例的判别力依赖非 physio 流的 Πa 越过 physio 硬顶，否则不红是平凡的"
+            )
+
+    # -- 合并路径（校验入参根本看不到的那个值）------------------------------
+
+    def test_merged_precision_over_bound_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**判别力⑤**：子源可靠度抬高 → 合并出线 Πa 越界 → 必红。
+
+        这一格是「守卫必须落在出网收口点」的正面证明：入参两条先验的 Πa 各为 0.30
+        （**都低于硬顶 0.359，逐条看完全合规**），但 `merge_physio_priors` 用的是子源常量
+        `PHYSIO_SUBSOURCE_PRECISION_A`、不是入参精度，合并出线 Πa=0.40 才越界。
+        任何「校验入参 priors」的实现在这一格上都会假绿。
+        """
+        monkeypatch.setitem(external_priors_module.PHYSIO_SUBSOURCE_PRECISION_A, "eda", 0.40)
+        monkeypatch.setitem(external_priors_module.PHYSIO_SUBSOURCE_PRECISION_A, "hrv", 0.40)
+
+        eda = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(MIN_PRECISION, 0.30))
+        hrv = _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.30))
+        # 正控：入参逐条合规——红必须来自合并产物，不是来自入参
+        for prior in (eda, hrv):
+            assert prior.precision[1] < PHYSIO_PRECISION_A_SELF_IGNITE_BOUND
+
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界") as exc:
+            build_external_priors_override([eda, hrv])
+        # 红在合并后的那条流上（名字是 "physio"，不是 "eda/sc"/"hrv/rmssd"）
+        assert PHYSIO_MERGED_MODALITY in str(exc.value)
+        assert "0.4" in str(exc.value), f"错误消息未给出合并后的实测 Πa：{exc.value}"
+
+    def test_model_construct_bypass_is_still_caught(self) -> None:
+        """构造期校验的四条绕过路径之一（`model_construct`）仍被出网口拦下。
+
+        `ModalityPrior` 是 frozen + validator，但 `model_construct` 完全跳过 validator。
+        这正是「唯一必经收口点是出网函数」的理由——守卫若写在模型层，这一格假绿。
+        """
+        forged = ModalityPrior.model_construct(
+            modality="physio/forged", mu=(0.0, 0.1), precision=(MIN_PRECISION, 0.75)
+        )
+        # 正控：伪造确实绕过了模型校验（对象真的带着越界 Πa 存在）
+        assert forged.precision[1] == 0.75
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界"):
+            build_external_priors_override([forged])
+
+    def test_nonzero_mu_v_path_is_now_owned_by_m9_but_m8_still_tightens(self) -> None:
+        """**执行序 pin**：非零 μv 的端到端红，自 M9 落地起归 **M9**（不再是 M8）。
+
+        本用例的前身断言 `match="M8 ..."`——M9（physio 出线 μv 必须恒 0）排在 M8 之前后，
+        同一载荷改红在 M9。**这不是判别力缩水**，两件事分别验：
+        1. **M8 的收紧判据本身没变**：下面直接调纯函数 `_physio_self_ignite_salience`，
+           证明 μv=1.0 时硬顶确实收紧到 < Πa=0.30 —— 即「M8 也会拦」仍成立，只是 M9 先报。
+        2. **端到端谁先报**：由 `pytest.raises(match="M9 ...")` 钉死。
+        为什么 M9 该先报：M8 的消息会按那个**本就不该存在**的 μv 现算出收紧后的硬顶，把结论
+        导向「降 Πa」；照做则契约违反原样上 wire，只是不再点燃——修症状不修病。
+        """
+        pi_a = 0.30
+        assert pi_a < PHYSIO_PRECISION_A_SELF_IGNITE_BOUND, "前提：该 Πa 在 μv=0 下必须合规"
+
+        # μv=0：绿（正控，证明红确实由 μv 引起而非 Πa 本身）
+        payload = build_external_priors_override(
+            [_make_prior("physio", mu=(0.0, 0.5), precision=(MIN_PRECISION, pi_a))]
+        )
+        assert _physio_streams(payload), "正控：μv=0 这一格必须真有 physio 流走过 M8"
+
+        # ① M8 判据层：μv=1.0 时硬顶收紧到该 Πa 之下 —— M8 的一般性一字未改
+        worst, ceiling = _physio_self_ignite_salience((1.0, 0.5), MIN_PRECISION, pi_a)
+        assert ceiling < pi_a and worst >= ZERO_SALIENCE_THRESHOLD, (
+            f"M8 判据层已失效：μv=1.0 下硬顶 {ceiling} 应 < Πa={pi_a} 且最坏 salience "
+            f"{worst} 应 ≥ {ZERO_SALIENCE_THRESHOLD}"
+        )
+
+        # ② 端到端层：M7 允许 μv=1.0，故不会被 M7 抢先；M9 先于 M8 报
+        with pytest.raises(ValueError, match="M9 physio 效价契约违反") as exc:
+            build_external_priors_override(
+                [_make_prior("physio", mu=(1.0, 0.5), precision=(MIN_PRECISION, pi_a))]
+            )
+        assert "M8" not in str(exc.value), (
+            f"执行序错位：非零 μv 应由 M9 独占报错，消息里不该出现 M8：{exc.value}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# M9：physio 效价契约（出线 μv ≡ 0.0）—— 跨仓协议里**我方那半**的 fail-fast
+#
+# 来源：我方 2026-07-29 回件 `notes/2026-07-29-mcp-reply-to-zero-asks.md` §6-8 明确
+# **选 (a) 入协议 + 我方同时在出境侧加 fail-fast**（原话：「不是让你方一家兜……两侧各自
+# 封一半，0.359 才成为**两侧各自的**结构不变量」）。Zero 已落它那半（M2 分支
+# `mu = (0.0, mu[1])`，commit 8043176）；本节是我方那半的回归面。
+#
+# ⚠ **M8 顶不了 M9**（本节最核心的一格）：M8 拦的是「Πa 高到能自点燃」，一条
+# μv=0.9、Πa=0.05 的伪造 physio 流最坏 salience≈0.034 ≪ 0.18 —— **M8 结构上必然放行**，
+# 却违反了「生理对效价盲」这条被承诺要 fail-fast 的契约。下面 ① 那格用**正控**把
+# 「M8 放行」显式测出来，而不是嘴上声称。
+#
+# ⚠ 恒真式防线（pitfalls ⑥）：所有「不该红」的用例必须先证明被观测量存在（载荷里真有
+# physio 流 / 该流的 μv 真是非零），否则「没有 physio 流 ⇒ 断言恒真」会让整节假绿。
+# ---------------------------------------------------------------------------
+
+
+class TestM9PhysioValenceContract:
+    """出线 physio 流的 μv 必须恒 0.0，否则出网收口点 fail-fast。"""
+
+    # -- 前提：模型层不设防，出网口是唯一收口点 ------------------------------
+
+    def test_model_layer_does_not_enforce_the_contract(self) -> None:
+        """正控前提：`ModalityPrior` 层**允许** physio 流带非零 μv（μv=0.9 合法构造）。
+
+        这解释了 M9 为何必须落在出网收口点：模型层的 `_validate_ranges` 只校验 μ∈[-1,1]
+        与 Π 有限>0，**没有任何一条把 physio 的 μv 钉 0**；再叠加 model_construct /
+        model_copy / 鸭子类型三条绕过口，信任模型实例等于没有守卫。
+        """
+        legit = ModalityPrior(
+            modality="physio/forged", mu=(0.9, 0.4), precision=(MIN_PRECISION, 0.05)
+        )
+        assert legit.mu[0] == 0.9, "前提破：模型层若已拦下非零 μv，M9 的存在理由需重新论证"
+
+    # -- 判别力① 伪造 physio 流必红，且红在 M9（M8 结构上够不着）--------------
+
+    def test_forged_nonzero_mu_v_raises_m9_where_m8_structurally_cannot(self) -> None:
+        """**判别力①**：μv=0.9、Πa=0.05 的伪造 physio 流必红，且**红在 M9 不是 M8**。
+
+        正控是本例的重点：先用纯函数把「M8 会放行这条载荷」测出来（最坏 salience≈0.034
+        ≪ 0.18），再断言它仍被拦下 —— 从而证明拦下它的**只能**是 M9。若哪天有人把 M9 删掉
+        而寄望「M8 顶一下」，本例会红在 `pytest.raises` 上。
+        """
+        mu = (0.9, 0.4)
+        pi_a = 0.05
+        # 正控：M8 判据对这条载荷**放行**（不是「恰好也拦了」）
+        worst, _ceiling = _physio_self_ignite_salience(mu, MIN_PRECISION, pi_a)
+        assert worst < ZERO_SALIENCE_THRESHOLD, (
+            f"正控失败：M8 最坏 salience={worst} 已 ≥ 阈值 {ZERO_SALIENCE_THRESHOLD}，"
+            "本例测不出「M8 顶不了 M9」"
+        )
+
+        forged = _make_prior("physio/forged", mu=mu, precision=(MIN_PRECISION, pi_a))
+        with pytest.raises(ValueError, match="M9 physio 效价契约违反") as exc:
+            build_external_priors_override([forged])
+
+        message = str(exc.value)
+        # 实测 μv 必须出现在消息里（定位用）
+        assert "0.9" in message, f"错误消息未给出实测 μv：{message}"
+        # 归因：契约 / Kreibig 是建模依据 / 落成 0.0 的是我方硬写而非 Zero M2
+        assert "对效价盲" in message and "Kreibig" in message, f"错误消息缺契约归因：{message}"
+        assert "M2 只覆写 Πv" in message, (
+            f"错误消息未澄清「不是 Zero M2 的保证」这条已订正的假依据：{message}"
+        )
+        # Zero 已落其半，但我方不依赖对方状态
+        assert "8043176" in message and "不依赖对方状态" in message, (
+            f"错误消息未写明 Zero 侧落地点与「两侧各封一半」：{message}"
+        )
+        # 危害：不换取后验影响力却单买点燃资格
+        assert "单买点燃资格" in message and "hypot" in message, (
+            f"错误消息未说明非零 μv 的危害机制：{message}"
+        )
+
+    # -- 判别力② 正常流绿 ---------------------------------------------------
+
+    def test_zero_mu_v_streams_pass(self) -> None:
+        """**判别力②**：μv=0.0 的正常 physio 流全绿——单流与默认合并路径双查（各带正控）。
+
+        与 ① 的差只有 μv 那一维（同为 physio 前缀、同为合法 Πa），证明 M9 拦的是**非零 μv**
+        而非「凡 physio 流就拦」。
+        """
+        single = _make_prior("physio/forged", mu=(0.0, 0.4), precision=(MIN_PRECISION, 0.05))
+        payload = build_external_priors_override([single])
+        streams = _physio_streams(payload)
+        assert len(streams) == 1, f"正控失败：载荷里没有 physio 流 {payload}"
+        assert streams[0][1] == pytest.approx((0.0, 0.4))
+
+        # 默认合并路径（EDA+HRV → physio）同样绿
+        eda = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(MIN_PRECISION, 0.15))
+        hrv = _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.20))
+        merged_payload = build_external_priors_override([eda, hrv])
+        merged_streams = _physio_streams(merged_payload)
+        assert len(merged_streams) == 1 and merged_streams[0][0] == PHYSIO_MERGED_MODALITY, (
+            f"正控失败：合并路径未产出 physio 流 {merged_payload}"
+        )
+        assert merged_streams[0][1][0] == 0.0
+        assert merged_streams[0][1][1] != 0.0, "正控：μa 须非平凡，否则观测的不是 μv 那一维"
+
+    # -- 判别力④ 非 physio 流带非零 μv 是合法的，不得误报 --------------------
+
+    def test_non_physio_streams_may_carry_nonzero_mu_v(self) -> None:
+        """**判别力④**：vision/audio 带非零 μv 是**本职**，M9 不得误报。
+
+        效价正是这两条流的主信息（face valence 强），拦它们等于把守卫写错了对象。
+        """
+        vision = _make_prior("vision", mu=(0.9, 0.3), precision=(0.20, 0.12))
+        audio = _make_prior("audio/prosody", mu=(-0.8, 0.5), precision=(0.10, 0.25))
+        payload = build_external_priors_override([vision, audio])
+
+        # 正控①：这两条确实**不被判为** physio（否则「不红」是因为没被观测，恒真式）
+        assert _physio_streams(payload) == [], "vision/audio 不应被判为 physio 流"
+        # 正控②：它们的 μv 确实非零（否则「不红」是平凡的）
+        assert [s[1][0] for s in payload["external_priors"]] == pytest.approx([0.9, -0.8])
+
+    # -- 判别力⑤ 合并路径产出非零 μv 也要红 ---------------------------------
+
+    def test_merged_output_with_nonzero_mu_v_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**判别力⑤**：合并式若改口径把子源 μv 带出，出网口仍必须红。
+
+        这一格正是回件 §6-8 说「合并产出的新 μ……只有我方出境侧看得见」的可执行版：
+        入参两条先验的 μv **都是 0.0（逐条完全合规）**，红只可能来自合并产物。
+        通过 monkeypatch 换掉 `merge_physio_priors` 模拟「v2 改口径 / 新增 RSP 子源」这类
+        未来改动——三处 μv 硬写锚点中的第三处（合并出线）被改时的真实形态。
+        """
+        original_merge = external_priors_module.merge_physio_priors
+
+        def leaking_merge(
+            priors: list[ModalityPrior], *, omega: float | None = None
+        ) -> list[ModalityPrior]:
+            """模拟「合并式把子源 μv 按精度加权带出」——即第三处硬写锚点被删。"""
+            merged = original_merge(priors, omega=omega)
+            return [
+                p.model_copy(update={"mu": (0.42, p.mu[1])})
+                if p.modality == PHYSIO_MERGED_MODALITY
+                else p
+                for p in merged
+            ]
+
+        monkeypatch.setattr(external_priors_module, "merge_physio_priors", leaking_merge)
+
+        eda = _make_prior("eda/sc", mu=(0.0, 0.8), precision=(MIN_PRECISION, 0.15))
+        hrv = _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.20))
+        # 正控：入参逐条合规——红必须来自合并产物
+        for prior in (eda, hrv):
+            assert prior.mu[0] == 0.0
+
+        with pytest.raises(ValueError, match="M9 physio 效价契约违反") as exc:
+            build_external_priors_override([eda, hrv])
+        # 红在合并后的那条流上（名字是 "physio"，不是 "eda/sc"/"hrv/rmssd"）
+        assert PHYSIO_MERGED_MODALITY in str(exc.value)
+        assert "0.42" in str(exc.value), f"错误消息未给出合并产物的实测 μv：{exc.value}"
+
+    # -- 执行序 -------------------------------------------------------------
+
+    def test_m9_precedes_m8_when_both_are_violated(self) -> None:
+        """两条同时违反时**先报 M9**（契约违反是根因，Πa 越顶是并发症）。
+
+        正控：先证明这条载荷**确实也**越了 M8 的硬顶（否则「报 M9」是平凡的、与执行序无关）。
+        """
+        mu = (0.9, 0.4)
+        pi_a = 0.5  # 远超 μv=0 下的 0.359，更超 μv=0.9 下收紧后的硬顶
+        worst, ceiling = _physio_self_ignite_salience(mu, MIN_PRECISION, pi_a)
+        assert worst >= ZERO_SALIENCE_THRESHOLD and pi_a > ceiling, (
+            f"正控失败：该载荷未同时违反 M8（最坏 salience={worst}、硬顶={ceiling}），"
+            "本例测不到执行序"
+        )
+
+        with pytest.raises(ValueError, match="M9 physio 效价契约违反") as exc:
+            build_external_priors_override([_make_prior("physio", mu=mu, precision=(0.5, pi_a))])
+        assert "M8" not in str(exc.value), f"执行序错位：应由 M9 报，实得 {exc.value}"
+
+    def test_m7_precedes_m9_for_out_of_domain_mu_v(self) -> None:
+        """**M7 仍先于 M9**：越域/NaN 的 μv 报「M7 μ 越界」，不报契约违反。
+
+        理由：域错误的诊断更具体；且 `nan != 0.0` 恒 True，若无 M7 在前，NaN μv 会被
+        误报成「契约违反」而把排查引向跨仓协议——那是错的方向。
+        """
+        out_of_domain = ModalityPrior.model_construct(
+            modality="physio", mu=(7.7, 0.4), precision=(MIN_PRECISION, 0.05)
+        )
+        with pytest.raises(ValueError, match="M7 μ 越界"):
+            build_external_priors_override([out_of_domain])
+
+        nan_mu_v = ModalityPrior.model_construct(
+            modality="physio", mu=(float("nan"), 0.4), precision=(MIN_PRECISION, 0.05)
+        )
+        with pytest.raises(ValueError, match="M7 μ 越界"):
+            build_external_priors_override([nan_mu_v])
+
+    # -- 施加集合 == Zero 的 M2 集合 ----------------------------------------
+
+    @pytest.mark.parametrize("name", ["physio", "EDA/SC", "edax", "HRV_RMSSD", "pupil/diam", "scr"])
+    def test_covers_exactly_zeros_m2_prefix_set(self, name: str) -> None:
+        """M9 的施加集合须与 Zero M2 的判定集合**同集**（大小写不敏感 + 裸前缀）。
+
+        用 `_triggers_zero_m2` 而非 advisory 的 `is_physio_stream`：后者区分大小写、要求
+        分隔符，"EDA/SC"/"edax" 在它那里是 False，而 Zero **会**对这两条覆写 Πv——集合错位
+        会让「Zero 认定的 physio」逃出我方契约守卫。
+        """
+        # 正控：这些流名在 Zero 侧确实触发 M2（本例的前提，不是被测项）
+        assert _triggers_zero_m2(name), f"前提破：{name!r} 在 Zero 侧不触发 M2，本例无意义"
+        prior = _make_prior(name, mu=(0.6, 0.4), precision=(MIN_PRECISION, 0.05))
+        with pytest.raises(ValueError, match="M9 physio 效价契约违反"):
+            build_external_priors_override([prior])
