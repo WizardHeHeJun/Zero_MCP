@@ -3,11 +3,16 @@
 契约的**唯一真相**——MCP 层 `src/mcp/zero/` 与 Agent 层共同 import 此模块，
 不得在其他地方重复定义这些数据形状。
 
-数据来源均经现场核验（2026-07-14 对 D:\\Zero 源码的双视角对抗核验）：
-- 常量：D:\\Zero\\src\\models\\facs_decoder.py:16-42 · composite.py:17
-- expression 形状：D:\\Zero\\src\\orchestration\\runner.py:174,491-516
-- appraise_text 签名：D:\\Zero\\src\\orchestration\\chat_driver.py:184,313-320
-- streams 形状：D:\\Zero\\src\\affect_core.py:77-95
+数据来源均经现场核验（2026-07-14 首核 / 2026-07-29 R7 复核）。口径：**Zero 仓内相对路径
++ `::` + 符号名**，跨仓行号一律不写（行号一次编辑即失效且腐烂不驱红；符号名是契约、
+路径只是提示，Zero agents 层仍在迁移）：
+- FACS 常量：Zero `src/agents/models/facs_decoder.py::{FACS_KEYS, FACS_KEYS_EXT}`
+- coping AU 子集：Zero `src/agents/models/composite.py::_COPING_DRIVEN_AUS`
+- text_label 枚举：Zero `src/agents/affect_math.py::text_label`
+- expression 形状：Zero `src/orchestration/runner.py::_state_to_entry` 的 "expression" 键
+  （即 `ConversationSession.step` 返回体的该子树）
+- appraise_text 签名：Zero `src/agents/language.py::ConversationModel.appraise_text`
+- streams 形状：Zero `src/agents/affect_core.py` 的 external streams 组装段
 """
 
 from __future__ import annotations
@@ -21,11 +26,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 规范常量（来自 D:\Zero\src\models\facs_decoder.py:16-42 · composite.py:17）
+# 规范常量（来自 Zero `src/agents/models/facs_decoder.py` 与 `.../composite.py` 的同名符号）
 # ---------------------------------------------------------------------------
 
 FACS_KEYS: list[str] = ["AU04", "AU06", "AU12", "AU15", "intensity"]
-"""旧 5 维 FACS 键集（facs_decoder.py:16-20）。"""
+"""旧 5 维 FACS 键集（Zero `src/agents/models/facs_decoder.py::FACS_KEYS`）。"""
 
 FACS_KEYS_EXT: list[str] = [
     "AU01",
@@ -42,13 +47,23 @@ FACS_KEYS_EXT: list[str] = [
     "AU26",
     "intensity",
 ]
-"""扩展 13 维 FACS 键集（facs_decoder.py:32-47，议会任务 D 起含 AU17/AU26 通用 AU）。"""
+"""扩展 13 维 FACS 键集（Zero `src/agents/models/facs_decoder.py::FACS_KEYS_EXT`，
+议会任务 D 起含 AU17/AU26 通用 AU）。"""
 
 COPING_DRIVEN_AUS: tuple[str, ...] = ("AU23", "AU01", "AU02", "AU20")
-"""coping_potential 驱动的 AU 子集（facs_decoder.py:45）。"""
+"""coping_potential 驱动的 AU 子集（Zero `src/agents/models/composite.py::_COPING_DRIVEN_AUS`）。
+
+⚠ 归属订正（2026-07-29 跨仓现场核验）：此前注为 facs_decoder，实际该元组定义在 composite.py，
+由 `CompositeChannelDecoder.predict_channels_coping` 的 C2 residual 叠加消费。
+"""
 
 TEXT_LABELS: frozenset[str] = frozenset({"excited", "content", "angry", "sad"})
-"""text_label 的合法枚举集（expression.py 推断 + composite.py:17）。"""
+"""text_label 的合法枚举集（Zero `src/agents/affect_math.py::text_label` 的四象限返回值）。
+
+⚠ 归属订正（2026-07-29 跨仓现场核验）：此前注为「expression.py 推断 + composite.py」，
+但真正产 label 的是 affect_math 的 `text_label`（v≥0 → excited/content，v<0 → angry/sad，
+分界 a≥0.33）；composite 只是转调它。
+"""
 
 # 用于 facs_au 键校验的全集（FACS_KEYS ∪ FACS_KEYS_EXT）
 _FACS_VALID_KEYS: frozenset[str] = frozenset(FACS_KEYS) | frozenset(FACS_KEYS_EXT)
@@ -63,13 +78,15 @@ class AffectStimulus(BaseModel):
     """喂给 Zero 的单条情感刺激（MCP → Zero 方向）。
 
     对应 ConversationModel.appraise_text() 产出 + coping 独立通道。
-    - valence/arousal: 各维 [-1,1]，由 appraise_text 返回（language.py:85）。
+    - valence/arousal: 各维 [-1,1]，由 Zero
+      `src/agents/language.py::ConversationModel.appraise_text` 返回。
     - coping_potential: 独立通道，默认 None；非 None 时同样 [-1,1]。
-      **Q4 已定（Zero 回传 2026-07-14）**：正式入口 = Zero `Stimulus.control_appraisal`
-      （state.py:33，Smith & Ellsworth 1985 control 维，与 goal_congruence 正交）——
+      **Q4 已定（Zero 回传 2026-07-14）**：正式入口 = Zero
+      `src/orchestration/state.py::Stimulus.control_appraisal`（Smith & Ellsworth 1985
+      control 维，与 goal_congruence 正交）——
       本字段接线时**映射到 `Stimulus.control_appraisal`**，**不要**走
-      `state_overrides={"coping_potential_state":...}`（enabled 时被 AppraisalAgent
-      每轮从 stim.control_appraisal 覆写，appraisal.py:174-176）。需 Zero 侧开
+      `state_overrides={"coping_potential_state":...}`（enabled 时被 Zero
+      `src/agents/appraisal.py::AppraisalAgent` 每轮从 stim.control_appraisal 覆写）。需 Zero 侧开
       `coping_potential_enabled` 门控。coping 决定 (-v,+a) 象限愤怒↔恐惧判别性 AU。
     """
 
@@ -89,7 +106,8 @@ class ModalityPrior(BaseModel):
     精度 (Π_v, Π_a) 必须 > 0（高斯精度，精度=0 无意义）。
     注意：PerceptionHub 禁止均值融合——各先验独立保留由内核竞争融合（AD-3）。
 
-    as_stream() 输出对齐 Zero affect_core streams 形状（三元组）。
+    as_stream() 输出对齐 Zero affect_core streams 形状（三元组）——
+    ⚠ `coping` **不在**该三元组内（external_prior schema v1 不传输，见该字段 description）。
     """
 
     # frozen：构造后不可变。同仓兄弟模型（mappers/prosody.py::ProsodyParams、
@@ -108,7 +126,19 @@ class ModalityPrior(BaseModel):
         ...,
         description="(Π_v, Π_a)，各维 > 0 且有限",
     )
-    coping: float | None = Field(default=None, ge=-1.0, le=1.0)
+    coping: float | None = Field(
+        default=None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "可选 coping 分量。⚠ **external_prior schema v1 不传输本字段**：as_stream() 只返 "
+            "(name, μ, Π) 三元组、Zero 侧 ExternalPrior 无对应槽位 ⇒ 写进来会被**静默丢弃**。"
+            "保留字段是为兼容 build_recommended_prior(coping=...) 这一既有公开入口；真要送达"
+            "须先与 Zero 商定 schema v2 的三元组扩展形状（版本号由跨仓协议 "
+            "EXTERNAL_PRIOR_SCHEMA_VERSION 承载，本仓不单方面承诺 bump 时点）。"
+            "丢弃面由 test_as_stream_drops_exactly_coping 锁定。"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> ModalityPrior:
@@ -117,9 +147,12 @@ class ModalityPrior(BaseModel):
             raise ValueError("mu 各维必须在 [-1, 1] 内")
         pv, pa = self.precision
         # ⚠ 必须用 isfinite 显式判 NaN：`pv <= 0.0` 对 NaN **恒 False**，NaN 精度会静默通过。
-        # 而 Zero 侧同样漏（affect_math.py:1052 `pi_v <= 0.0`、:1058 `pi_v > cap` 皆 NaN-恒 False，
-        # 其 M7 只守 μ 不守 Π）→ 两侧都不 fail-fast，NaN 精度会直接进 Zero 融合数学产出 NaN 后验。
-        # 对比：越界 μ 至少会被 Zero M7 响亮 raise。故这一条由我方单边兜住。
+        # 本条是 MCP 侧**单边兜底**，**不依赖 Zero 是否自带有限性校验**：其 M3 的
+        # `pi_v <= 0.0` / `pi_v > cap` 两条判据同为比较式（对 NaN 恒 False），M7 又只守 μ
+        # 不守 Π；Zero 是否在 M3 前置 isfinite 是**会随其提交/回退变动的运行时事实**，
+        # 把本仓判别力挂在对方未落地的编辑上是跨仓硬教训（cec7fe3 同族）。
+        # 对比：越界 μ 至少会被 Zero M7 响亮 raise；NaN 精度则更隐蔽——一旦漏过就直接进
+        # Zero 融合数学产出 NaN 后验。故这一条无论对侧如何都由我方守住。
         if not (math.isfinite(pv) and math.isfinite(pa)):
             raise ValueError("precision 各维必须为有限值（NaN/inf 会静默污染 Zero 融合后验）")
         if pv <= 0.0 or pa <= 0.0:
@@ -127,7 +160,12 @@ class ModalityPrior(BaseModel):
         return self
 
     def as_stream(self) -> tuple[str, tuple[float, float], tuple[float, float]]:
-        """转为 Zero affect_core streams 单条形状：(name, (μ_v,μ_a), (Π_v,Π_a))。"""
+        """转为 Zero affect_core streams 单条形状：(name, (μ_v,μ_a), (Π_v,Π_a))。
+
+        **只携带 modality / mu / precision 三项**；`coping` 在此丢弃（schema v1 无槽位）。
+        丢弃面是被守卫锁定的既定事实，见 tests/agents/test_zero_affect_models.py::
+        test_as_stream_drops_exactly_coping。
+        """
         return (self.modality, self.mu, self.precision)
 
 
@@ -186,7 +224,8 @@ class ExpressionHead(BaseModel):
     值 ∈ [0, 1]。AD-4：不要求全集——占位路径只出象限相关子集（3/9 键）。
 
     prosody_scale（Q1，Zero 回传 2026-07-14）：韵律量纲**兄弟键**，与 prosody 同级
-    （Zero 刻意不塞进 prosody 子 dict，见 affect_math.py:476）——"ratio"=倍率占位、
+    （Zero 刻意不塞进 prosody 子 dict，见 `src/agents/affect_math.py::decode_channels`
+    输出的 "prosody_scale" 兄弟键）——"ratio"=倍率占位、
     "normalized"=归一真模型；缺省 None（decoder 未标注量纲，如 mock，additive 零回归）。
     当 "normalized" 时校验 prosody 三值收窄到 [0,1]。
     """
@@ -223,8 +262,14 @@ class ExpressionHead(BaseModel):
 class LanguageOutput(BaseModel):
     """语言层输出（仅在语言层开启时出现，ExpressionBundle.language 可为 None）。
 
-    来自 D:\\Zero\\src\\agents\\language.py:58-85。
+    对应 Zero `src/agents/language.py::LanguageDraft`。
     affect: (v, a) 二元组，JSON 化后为 list，pydantic 自动强转（AD 兼容性）。
+
+    ⚠ 内容订正（2026-07-29 跨仓现场核验）：Zero 现行 `LanguageDraft` **只有 `text` 与
+    `affect`**，`iters` / `consistency` 已从其 dataclass 上移除。本模型**宽松保留**这两个
+    带默认值的可选字段——保超集不收窄：删属收窄，若某条路径/旧版 Zero 仍发这两个键，
+    `extra="forbid"` 会让整个 `ExpressionBundle.from_step_output` 解析炸掉。
+    故它们是**本仓兼容字段，不构成 Zero 侧契约要求**。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -243,13 +288,16 @@ class LanguageOutput(BaseModel):
 class ExpressionBundle(BaseModel):
     """Zero session.step() 返回 expression 的完整结构化表示。
 
-    来自 D:\\Zero\\src\\orchestration\\runner.py:174,491-516。
+    来自 Zero `src/orchestration/runner.py::_state_to_entry` 的 "expression" 键
+    （即 `ConversationSession.step` 返回体的该子树）。
 
     valence_arousal / ExpressionHead 内部的 tuple 字段均兼容 JSON 化后的 list 输入
     （Zero 内部是 tuple，过 MCP/JSON 边界变 list）——pydantic v2 默认支持 list→tuple 强转。
 
     prosody_scale（Q1）：Zero 在 expression 顶层**提升**一份 prosody 量纲标记
-    （`expression["prosody_scale"] = spontaneous["prosody_scale"]`，expression.py:88-91），
+    （`expression["prosody_scale"] = spontaneous["prosody_scale"]`，见 Zero
+    `src/agents/expression.py::ExpressionAgent`——注意路径已从 `src/expression.py` 迁到
+    `src/agents/expression.py`），
     供 MCP TTS mapper 单点读；两头共用同一无状态 decoder 故量纲一致。缺省 None
     （decoder 未标注量纲时不挂键，additive 零回归）。各头内也各带一份同名兄弟键。
     """
@@ -267,7 +315,8 @@ class ExpressionBundle(BaseModel):
         """从 Zero session.step() 返回 dict 解析 ExpressionBundle。
 
         step_out 可以是：
-        1. step() 完整返回 dict（含 "expression" 键，runner.py:174）→ 取 expression 子树。
+        1. step() 完整返回 dict（含 "expression" 键，见 Zero
+           `src/orchestration/runner.py::_state_to_entry`）→ 取 expression 子树。
         2. 直接传入 expression 子 dict（含 "valence_arousal"/"spontaneous"/"voluntary"）。
 
         两种形态都兼容；extra 键（如外层 trace 等）在挑取 expression 子树时自然隔离，

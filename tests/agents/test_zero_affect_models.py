@@ -238,10 +238,17 @@ class TestModalityPriorValidation:
     def test_non_finite_precision_raises(self, bad: float) -> None:
         """NaN/±inf 的 Π 被构造期拒绝。
 
-        ⚠ 这条曾是**双侧全漏**：我方 `pv <= 0.0` 与 Zero 的 `affect_math.py:1052/:1058`
-        判据对 NaN 皆恒 False，而 Zero M7 只守 μ 不守 Π → NaN 精度会静默进入融合数学
-        产出 NaN 后验，两侧都不 fail-fast（对比：越界 μ 至少被 Zero M7 响亮 raise）。
-        故此校验由我方单边兜住，删掉它不会有任何其它防线接住。
+        ⚠ 这条曾是**双侧全漏**：我方 `pv <= 0.0` 与 Zero
+        `src/agents/affect_math.py::expand_external_priors` 的 M3 判据
+        （`pi_v <= 0.0` 正值关、`pi_v > precision_cap` 上界关）对 NaN 皆恒 False，
+        而其 M7 只守 μ 不守 Π → NaN 精度会静默进入融合数学产出 NaN 后验，
+        两侧都不 fail-fast（对比：越界 μ 至少被 M7 响亮 raise）。
+
+        本条是 MCP 侧**单边兜底**，判据与对方状态解耦：不论 Zero 的
+        expand_external_priors 是否自带有限性校验，我方都不依赖对方。
+        「对方有守卫」是随时会变的运行时事实——2026-07-29 一天内实测经历三态：
+        main `11c25b0` 无 → 其未提交工作树出现 M3′ `math.isfinite` → main `332cb40`
+        起落地。本条是出网收口点，不随对方处于哪一态而增减。
         """
         with pytest.raises(ValidationError):
             ModalityPrior(modality="audio", mu=(0.0, 0.0), precision=(bad, 0.5))
@@ -389,8 +396,8 @@ class TestExpressionHeadTextLabel:
 
 class TestProsodyScale:
     """Q1：prosody_scale 是 ExpressionHead/ExpressionBundle 的**兄弟键**（非 prosody 子 dict 内，
-    Zero affect_math.py:476 刻意如此）。normalized→prosody 三值收窄 [0,1]；ratio/缺省放宽
-    （兼容当前 Zero 输出）。
+    Zero `src/agents/affect_math.py::decode_channels` 把它与 prosody 平级输出，刻意如此）。
+    normalized→prosody 三值收窄 [0,1]；ratio/缺省放宽（兼容当前 Zero 输出）。
     """
 
     def test_absent_scale_allows_ratio_prosody(self) -> None:
@@ -442,7 +449,12 @@ class TestProsodyScale:
             ExpressionHead(**data)
 
     def test_bundle_top_level_prosody_scale(self) -> None:
-        """ExpressionBundle 顶层接受 Zero 提升的 prosody_scale（expression.py:88-91）。"""
+        """ExpressionBundle 顶层接受 Zero 提升的 prosody_scale。
+
+        提升点：Zero `src/agents/expression.py::ExpressionAgent` 的
+        `expression["prosody_scale"] = spontaneous["prosody_scale"]`（仅当 spontaneous
+        带该键时提升）。注：该模块 2026-07 已从 `src/expression.py` 迁到 `src/agents/`。
+        """
         data = _make_expression_bundle_dict()
         data["prosody_scale"] = "ratio"
         bundle = ExpressionBundle(**data)
@@ -725,3 +737,48 @@ class TestRealShapeRoundtrip:
         bundle = ExpressionBundle.from_step_output(step_out)
         assert bundle.valence_arousal == (pytest.approx(v), pytest.approx(a))
         assert bundle.spontaneous.text_label == "content"
+
+
+# ---------------------------------------------------------------------------
+# D-7：ModalityPrior.as_stream() 的**丢弃面**（external_prior schema v1 不传 coping）
+# ---------------------------------------------------------------------------
+
+_AS_STREAM_CARRIED_FIELDS: frozenset[str] = frozenset({"modality", "mu", "precision"})
+"""`as_stream()` 三元组实际携带的字段名集合（丢弃面 = model_fields − 本集合）。
+
+之所以显式维护这份常量而不是从返回值里推：三元组里装的是**值**不是字段名，
+`assert "coping" not in prior.as_stream()` 对任何实现都恒真（pitfalls⑥ 原型）。
+"""
+
+
+class TestAsStreamDiscardSurface:
+    """`coping` 写进 ModalityPrior 会被 as_stream() 静默丢弃 —— 这是**已知且有意**的事实。
+
+    Zero 侧 ExternalPrior 是 `(name, μ, Π)` 三元组、无 coping 槽位，故 schema v1 不传输。
+    字段保留而非删除：`build_recommended_prior(coping=...)` 是既有公开入口，删属 breaking。
+    本类把「丢弃面」钉成可执行记录——日后若 Zero 进 schema v2 把 coping 纳入三元组，
+    或本模型新增字段，本用例会红并提示同步 Field description 与跨仓 schema 认知。
+    """
+
+    def test_as_stream_drops_exactly_coping(self) -> None:
+        """丢弃面精确等于 {"coping"}——多一个少一个都要红。"""
+        dropped = set(ModalityPrior.model_fields) - _AS_STREAM_CARRIED_FIELDS
+        assert dropped == {"coping"}, (
+            f"as_stream 的丢弃面变为 {sorted(dropped)}——须同步更新 ModalityPrior.coping 的 "
+            "Field description（『v1 不传输』文案）与跨仓 schema 认知"
+        )
+
+    def test_as_stream_payload_is_exactly_the_carried_fields(self) -> None:
+        """携带面：三元组逐值等于 (modality, mu, precision)，且元数与携带字段数一致。
+
+        ⚠ 判别力：`coping=0.5` 显式传入（非默认 None），若实现改成把 coping 追加进元组，
+        `len(...)` 那行接住；若改成挪用某一槽位装 coping，逐值相等那行接住。
+        """
+        prior = ModalityPrior(modality="vision", mu=(0.1, 0.2), precision=(0.2, 0.12), coping=0.5)
+        # 正控：被丢弃的字段确实被赋了**非默认**值，否则「丢没丢」不可观测。
+        assert prior.coping == 0.5
+
+        stream = prior.as_stream()
+
+        assert stream == ("vision", (0.1, 0.2), (0.2, 0.12))
+        assert len(stream) == len(_AS_STREAM_CARRIED_FIELDS)

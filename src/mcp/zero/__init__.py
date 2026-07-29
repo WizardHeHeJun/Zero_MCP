@@ -11,7 +11,8 @@
 - Zero 协议镜像（Zero*Protocol，runtime_checkable）
 - 规范常量（FACS_KEYS / FACS_KEYS_EXT / COPING_DRIVEN_AUS / TEXT_LABELS）
 - external_priors 接线（Q3，EXTERNAL_PRIOR_SCHEMA_VERSION / build_external_priors_override）
-- Zero MCP Client（Task 1-4，ZeroLinkClient + 四个自定义异常，含 unknown-session 机读判定）
+- Zero MCP Client（Task 1-4，ZeroLinkClient + 自定义异常族）
+- Zero 机读错误码（2026-07-29 令牌换代：`[zero:<code>]` 位置无关令牌 + 按码分类的异常子类）
 """
 
 from __future__ import annotations
@@ -42,11 +43,23 @@ from src.mcp.zero.channels import (
 
 # -- Zero MCP Client（Task 1-4）-----------------------------------------------
 from src.mcp.zero.client import (
+    ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE,
+    ZERO_ERROR_CODE_CONFIG_INVALID,
+    ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
+    ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID,
+    ZERO_ERROR_CODE_PAYLOAD_INVALID,
+    ZERO_ERROR_CODE_UNKNOWN_SESSION,
+    ZERO_ERROR_CODES,
+    ZeroLinkCallerFaultError,
     ZeroLinkCallError,
     ZeroLinkClient,
+    ZeroLinkConfigIncompatibleError,
     ZeroLinkConnectionError,
+    ZeroLinkDeployEnvError,
     ZeroLinkDisabledError,
+    ZeroLinkNonDegradableError,
     ZeroLinkUnknownSessionError,
+    classify_zero_error,
     generate_session_id,
 )
 
@@ -165,4 +178,17 @@ __all__ = [
     "ZeroLinkCallError",
     "ZeroLinkUnknownSessionError",
     "generate_session_id",
+    # Zero 机读错误码（2026-07-29 令牌换代）
+    "ZERO_ERROR_CODES",
+    "ZERO_ERROR_CODE_UNKNOWN_SESSION",
+    "ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE",
+    "ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID",
+    "ZERO_ERROR_CODE_PAYLOAD_INVALID",
+    "ZERO_ERROR_CODE_CONFIG_INVALID",
+    "ZERO_ERROR_CODE_DEPLOY_ENV_INVALID",
+    "ZeroLinkNonDegradableError",
+    "ZeroLinkConfigIncompatibleError",
+    "ZeroLinkCallerFaultError",
+    "ZeroLinkDeployEnvError",
+    "classify_zero_error",
 ]

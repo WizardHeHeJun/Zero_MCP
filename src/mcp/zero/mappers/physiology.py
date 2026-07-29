@@ -26,9 +26,15 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.agents.models.zero_affect import ExpressionHead
+from src.agents.models.zero_affect import ExpressionHead, PhysiologyChannel
 
 logger = logging.getLogger(__name__)
+
+_SCALE_MISMATCH_MARKER: str = "physiology 口径失配（W6）"
+"""口径失配 warning 的稳定前缀——与本模块「归一范围退化」等其它 warning 区分。
+
+测试按此串筛选记录：若只断言「有 warning」，退化范围那条会让用例**红在错误的原因上**。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +116,14 @@ class LinearPhysiologyMapper:
     判据：`temperature_c` 出现≈canonical(μS)、`pupil_mm` 出现且无 temp≈legacy([0,1])。行为差异见
     test_zero_physiology_mapper.py::TestLegacyScaleConsumptionGap。
 
+    **失配观测（2026-07-29 补，Zero 12:25 回执 D-5）**：上述判据已从纯 docstring 升级为
+    `_detect_scale_mismatch()` + `map()` 里一条 **warning**（实例级去重）。它**只观测、不改任何
+    数值**——三条数值锁（TestLegacyScaleConsumptionGap）原样成立，即本改动的零回归看门狗。
+    ⚠ **绝不可据此宣称「20× 欠标度已解决」**：判据挂在 `temperature_c`/`pupil_mm` **键的有无**上，
+    Zero 一旦增删这两个键（其 §4.4-4 正要动键集）本启发式即**静默失效**——既不再报，也不误报，
+    调用方无从察觉。真解仍是 Zero 允诺的 `physiology_scale` 量纲兄弟键（对齐 `prosody_scale`），
+    落地后本判据须改按兄弟键判定、并把形状启发式降级为兜底。
+
     ⚠ **保护策略有意不对称**（code-review W3）：作**除数**的 cardio_respiratory_ratio/
     skin_conductance_max_us 在 `__init__` 即 fail-fast（≤0 → ValueError，防 ZeroDivisionError）；作
     **归一范围** temperature_range/pupil_mm_range 退化（span≤0）**不构造期 raise**，而 map() 优雅
@@ -120,6 +134,10 @@ class LinearPhysiologyMapper:
         skin_conductance_max_us : 皮电归一上界（μS，>0，≤0 构造期 raise），默认 20.0（WESAD 量级）。
         temperature_range       : (min_c, max_c) 温度归一范围，默认 (30,40)；退化→map() 回 None。
         pupil_mm_range          : (min_mm, max_mm) 瞳孔归一范围，默认 (3,5)；退化→map() 回退 None。
+
+    Attributes:
+        scale_mismatch_warned: 口径失配 warning 的**实例级**去重标志（首次失配后置 True，避免逐帧
+            刷屏）。有意不做模块级去重——那会让测试顺序相关（先跑的用例吃掉 warning，后跑的假绿）。
     """
 
     def __init__(
@@ -143,6 +161,7 @@ class LinearPhysiologyMapper:
         self.skin_conductance_max_us = skin_conductance_max_us
         self.temperature_range = temperature_range
         self.pupil_mm_range = pupil_mm_range
+        self.scale_mismatch_warned = False
 
     async def map(self, channel: ExpressionHead) -> PhysiologyParams:
         """async：将 ExpressionHead 生理通道映射为 PhysiologyParams。
@@ -156,6 +175,13 @@ class LinearPhysiologyMapper:
             PhysiologyParams——引擎无关的生理驱动动画参数（temp/pupil 源缺省时对应维为 None）。
         """
         physiology = channel.physiology
+
+        # 口径失配观测（W6·零回归）：**只发 warning，不改任何数值**——数值分支在下面原样保留。
+        if not self.scale_mismatch_warned:
+            mismatch_reason = self._detect_scale_mismatch(physiology)
+            if mismatch_reason is not None:
+                self.scale_mismatch_warned = True
+                logger.warning("%s：%s", _SCALE_MISMATCH_MARKER, mismatch_reason)
 
         heart_rate_bpm = max(0.0, physiology.heart_rate_bpm)
         breath_rate_bpm = max(0.0, physiology.heart_rate_bpm / self.cardio_respiratory_ratio)
@@ -184,6 +210,45 @@ class LinearPhysiologyMapper:
             skin_temperature_level=skin_temperature_level,
             pupil_dilation=pupil_dilation,
         )
+
+    def _detect_scale_mismatch(self, physiology: PhysiologyChannel) -> str | None:
+        """按形状启发式判定「来源口径 ⟂ 本 mapper 的 sc 标度设定」是否失配。
+
+        返回**原因串**（而非 bool）：调用方直接把它写进日志，测试也据此断言「红在正确的原因上」
+        ——只判 True/False 会让「因另一个原因发的 warning」被当成通过。无失配返回 None。
+
+        判据（与类 docstring 的 W6 判据同源）：
+        - `temperature_c` 出现 ⇒ 疑似 canonical（`skin_conductance` 是 μS）；
+        - `pupil_mm` 出现且无 `temperature_c` ⇒ 疑似 legacy（`skin_conductance` 已是 [0,1]）；
+        - 两键皆无 ⇒ **判不出**，静默放行（不猜、不误报）。
+
+        ⚠ 这是**观测**不是**保证**：判据挂在键的有无上，Zero 增删 `temperature_c`/`pupil_mm`
+        会让它静默失效。真解是 Zero 允诺的 `physiology_scale` 兄弟键，见类 docstring。
+
+        Args:
+            physiology: 待消费的生理通道（canonical 或 legacy 形状）。
+
+        Returns:
+            失配原因串（可直接进日志）；无失配或形状判不出 → None。
+        """
+        looks_canonical = physiology.temperature_c is not None
+        looks_legacy = physiology.temperature_c is None and physiology.pupil_mm is not None
+
+        if looks_legacy and self.skin_conductance_max_us != 1.0:
+            return (
+                "来源疑似 legacy 口径（无 temperature_c、有 pupil_mm ⇒ skin_conductance 已是 "
+                "[0,1]），但本 mapper 按 μS 归一（skin_conductance_max_us="
+                f"{self.skin_conductance_max_us}）⇒ 系统性欠标度 "
+                f"~{self.skin_conductance_max_us:g}×。"
+                "接线须显式配 skin_conductance_max_us=1.0（W6）"
+            )
+        if looks_canonical and self.skin_conductance_max_us == 1.0:
+            return (
+                "来源疑似 canonical 口径（有 temperature_c ⇒ skin_conductance 为 μS），但本 mapper "
+                "配了 skin_conductance_max_us=1.0 ⇒ 过标度"
+                "（μS 量级读数被当 [0,1] 消费，将常态饱和）"
+            )
+        return None
 
     def _normalize_temperature(self, temperature_c: float | None) -> float | None:
         """将 temperature_c 在 temperature_range 内归一到 [0,1]（clamp）。

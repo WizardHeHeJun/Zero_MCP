@@ -35,7 +35,11 @@ import pytest
 
 from src.agents.models.zero_affect import ModalityPrior
 from src.mcp.zero.channels.physio_channel import EdaChannel, HrvChannel
-from src.mcp.zero.external_priors import MIN_PRECISION, is_physio_stream
+from src.mcp.zero.external_priors import (
+    MIN_PRECISION,
+    build_external_priors_override,
+    is_physio_stream,
+)
 from src.mcp.zero.perception import PerceptionChannel, PerceptionHub
 
 # ---------------------------------------------------------------------------
@@ -432,3 +436,47 @@ class TestPhysioChannelReset:
         hub.reset_all()  # 不应因 stateless 无 reset 而抛
 
         assert len(eda.baseline_history) == 0, "reset_all 应清空 EdaChannel 基线历史"
+
+
+# ---------------------------------------------------------------------------
+# D-6：通道 → wire 端到端 —— 真通道产出的 physio 先验落到载荷上仍须 μv≡0
+# ---------------------------------------------------------------------------
+
+
+class TestChannelToWireMuVZero:
+    """`PHYSIO_PRECISION_A_SELF_IGNITE_BOUND=0.359` 的前提须在**出网口**成立，而非只在通道内。
+
+    既有 E5 / E12c 只断言单通道 `ModalityPrior.mu[0] == 0.0`；本类补的是**单条 physio 流
+    不触发 EDA/HRV 预合并、原样透传到 `build_external_priors_override` 载荷**这条路径——
+    该路径上没有任何产品码会去归零 μv，故通道侧一旦写出非零 μv 就会**直接上 wire**，
+    而按 μv≡0 闭式复算的 0.359 上界守卫不会报错（真实上界应收紧到 ≈0.2536）。
+
+    ⚠ 判别力设计：μv 由**真 EdaChannel 计算**（非手写常量喂进去），故「通道改成带出非零
+    μv」这一变异会真正驱红；若改用 `_make_prior(mu=(0.0, ...))` 手工构造，断言就退化成
+    「我断言我自己刚写进去的 0」——恒真式（pitfalls⑥）。
+    """
+
+    async def test_channel_priors_reach_wire_with_zero_mu_v(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """真 EdaChannel 产出的单条先验直达载荷（不合并），其 wire 上的 μv 仍为 0。"""
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch, _clock = _make_warm_eda_channel(sampling_rate=8)
+        prior = await ch.sense(signal=_make_eda_signal(rate=8, level=500.0))
+        assert prior is not None, "通道未产出先验，后续全称断言会恒真"
+
+        payload = build_external_priors_override([prior])["external_priors"]
+        physio_streams = [s for s in payload if is_physio_stream(s[0])]
+        # 正控①：载荷里必须真有 physio 流被观测到（空集会让下面的 for 循环恒真）。
+        assert physio_streams, f"载荷里没有 physio 流：{[s[0] for s in payload]}"
+        # 正控②：确认走的是**不合并**路径（单条 EDA，无 HRV），即本用例覆盖的透传面。
+        assert len(payload) == 1 and payload[0][0] == prior.modality
+
+        for name, mu, _precision in physio_streams:
+            assert mu[0] == 0.0, (
+                f"physio 流 {name!r} 的出线 μv={mu[0]} ≠ 0 —— 自点燃上界 0.359 的前提已破；"
+                "须把上界收紧到 ≈0.2536 并同步跨仓守卫的现算式"
+            )
+        # μa 由真信号算出、非平凡：证明本用例观测的确是「μv 那一维被钉 0」，
+        # 而不是「整条先验退化成零向量」。
+        assert physio_streams[0][1][1] != 0.0

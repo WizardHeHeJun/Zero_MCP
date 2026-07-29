@@ -17,13 +17,18 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import pytest
 
 from src.agents.models.zero_affect import ModalityPrior
 from src.mcp.zero import external_priors as external_priors_module
 from src.mcp.zero.external_priors import (
+    _MERGE_OMEGA_WARN_MARKER,
     EXTERNAL_PRIOR_SCHEMA_VERSION,
     MIN_PRECISION,
+    PHYSIO_MERGE_OMEGA_DEFAULT,
     PHYSIO_MERGED_MODALITY,
     PHYSIO_STREAM_PREFIXES,
     PHYSIO_SUBSOURCE_PRECISION_A,
@@ -348,7 +353,8 @@ class TestIsPhysioStream:
 
 
 class TestM7MuDomain:
-    """M7 客户端校验：出线 μ 各维 ∈[-1,1]，镜像 Zero `affect_math.py:1039-1043`。
+    """M7 客户端校验：出线 μ 各维 ∈[-1,1]，镜像 Zero
+    `src/agents/affect_math.py::expand_external_priors` 的 M7 μ 域 fail-fast。
 
     背景：Zero commit `0d4edb1`（2026-07-28 20:00，已在其 main）新增 M7 fail-fast——
     越界 μ 从「静默降级」变成 `raise ValueError`。经其 server 包成 ToolError → 我方
@@ -462,10 +468,14 @@ class TestM3PrecisionCap:
     def test_non_finite_precision_is_caught(self, bad: float) -> None:
         """NaN/inf 的 Π 被出境守卫拦下——`value > cap` 对 NaN **恒 False**，会静默穿过上界关。
 
-        ⚠ 这条比越界 μ 更隐蔽，因为**两侧都没有兜底**：Zero 的 M7（`affect_math.py:1039`）
-        只守 μ 不守 Π，其 `:1052` `pi_v <= 0.0` 与 `:1058` `pi_v > cap` 对 NaN 同样恒 False
-        → NaN 精度会一路进入融合数学产出 NaN 后验，无任何 fail-fast。删掉本守卫不会有
-        其它防线接住（对比越界 μ 至少会被 Zero M7 响亮 raise）。
+        ⚠ 这条比越界 μ 更隐蔽：Zero `src/agents/affect_math.py::expand_external_priors`
+        的 M7 只守 μ 不守 Π，其 M3 两关（`pi_v <= 0.0` 正值关、`pi_v > precision_cap`
+        上界关）对 NaN 同样恒 False → NaN 精度会一路进入融合数学产出 NaN 后验。
+
+        本守卫是 MCP 侧**单边兜底**，不依赖对方状态。「对方有守卫」是随时会变的运行时
+        事实——2026-07-29 一天内实测经历三态：Zero main `11c25b0` 无 → 其未提交工作树
+        出现 M3′（`math.isfinite` 前置于两条比较）→ main `332cb40` 起落地。出网收口点
+        必须在我方：删掉本守卫，我方就把 NaN 拦截权交给了一个当天变了三次的外部状态。
         """
         rogue = ModalityPrior.model_construct(
             modality="vision", mu=(0.1, 0.1), precision=(bad, 0.2)
@@ -843,3 +853,157 @@ class TestPhysioPreMerge:
         merged_pi = merge_physio_priors(priors)[0].precision[1]
         assert merged_pi < naive_sum
         assert merged_pi == pytest.approx(naive_sum / 2.0), "对称 ω 下合并精度应为朴素和的一半"
+
+
+# ---------------------------------------------------------------------------
+# 非默认 ω 告警（D-5(b)·Zero 2026-07-29 回执 R6，零回归）
+#
+# `PHYSIO_MERGE_OMEGA_DEFAULT` docstring 的「仅供实验/对照，生产不应改」原是**自律文字**，
+# 代码里非默认值静默接受。R6 要求升级为可执行守卫：warn（不 raise——实验/对照是正当用途，
+# 且 :742 的对照用例会设 0.571 并期望成功）。数值行为一字未动。
+#
+# 判别力四格（两条入口 × 是否默认，逐格实证）：
+#   env=0.571        → 发      | 显式 omega=0.6 → 发（env 判据会漏掉的那条通路）
+#   env 未设（默认）  → 不发    | 显式 omega=0.5 → 不发
+# 两条「不发」都先跑正控，证明该 warn 在同一 caplog 会话里确实可见（防恒真式）。
+# ---------------------------------------------------------------------------
+
+_PRIORS_LOGGER = "src.mcp.zero.external_priors"
+
+
+def _omega_warnings(caplog: Any) -> list[str]:
+    """只挑「非默认 ω」那一类 WARNING（按产品侧稳定前缀筛，避免被别的原因染绿/染红）。"""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and _MERGE_OMEGA_WARN_MARKER in record.getMessage()
+    ]
+
+
+def _merge_pair() -> list[ModalityPrior]:
+    """EDA+HRV 两条流（会触发合并 ⇒ 会走到 _resolve_merge_omega）。"""
+    return [
+        _make_prior("eda/sc", mu=(0.0, 0.7), precision=(MIN_PRECISION, 0.18)),
+        _make_prior("hrv/rmssd", mu=(0.0, 0.9), precision=(MIN_PRECISION, 0.18)),
+    ]
+
+
+class TestMergeOmegaOverrideWarning:
+    """ω≠终裁默认必须出声：它直接改发往 Zero 的 wire Πa，而 Zero 侧无同名旋钮可观测。"""
+
+    def test_env_override_warns(self, monkeypatch: pytest.MonkeyPatch, caplog: Any) -> None:
+        """env 通路：ZERO_PHYSIO_MERGE_OMEGA=0.571 → 出声，且数值仍按 0.571 算（不 raise）。"""
+        monkeypatch.setenv("ZERO_PHYSIO_MERGE_OMEGA", "0.571")
+        with caplog.at_level(logging.WARNING, logger=_PRIORS_LOGGER):
+            merged = merge_physio_priors(_merge_pair())
+        messages = _omega_warnings(caplog)
+        assert len(messages) == 1, f"应恰有一条非默认 ω warn，实际日志：{caplog.text!r}"
+        assert "0.571" in messages[0] and "私有旋钮" in messages[0], (
+            f"warn 须点明取值与「Zero 无同名旋钮可观测」，实际：{messages[0]!r}"
+        )
+        # 零回归：只加声音不改数值（与 :742 对照用例同式）
+        expected = (
+            0.571 * PHYSIO_SUBSOURCE_PRECISION_A["eda"]
+            + (1.0 - 0.571) * (PHYSIO_SUBSOURCE_PRECISION_A["hrv"])
+        )
+        assert merged[0].precision[1] == pytest.approx(expected)
+
+    def test_explicit_argument_override_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: Any
+    ) -> None:
+        """入参通路：omega=0.6 → 出声。
+
+        判据必须写在**解析后的值**上：若按「env 读到没有」判，这条通路会整条漏掉（env 未设，
+        照样改了 wire Πa）。故此处刻意把 env 删干净。
+        """
+        monkeypatch.delenv("ZERO_PHYSIO_MERGE_OMEGA", raising=False)
+        with caplog.at_level(logging.WARNING, logger=_PRIORS_LOGGER):
+            merge_physio_priors(_merge_pair(), omega=0.6)
+        messages = _omega_warnings(caplog)
+        assert len(messages) == 1, f"显式入参也须出声，实际日志：{caplog.text!r}"
+        assert "0.6" in messages[0]
+
+    def test_default_path_is_silent(self, monkeypatch: pytest.MonkeyPatch, caplog: Any) -> None:
+        """**零回归主证**：env 未设、不传 omega（生产默认路径）→ 不出声。
+
+        先跑正控（同一 caplog 会话里 env=0.571 必出声）再断言静默，否则是恒真式。
+        """
+        with caplog.at_level(logging.WARNING, logger=_PRIORS_LOGGER):
+            monkeypatch.setenv("ZERO_PHYSIO_MERGE_OMEGA", "0.571")
+            merge_physio_priors(_merge_pair())
+            assert _omega_warnings(caplog), "正控失败：warn 不可见，静默断言将是恒真式"
+            caplog.clear()
+            monkeypatch.delenv("ZERO_PHYSIO_MERGE_OMEGA", raising=False)
+            merged = merge_physio_priors(_merge_pair())
+        assert _omega_warnings(caplog) == []
+        assert merged[0].precision[1] == pytest.approx(
+            sum(PHYSIO_SUBSOURCE_PRECISION_A.values()) / 2.0
+        )
+
+    def test_explicit_default_value_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: Any
+    ) -> None:
+        """显式传入的值**等于**默认 → 不出声（判据是「值非默认」，不是「有没有显式传」）。"""
+        monkeypatch.delenv("ZERO_PHYSIO_MERGE_OMEGA", raising=False)
+        with caplog.at_level(logging.WARNING, logger=_PRIORS_LOGGER):
+            merge_physio_priors(_merge_pair(), omega=0.6)  # 正控
+            assert _omega_warnings(caplog), "正控失败：warn 不可见，静默断言将是恒真式"
+            caplog.clear()
+            merge_physio_priors(_merge_pair(), omega=PHYSIO_MERGE_OMEGA_DEFAULT)
+        assert _omega_warnings(caplog) == []
+
+    def test_warn_is_not_deduplicated(self, monkeypatch: pytest.MonkeyPatch, caplog: Any) -> None:
+        """有意**不去重**：每次合并各出声一次。
+
+        模块级 `_warned` 标志会让用例顺序相关（先跑的吃掉 warning、后跑的假绿），代价（非默认 ω
+        下逐次刷屏）可接受——那本就不该出现在生产。
+        """
+        monkeypatch.delenv("ZERO_PHYSIO_MERGE_OMEGA", raising=False)
+        with caplog.at_level(logging.WARNING, logger=_PRIORS_LOGGER):
+            merge_physio_priors(_merge_pair(), omega=0.6)
+            merge_physio_priors(_merge_pair(), omega=0.6)
+        assert len(_omega_warnings(caplog)) == 2
+
+
+# ---------------------------------------------------------------------------
+# D-6：0.359 自点燃上界的前提锚 —— μv≡0 是**我方**硬写，不是 Zero 的保证
+# ---------------------------------------------------------------------------
+
+
+class TestPhysioOutboundMuVZeroPremise:
+    """`PHYSIO_PRECISION_A_SELF_IGNITE_BOUND=0.359` 成立的唯一前提：出线 physio 流 μv≡0。
+
+    归因订正（2026-07-29 跨仓现场核验，Zero 指认成立）：Zero
+    `src/agents/affect_math.py::expand_external_priors` 的 M2 分支**只覆写 Πv、从不碰 μ**，
+    紧邻的 M7 也只做 μ∈[-1,1] 域校验。μv≡0 完全来自**我方三处硬写**——EdaChannel /
+    HrvChannel 各一处 `mu_v = 0.0`，以及 `merge_physio_priors` 出线的 `mu=(0.0, mu_merged_a)`。
+    前提一旦破，hypot(μ) 最大到 √2，真实自点燃上界收紧到 ≈0.2536（0.359 松约 30%），
+    而按 μv≡0 闭式复算的既有跨仓守卫**不会报错**——文案说缺口在、断言却测不到。
+
+    ⚠ 本类补的是一处**实测存在的恒真式缺口**：既有
+    `test_merge_precision_matches_council_value` 给两条入参的 μv 都写 0.0，故其
+    `assert merged[0].mu[0] == 0.0` 对「把入参 μv 按精度加权带出」这一变异**恒绿**
+    （pitfalls⑥ 原型）。本类改喂非零 μv，使该变异真正驱红。
+    """
+
+    def test_merge_forces_mu_v_zero_against_nonzero_inputs(self) -> None:
+        """入参带**非零且异号**的 μv，合并出线仍须硬置 0.0。
+
+        异号（+0.9 / -0.7）而非同号：若实现改成精度加权带出，同号入参也许仍落在某个
+        接近 0 的值上，异号则让加权结果显著偏离 0，变异更易被 `== 0.0` 接住。
+        """
+        eda = _make_prior("eda/sc", mu=(0.9, 0.4), precision=(MIN_PRECISION, 0.15))
+        hrv = _make_prior("hrv/rmssd", mu=(-0.7, 0.6), precision=(MIN_PRECISION, 0.20))
+        # 正控：被观测量（入参 μv）必须真的非零，否则下面的断言退化成恒真式。
+        assert eda.mu[0] != 0.0 and hrv.mu[0] != 0.0, "入参 μv 全零 → 本用例无判别力"
+
+        merged = merge_physio_priors([eda, hrv])
+
+        assert len(merged) == 1, f"EDA+HRV 应合并为单条，实际 {[p.modality for p in merged]}"
+        assert merged[0].mu[0] == 0.0, (
+            f"合并出线 μv={merged[0].mu[0]} ≠ 0 —— PHYSIO_PRECISION_A_SELF_IGNITE_BOUND=0.359 "
+            "的前提已破。须按 hypot(μ)≤√2 把上界收紧到 ≈0.2536，并**成对**修改跨仓守卫里的"
+            "现算式（只改常量或只改现算式都会红，两者都不改而只改文案则是假绿）。"
+        )
+        # μa 仍按 CI 加权正常产出（证明本用例观测的是 μv 那一维，不是「整个 mu 被清空」）
+        assert merged[0].mu[1] != 0.0

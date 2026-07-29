@@ -1,8 +1,11 @@
 """Q3 external_priors 接线接口——MCP → Zero session.step(state_overrides=...) 载荷构造。
 
-跨仓协议锚点：本模块数据形状与
-D:\\Zero\\src\\orchestration\\external_prior.py 的 ExternalPrior / EXTERNAL_PRIOR_SCHEMA_VERSION
-严格对齐（现场核验 2026-07-14）。本仓不 import Zero，对齐靠镜像类型别名 + 版本常量断言。
+跨仓协议锚点：本模块数据形状与 Zero
+`src/orchestration/external_prior.py::{ExternalPrior, EXTERNAL_PRIOR_SCHEMA_VERSION}`
+严格对齐（现场核验 2026-07-14 / R7 复核 2026-07-29）。本仓不 import Zero，对齐靠镜像类型
+别名 + 版本常量断言。跨仓引用一律「仓内相对路径::符号名」，**禁写对方行号与绝对路径**
+（R7 双方约定：行号一次编辑即失效且腐烂不驱红；绝对路径把「Zero 装在哪」这个部署事实
+钉进源码，是第二个易腐维度）。
 
 M3/M6 客户端 fail-fast（早于 Zero 报错、消息更清晰，阈值默认对齐 Zero 且走同名 env）：
 - M6 流数上界 max_streams（默认 ZERO_MAX_EXTERNAL_STREAMS=5）。
@@ -40,7 +43,7 @@ logger = logging.getLogger(__name__)
 EXTERNAL_PRIOR_SCHEMA_VERSION: int = 1
 """跨仓协议版本锚点。
 
-须与 D:\\Zero\\src\\orchestration\\external_prior.py 的同名常量保持一致（M5，
+须与 Zero `src/orchestration/external_prior.py::EXTERNAL_PRIOR_SCHEMA_VERSION` 保持一致（M5，
 跨仓回归断言应在 zerorepo 集成测试中 assertEqual 此值与 Zero 侧值）。
 修改此值前须与 Zero 侧窗口协调，并同步更新两仓。
 """
@@ -50,7 +53,7 @@ EXTERNAL_PRIOR_SCHEMA_VERSION: int = 1
 # ---------------------------------------------------------------------------
 
 MIN_PRECISION: float = 1e-3
-"""最小高斯精度，镜像 D:\\Zero\\src\\agents\\affect_math.py:21 的 MIN_PRECISION。
+"""最小高斯精度，镜像 Zero `src/agents/affect_math.py::MIN_PRECISION`。
 
 生理流（physio/eda/hrv/pupil/scr 前缀）的效价精度 Πv 会被 Zero M2 无条件覆写为此值
 （EDA/HRV/瞳孔对效价盲，Kreibig 2010）；MCP 侧构造生理先验时也应直接给此值以示意图一致。
@@ -59,16 +62,18 @@ MIN_PRECISION: float = 1e-3
 ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT: float = 0.8
 """M3 单条外部先验精度上界默认值。
 
-镜像 Zero AffectState.external_prior_precision_cap（D:\\Zero\\src\\orchestration\\state.py:228，
-env ZERO_EXTERNAL_PRIOR_PRECISION_CAP 默认 0.8）。修改须与 Zero 侧协调（M3，防默认值漂移；
+镜像 Zero `src/orchestration/state.py::AffectState.external_prior_precision_cap`
+（`Field(default=0.8, gt=0.0)`，env ZERO_EXTERNAL_PRIOR_PRECISION_CAP 默认 0.8）。
+修改须与 Zero 侧协调（M3，防默认值漂移；
 跨仓回归 assertEqual 此值与 Zero 侧 AffectState 字段默认）。
 """
 
 ZERO_MAX_EXTERNAL_STREAMS_DEFAULT: int = 5
 """M6 每轮外部流数上界默认值。
 
-镜像 Zero AffectState.max_external_streams（D:\\Zero\\src\\orchestration\\state.py:232，
-env ZERO_MAX_EXTERNAL_STREAMS 默认 5）。修改须与 Zero 侧协调（M6，防默认值漂移；
+镜像 Zero `src/orchestration/state.py::AffectState.max_external_streams`
+（`Field(default=5, ge=0)`，env ZERO_MAX_EXTERNAL_STREAMS 默认 5）。
+修改须与 Zero 侧协调（M6，防默认值漂移；
 跨仓回归 assertEqual 此值与 Zero 侧 AffectState 字段默认）。
 """
 
@@ -78,8 +83,8 @@ def _resolve_precision_cap(precision_cap: float | None) -> float:
 
     env 变量名与 Zero 侧同名（同一旋钮），保证两仓 fail-fast 阈值同步。
     env 值非法（无法解析为 float / ≤0）时 raise 带语境的 ValueError——与 M3 业务
-    ValueError 区分，避免线上「配置错误」被误当成「精度超上界」（镜像 Zero AffectState
-    字段 gt=0.0 约束，D:\\Zero\\src\\orchestration\\state.py:228）。
+    ValueError 区分，避免线上「配置错误」被误当成「精度超上界」（镜像 Zero
+    `src/orchestration/state.py::AffectState.external_prior_precision_cap` 的 gt=0.0 约束）。
     """
     if precision_cap is not None:
         return precision_cap
@@ -105,8 +110,8 @@ def _resolve_max_streams(max_streams: int | None) -> int:
 
     env 变量名与 Zero 侧同名（同一旋钮），保证两仓 fail-fast 阈值同步。
     env 值非法（无法解析为 int / <0）时 raise 带语境的 ValueError——与 M6 业务
-    ValueError 区分（镜像 Zero AffectState 字段 ge=0 约束，
-    D:\\Zero\\src\\orchestration\\state.py:232）。
+    ValueError 区分（镜像 Zero
+    `src/orchestration/state.py::AffectState.max_external_streams` 的 ge=0 约束）。
     """
     if max_streams is not None:
         return max_streams
@@ -130,7 +135,7 @@ def _resolve_max_streams(max_streams: int | None) -> int:
 # ---------------------------------------------------------------------------
 
 ExternalPriorTuple = tuple[str, tuple[float, float], tuple[float, float]]
-"""镜像 D:\\Zero\\src\\orchestration\\external_prior.py 的 ExternalPrior。
+"""镜像 Zero `src/orchestration/external_prior.py::ExternalPrior`。
 
 形状：(name: str, (μ_v, μ_a): tuple[float,float], (Π_v, Π_a): tuple[float,float])
 
@@ -149,7 +154,7 @@ ExternalPriorTuple = tuple[str, tuple[float, float], tuple[float, float]]
 PHYSIO_STREAM_PREFIXES: tuple[str, ...] = ("physio", "eda", "hrv", "pupil", "scr")
 """Zero 强制覆写效价精度 Πv 的流名前缀集合（M2，生理信号对效价盲）。
 
-Zero 侧行为（D:\\Zero\\src\\orchestration\\external_prior.py，Kreibig 2010）：
+Zero 侧行为（`src/agents/affect_math.py::_PHYSIO_PREFIXES` 的 M2 消费点，Kreibig 2010）：
 凡流名匹配这些前缀的流，Zero 的 expand_external_priors() 将其效价精度 Πv
 强制覆写为 MIN_PRECISION（极低精度=对效价几乎不贡献），以反映 EDA/HRV/瞳孔
 对效价盲的生理学约束。唤醒度精度 Πa 保留原值（生理信号对唤醒可靠）。
@@ -189,7 +194,7 @@ def is_physio_stream(name: str) -> bool:
 def _triggers_zero_m2(name: str) -> bool:
     """精确镜像 Zero M2 生理流判定，用于 M3 客户端校验的生理流 Πv 豁免。
 
-    Zero 的判定（D:\\Zero\\src\\agents\\affect_math.py:998）::
+    Zero 的判定（`src/agents/affect_math.py::expand_external_priors` 的 M2 生理流分支）::
 
         if name.lower().startswith(_PHYSIO_PREFIXES):  # 大小写不敏感·裸前缀（无需分隔符）
             pi_v = MIN_PRECISION
@@ -231,9 +236,29 @@ _RECOMMENDED_PRECISION_DEFAULTS: dict[ModalityKind, tuple[float, float]] = {
 PHYSIO_PRECISION_A_SELF_IGNITE_BOUND: float = 0.359
 """**自点燃硬上界**：physio 的 Πa 一旦 ≥ 此值，我方 physio 流可自行越过 Zero 的点燃门。
 
-推导（Zero `stream_salience` = hypot(μ)·mean(Π)、`SALIENCE_THRESHOLD` = 0.18）：
-physio 的 μv 恒 0（Kreibig 2010 + Zero M2），故 hypot(μ)=|μa| ≤ 1；Πv 恒 MIN_PRECISION。
+推导（Zero `src/agents/affect_math.py::stream_salience` = hypot(μ)·mean(Π)、
+同模块 `SALIENCE_THRESHOLD` = 0.18）：
+本上界成立**依赖一条我方单边前提**——physio 流的 μv 恒 0，故 hypot(μ)=|μa| ≤ 1；
+Πv 恒 MIN_PRECISION（**这一条才是 Zero M2 给的保证**）。
 最坏情形 |μa|=1 时 salience = (MIN_PRECISION + Πa)/2 ≥ 0.18 ⟺ Πa ≥ 0.36 − 1e-3 = 0.359。
+
+⚠ **归因订正（2026-07-29 跨仓现场核验，Zero 指认成立）**：μv≡0 **不是 Zero 保证的**。
+Zero `expand_external_priors` 的 M2 分支（按 `_PHYSIO_PREFIXES` 命中）**只覆写 Πv、全程不碰 μ**；
+紧邻的 M7 也只做 μ∈[-1,1] 域校验、不置零。Kreibig 2010 支撑的是「EDA/HRV 对效价盲」这一
+**建模选择**，把它落成 `μv = 0.0` 的是**我方通道侧硬写**，共三处锚点：
+`src/mcp/zero/channels/physio_channel.py` 的 `EdaChannel` 与 `HrvChannel` 各一处 `mu_v = 0.0`，
+以及本模块 `merge_physio_priors` 出线的 `mu=(0.0, mu_merged_a)`。
+⇒ 一旦任一 physio 流带**非零 μv**（v2 改口径 / 未来 RSP 子源 / 合并式产出新 μv），
+hypot(μ) 最大到 √2，真实自点燃上界**收紧到 ≈0.2536**（= 2·0.18/√2 − MIN_PRECISION）；
+届时 0.359 会**松约 30%**，而现有守卫按 μv≡0 的闭式复算、**不会报错**——即文案说的缺口在、
+断言却测不到。故三处硬写锚点**不得删注释**，改口径时必须成对复算本常量与守卫里的现算式。
+本轮（R7）**只订正归因与风险陈述，不动 0.359 这个数值**——是否把「physio 前缀流强制
+μ=(0.0, μa)」写进跨仓协议（写进 = 把上界从两仓自律升级为单侧结构保证）待双方拍板。
+前提的守卫分布在三处（对应三处硬写）：通道侧 EDA/HRV 见
+tests/mcp/test_zero_physio_channel.py 的 `test_mu_v_is_zero` / `test_hrv_mu_v_is_zero`；
+合并出线见 tests/mcp/test_zero_external_priors.py::TestPhysioOutboundMuVZeroPremise；
+通道→wire 端到端见 tests/mcp/test_zero_physio_channel.py::
+`test_channel_priors_reach_wire_with_zero_mu_v`。
 
 ⚠ **为什么这条要写成常量而不是注释**：Πa 由 env ``EXTERNAL_PHYSIO_PRECISION_A`` 控，
 Zero 侧只有 cap=0.8 的宽上界。而 Zero 的 D7 承诺（`exclude_physio_fusion` 默认 True，
@@ -345,7 +370,9 @@ PHYSIO_MERGE_OMEGA_DEFAULT: float = 0.5
 ⚠ 跨仓约定错位提醒：Zero 材料里的 ω≈0.571 是加在 **HRV** 上的权重，与本仓「ω 乘 Π_eda」
 约定相反（对应本仓 ω=0.4286）——该档本身已作废，此处记录以免日后误代入。
 
-env ``ZERO_PHYSIO_MERGE_OMEGA`` 可覆盖，**仅供实验/对照，生产不应改**。
+env ``ZERO_PHYSIO_MERGE_OMEGA`` 可覆盖，**仅供实验/对照，生产不应改**。该自律文字已于
+2026-07-29（Zero 回执 R6）升级为可执行守卫：`_resolve_merge_omega` 对**任何**非默认 ω
+（env 或显式入参两条通路）发 warning——不 raise（实验/对照是正当用途），数值行为不变。
 """
 
 PHYSIO_SUBSOURCE_PRECISION_A: dict[str, float] = {"eda": 0.15, "hrv": 0.20}
@@ -364,7 +391,8 @@ PHYSIO_MERGED_MODALITY: str = "physio"
 """预合并后单条生理流的流名。
 
 必须落在 `PHYSIO_STREAM_PREFIXES` 内以继续触发 Zero M2（Πv→MIN_PRECISION）——
-"physio" 是 Zero `_PHYSIO_PREFIXES`（affect_math.py:971）的首项，现场核验通过。
+"physio" 是 Zero `src/agents/affect_math.py::_PHYSIO_PREFIXES` 的首项，现场核验通过
+（2026-07-29 复核仍成立；该元组同时被 M2 覆写与 D7 融合排除两处消费）。
 """
 
 _PHYSIO_MERGE_SOURCES: tuple[str, str] = ("eda", "hrv")
@@ -431,8 +459,32 @@ def _assert_merge_arity_invariant() -> None:
         )
 
 
+_MERGE_OMEGA_WARN_MARKER: str = "physio 合并权重 ω 非默认"
+"""非默认 ω 告警的稳定前缀（供测试按原因筛选，避免只断言「有 warning」而红在别的原因上）。"""
+
+
 def _resolve_merge_omega(omega: float | None) -> float:
-    """解析 CI 合并权重 ω：显式值优先，否则走 env（默认 0.5）；须落 (0,1) 开区间。"""
+    """解析 CI 合并权重 ω：显式值优先，否则走 env（默认 0.5）；须落 (0,1) 开区间。
+
+    **非默认 ω 一律 warning**（Zero 2026-07-29 回执 R6：把 `PHYSIO_MERGE_OMEGA_DEFAULT`
+    docstring 里「仅供实验/对照，生产不应改」的**自律文字**升级成可执行守卫）。三条设计决定：
+
+    1. **判据写在「解析后的值」上，不是「env 是否设了」**：按 `raw is not None` 判会漏掉显式入参
+       ``merge_physio_priors(..., omega=0.6)`` 这条通路；按 ``omega != DEFAULT`` 判两条通路全覆盖。
+    2. **warn 而非 raise**：实验/对照是这个旋钮的正当用途（既有对照用例就设非默认值），raise 会
+       破零回归。数值行为一字未动。
+    3. **有意不去重**：模块级 `_warned` 标志会让测试顺序相关（先跑的用例吃掉 warning、后跑的假
+       绿）。代价是非默认 ω 下每次合并各一条 warn——本就不该在生产出现。
+
+    Args:
+        omega: 显式权重；None = 走 env ``ZERO_PHYSIO_MERGE_OMEGA``，仍缺省则取终裁默认。
+
+    Returns:
+        落在 (0,1) 开区间的 ω。
+
+    Raises:
+        ValueError: ω 不在 (0,1) 开区间。
+    """
     if omega is None:
         raw = os.getenv("ZERO_PHYSIO_MERGE_OMEGA")
         omega = PHYSIO_MERGE_OMEGA_DEFAULT if raw is None else float(raw)
@@ -440,6 +492,16 @@ def _resolve_merge_omega(omega: float | None) -> float:
         raise ValueError(
             f"physio 合并权重 ω={omega} 须落 (0,1) 开区间"
             "（端点等于完全弃用一方，即 1 维 CI 的退化角，议会已排除）"
+        )
+    if omega != PHYSIO_MERGE_OMEGA_DEFAULT:
+        logger.warning(
+            "%s：ω=%s ≠ 议会终裁默认 %s（来源：env ZERO_PHYSIO_MERGE_OMEGA 或显式入参）。"
+            "ω≠0.5 会**同时**扰动 μ 与 Π，并直接改变发往 Zero 的 wire Πa；而这是**我方私有旋钮**"
+            "——Zero 侧无同名旋钮、无守卫能观测到这次偏移，出境数值的变动在对面完全不可见。"
+            "仅供实验/对照，生产勿用。",
+            _MERGE_OMEGA_WARN_MARKER,
+            omega,
+            PHYSIO_MERGE_OMEGA_DEFAULT,
         )
     return omega
 
@@ -627,8 +689,9 @@ def build_external_priors_override(
     for i, prior in enumerate(priors):
         stream = prior.as_stream()
         name, mu, (pi_v, pi_a) = stream
-        # M7：μ 域校验，镜像 Zero affect_math.py:1039-1043（commit 0d4edb1，2026-07-28 已在其
-        # main）。**必须校验出线 tuple 而非入参 priors**：① 本函数默认 merge_physio=True，
+        # M7：μ 域校验，镜像 Zero `src/agents/affect_math.py::expand_external_priors` 的 M7
+        # μ 域 fail-fast（commit 0d4edb1，2026-07-28 起已在其 main）。
+        # **必须校验出线 tuple 而非入参 priors**：① 本函数默认 merge_physio=True，
         # 合并会产出新 μ（μ_a 为 CI 加权值、μ_v 硬置 0.0），入口校验看不到它；② 入参是模型实例，
         # 而 ModalityPrior 的构造期校验可被 model_construct / model_copy / 鸭子类型伪造绕过
         # （实测四条绕过口均能把 (7.7, nan) 送出网），信任模型实例等于没有守卫。
@@ -639,7 +702,7 @@ def build_external_priors_override(
             if not (-1.0 <= coord <= 1.0):
                 raise ValueError(
                     f"M7 μ 越界：先验流[{i}] {name!r} 的 {dim}={coord} 不在 [-1, 1] 内"
-                    "（镜像 Zero affect_math.py:1039 的 M7 fail-fast）。"
+                    "（镜像 Zero expand_external_priors 的 M7 μ 域 fail-fast）。"
                     "注意本校验作用于合并后的出线值，请检查 ModalityPrior 构造或合并输入。"
                 )
         # M3：精度上界。镜像 Zero M2-先于-M3——生理流 Πv 会被 Zero 覆写为 MIN，故校验时按 MIN
@@ -650,14 +713,20 @@ def build_external_priors_override(
         effective_pi_v = MIN_PRECISION if triggers_m2 else pi_v
         for dim, value in (("Πv", effective_pi_v), ("Πa", pi_a)):
             # 有限性先于上界：`value > cap` 对 NaN **恒 False**，NaN 精度会静默穿过本关。
-            # Zero 侧无对应兜底——其 affect_math.py:1052 `pi_v <= 0.0` 与 :1058 `pi_v > cap`
-            # 同为 NaN-恒 False，M7 又只守 μ 不守 Π → NaN 精度两侧都不 fail-fast，直接进
-            # 融合数学产出 NaN 后验（比越界 μ 更隐蔽：后者至少被 Zero M7 响亮 raise）。
+            # 本条是 MCP 侧**单边收口，与对方状态解耦**：Zero
+            # `src/agents/affect_math.py::expand_external_priors` 的 M3 判据
+            # （`pi_v <= 0.0` 正值关、`pi_v > cap` 上界关）同为比较式、对 NaN 恒 False，
+            # 其 M7 又只守 μ 不守 Π。对方是否在 M3 前置有限性校验，是**随其提交/回退变动的
+            # 运行时事实**——2026-07-29 当天就实测到三态：main `11c25b0` 无 → 其未提交工作树
+            # 出现 M3′ `isfinite` → main `332cb40` 起落地。我方一律不依赖对方当前处于哪一态，
+            # 「同一天内变了三次」本身就是不该把判别力挂在对方状态上的证据。
+            # NaN 精度若漏过会直接进融合数学产出 NaN 后验，比越界 μ 更隐蔽
+            # （后者至少被 M7 响亮 raise）。
             if not math.isfinite(value):
                 raise ValueError(
                     f"M3 精度非有限值：先验流[{i}] {name!r} 的 {dim}={value}。"
-                    "NaN/inf 精度会静默污染 Zero 融合后验（Zero 侧无对应 fail-fast，"
-                    "其 :1052/:1058 判据对 NaN 恒 False），故由 MCP 侧单边拦截。"
+                    "NaN/inf 精度会静默污染 Zero 融合后验（其 M3 两条判据均为比较式、"
+                    "对 NaN 恒 False，M7 只守 μ），故不论对侧是否兜底均由 MCP 侧单边拦截。"
                 )
             if value > resolved_cap:
                 raise ValueError(
