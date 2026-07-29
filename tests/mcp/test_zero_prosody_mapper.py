@@ -9,10 +9,12 @@
   6. 协议符合性：isinstance(LinearProsodyMapper(), ProsodyMapper) 为 True。
   7. 自定义 range：构造参数 rate_range / pitch_semitone_range / gain_db_range 生效。
   8. ProsodyParams 不可变 / extra forbid：多余字段被拒、frozen 赋值抛 ValidationError。
+  9. 未知 prosody_scale（契约放宽为 str 后可达）：降级走 ratio 分支 + 一条 warning，不拒收。
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -21,7 +23,11 @@ from pydantic import ValidationError
 
 from src.agents.models.zero_affect import ExpressionHead
 from src.mcp.zero.expression_sink import ProsodyMapper
-from src.mcp.zero.mappers.prosody import LinearProsodyMapper, ProsodyParams
+from src.mcp.zero.mappers.prosody import (
+    _UNKNOWN_SCALE_MARKER,
+    LinearProsodyMapper,
+    ProsodyParams,
+)
 
 # ---------------------------------------------------------------------------
 # 辅助构造函数
@@ -544,3 +550,96 @@ class TestLerpDefensiveClamp:
 
         assert _lerp((0.5, 1.5), -0.5) == pytest.approx(0.5)  # 非 0.5+1.0*(-0.5)=0.0
         assert _lerp((-4.0, 4.0), -2.0) == pytest.approx(-4.0)
+
+
+# ---------------------------------------------------------------------------
+# 9. 未知 prosody_scale → 降级 + warn（契约从 Literal 放宽为 str 后**才可达**）
+#
+# 此前这条分支是**死代码**：`ExpressionHead.prosody_scale` 是
+# `Literal["ratio","normalized"] | None`，未知值在**更早的解析处**就把整条载荷拒了
+# （ValidationError），mapper 根本收不到 head，warn 永远走不到。2026-07-29 放宽为
+# `str | None` 后，未知值改为「收下 → 消费方降级 + 出声」，本节即其可达性与判别力实证。
+#
+# 判别力三格（逐格实证）：
+#   未知值 "linear"        → 发 warn，且数值逐值等同 ratio 分支（降级不改语义）
+#   已知值 ratio/normalized→ 不发（正控先证同一会话里该 warn 可见，防恒真式）
+#   缺省 None              → 不发
+# ---------------------------------------------------------------------------
+
+_PROSODY_MAPPER_LOGGER = "src.mcp.zero.mappers.prosody"
+
+
+def _unknown_scale_warnings(caplog: Any) -> list[str]:
+    """只挑「未知量纲降级」那一类 WARNING 的消息文本。
+
+    同模块另有「pitch<=0 兜底」warning：按「有没有 WARNING」断言会让用例被别的原因染绿/染红。
+    故按产品侧稳定前缀常量筛（同 test_zero_physiology_mapper.py::_mismatch_warnings 的做法）。
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and _UNKNOWN_SCALE_MARKER in record.getMessage()
+    ]
+
+
+class TestUnknownScaleFallback:
+    """未知 prosody_scale：解析层收下 → mapper 降级走 ratio + 一条 warning。"""
+
+    async def test_unknown_scale_value_is_parsed_at_all(self) -> None:
+        """前置事实（放宽前此处即 ValidationError，后续三条无从谈起）：未知值能构出 head。
+
+        正控（防恒真式）：不止断言「没抛」，还断言该值确实被读进模型——否则若实现把未知值
+        悄悄归一成 None，下面「走 ratio 分支」照样绿，但走的是 None 分支而非未知值分支。
+        """
+        head = _make_expression_head(prosody_scale="linear")
+        assert head.prosody_scale == "linear"
+
+    async def test_unknown_scale_maps_identically_to_ratio(self) -> None:
+        """降级**不改数值**：未知值三项输出逐值等于同参数 ratio 口径的输出。
+
+        期望值现算（拿 ratio 分支的结果作参照）而非 pin 死字面量——避免两处并联维护而分叉。
+        """
+        mapper = LinearProsodyMapper()
+        ratio_result = await mapper.map(
+            _make_expression_head(speech_rate=1.2, pitch=1.3, energy=0.7, prosody_scale="ratio")
+        )
+        unknown_result = await mapper.map(
+            _make_expression_head(speech_rate=1.2, pitch=1.3, energy=0.7, prosody_scale="linear")
+        )
+        assert unknown_result.rate_ratio == pytest.approx(ratio_result.rate_ratio)
+        assert unknown_result.pitch_semitones == pytest.approx(ratio_result.pitch_semitones)
+        assert unknown_result.gain_db == pytest.approx(ratio_result.gain_db)
+        # 参照本身不能是退化值（否则「相等」可能只是两边都没算）
+        assert ratio_result.rate_ratio == pytest.approx(1.2)
+        assert ratio_result.pitch_semitones == pytest.approx(12.0 * math.log2(1.3))
+
+    async def test_unknown_scale_logs_warning_naming_the_value(self, caplog: Any) -> None:
+        """warn **可达**且归因正确：恰一条、含未知值本身（便于运维直接看出 Zero 发了什么）。
+
+        pitch=1.0 有意选非退化值：pitch<=0 会另发一条兜底 warning，混进来会让断言红/绿在
+        错误的原因上。
+        """
+        head = _make_expression_head(pitch=1.0, prosody_scale="linear")
+        with caplog.at_level(logging.WARNING, logger=_PROSODY_MAPPER_LOGGER):
+            await LinearProsodyMapper().map(head)
+        messages = _unknown_scale_warnings(caplog)
+        assert len(messages) == 1, f"应恰有一条未知量纲 warn，实际日志：{caplog.text!r}"
+        assert "linear" in messages[0], f"归因须点名未知值，实际：{messages[0]!r}"
+
+    @pytest.mark.parametrize("scale", ["ratio", "normalized", None])
+    async def test_known_scales_stay_silent(self, caplog: Any, scale: str | None) -> None:
+        """零回归：已知值（含缺省 None）一律不发该 warn。
+
+        先跑正控（同一 caplog 会话里未知值必出声）再断言静默——否则「无 warn」可能只是因为
+        被观测量根本不可见，断言退化成恒真式（pitfalls ⑥）。
+        """
+        # normalized 口径三值须 ∈[0,1]（否则解析层收窄先炸）；ratio/None 下 0.5 亦合法
+        head = _make_expression_head(speech_rate=0.5, pitch=0.5, energy=0.5, prosody_scale=scale)
+        with caplog.at_level(logging.WARNING, logger=_PROSODY_MAPPER_LOGGER):
+            await LinearProsodyMapper().map(_make_expression_head(prosody_scale="linear"))
+            assert _unknown_scale_warnings(caplog), "正控失败：本会话下 warn 不可见，静默断言恒真"
+            caplog.clear()
+            await LinearProsodyMapper().map(head)
+        assert _unknown_scale_warnings(caplog) == [], (
+            f"prosody_scale={scale!r} 不应触发未知量纲 warn"
+        )

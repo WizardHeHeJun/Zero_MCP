@@ -111,8 +111,9 @@ class LinearPhysiologyMapper:
     （code-review W6）：Zero 门开/真模型出 canonical `skin_conductance`=μS[0,20]，默认上界 20 归一
     正确；但 Zero **门关无真模型**出的 legacy sc 已是 [0,1]（`clamp(|arousal|)`），默认 μS 归一会再
     除 20 → **系统性欠标度 ~20×**（legacy sc=1.0→level≈0.05），且**不报错**（超集只保证解析、不保
-    证消费标度）。physiology 通道**无量纲兄弟键**（不同 prosody `prosody_scale`），mapper 无法自识
-    别口径。消费方接线**须知所连 Zero 口径**：canonical→默认；legacy→配 `max_us=1.0`。
+    证消费标度）。physiology 通道**实际收不到量纲兄弟键**（契约层已可解析 `physiology_scale`，
+    但 Zero 尚未发布、本 mapper 也不读它——见下方「该兄弟键当前状态」），mapper 无法自识别
+    口径。消费方接线**须知所连 Zero 口径**：canonical→默认；legacy→配 `max_us=1.0`。
     判据：`temperature_c` 出现≈canonical(μS)、`pupil_mm` 出现且无 temp≈legacy([0,1])。行为差异见
     test_zero_physiology_mapper.py::TestLegacyScaleConsumptionGap。
 
@@ -123,6 +124,12 @@ class LinearPhysiologyMapper:
     Zero 一旦增删这两个键（其 §4.4-4 正要动键集）本启发式即**静默失效**——既不再报，也不误报，
     调用方无从察觉。真解仍是 Zero 允诺的 `physiology_scale` 量纲兄弟键（对齐 `prosody_scale`），
     落地后本判据须改按兄弟键判定、并把形状启发式降级为兜底。
+
+    **该兄弟键当前状态（2026-07-29 起，勿误读）**：契约层已能**解析** `physiology_scale`
+    （`ExpressionHead`/`ExpressionBundle` 各一份，解我方 `extra="forbid"` 自锁），但
+    ① Zero **尚未发布**该键（我方 17:09 回件立的接受条件是「我方确认升级完成前请勿发布」，
+    对方已照做）；② **本 mapper 一行未动、不消费该键**——上面所有数值分支与 W6 的 ~20× 欠标度
+    **原样**。即「解析层就绪 ≠ 已授权发布 ≠ 已消费」，三件事各自独立，勿把第一件当后两件。
 
     ⚠ **保护策略有意不对称**（code-review W3）：作**除数**的 cardio_respiratory_ratio/
     skin_conductance_max_us 在 `__init__` 即 fail-fast（≤0 → ValueError，防 ZeroDivisionError）；作
@@ -223,7 +230,9 @@ class LinearPhysiologyMapper:
         - 两键皆无 ⇒ **判不出**，静默放行（不猜、不误报）。
 
         ⚠ 这是**观测**不是**保证**：判据挂在键的有无上，Zero 增删 `temperature_c`/`pupil_mm`
-        会让它静默失效。真解是 Zero 允诺的 `physiology_scale` 兄弟键，见类 docstring。
+        会让它静默失效。真解是 Zero 允诺的 `physiology_scale` 兄弟键——该键**契约层已可解析、
+        但尚未发布也未被本函数消费**（本函数只读 `physiology` 子模型，不读该兄弟键），
+        见类 docstring「该兄弟键当前状态」。
 
         Args:
             physiology: 待消费的生理通道（canonical 或 legacy 形状）。

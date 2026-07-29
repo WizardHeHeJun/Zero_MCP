@@ -8,6 +8,10 @@ TTS 控制参数 ProsodyParams。
 - "normalized"：三值均 [0,1]，线性映射到各自目标范围。
 - "ratio" 或 None：speech_rate/pitch 是倍率（基线 1.0），
   energy 仍为 [0,1]（两口径共用）。
+- 其它（未知量纲值）：**降级**走 ratio 分支 + 一条 warning，**不拒收**——契约侧
+  `ExpressionHead.prosody_scale` 已从 `Literal` 放宽为 `str | None`（2026-07-29），
+  好让 Zero 能「加值不改旧值」演进枚举而不炸我方链路。在放宽之前这条降级分支是**死代码**
+  （Literal 在更早的解析处就把整条载荷拒了，根本走不到这里）。
 """
 
 from __future__ import annotations
@@ -20,6 +24,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from src.agents.models.zero_affect import ExpressionHead, ProsodyChannel
 
 logger = logging.getLogger(__name__)
+
+_UNKNOWN_SCALE_MARKER: str = "未知 prosody_scale"
+"""未知量纲降级 warning 的稳定前缀——与本模块「pitch<=0 兜底」那条 warning 区分。
+
+测试按此串筛选记录：若只断言「有 warning」，pitch 兜底那条会让用例**红/绿在错误的原因上**
+（同 physiology.py::_SCALE_MISMATCH_MARKER 的既有做法）。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +104,7 @@ class LinearProsodyMapper:
     - "normalized"：三值均 [0,1]，各自线性映射到目标范围。
     - "ratio" 或 None（Zero 当前占位默认出 "ratio"；未标注为 None）：
       speech_rate/pitch 是倍率，energy 仍视为 [0,1]。
+    - 未知值（契约放宽为 `str | None` 后可达）：降级走 ratio 分支 + warning，不拒收。
 
     async：对齐 ProsodyMapper Protocol（Protocol.map 是 async def），
     当前实现纯标量计算无真正的 I/O 等待，async 为预留——
@@ -124,8 +136,11 @@ class LinearProsodyMapper:
 
         分支逻辑（按 channel.prosody_scale，Q1）：
         - "normalized"：三值均 [0,1]，各自线性映射到目标范围。
-        - "ratio" / None（Zero 当前占位默认）/ 未知值（Literal 已限定，防御性回退）：
+        - "ratio" / None（Zero 当前占位默认）/ **未知值**（契约放宽为 `str` 后真实可达）：
           speech_rate/pitch 是倍率、energy 仍 [0,1]——统一走 `_map_ratio`。
+          未知值额外发一条以 `_UNKNOWN_SCALE_MARKER` 开头的 warning：**只观测、不改数值**
+          （降级结果与 ratio 逐值相同），把「Zero 加了新量纲值而我方尚未支持」暴露成可查日志，
+          而不是让整条载荷在解析处被拒、`graceful_step` 静默降级成 None。
         """
         prosody = channel.prosody
         scale = channel.prosody_scale
@@ -139,8 +154,8 @@ class LinearProsodyMapper:
             gain_db = _lerp(self.gain_db_range, prosody.energy)
         else:
             if scale not in ("ratio", None):
-                # Literal["ratio","normalized"]|None 不应出现其他值，防御性回退
-                logger.warning("未知 prosody_scale=%r，回退到 ratio 分支处理", scale)
+                # 契约已放宽为 str|None（Zero 可加值演进枚举）→ 本分支真实可达，非防御性死代码
+                logger.warning("%s=%r，回退到 ratio 分支处理", _UNKNOWN_SCALE_MARKER, scale)
             rate_ratio, pitch_semitones, gain_db = self._map_ratio(prosody)
 
         return ProsodyParams(

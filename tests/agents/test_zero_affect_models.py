@@ -429,12 +429,51 @@ class TestProsodyScale:
         with pytest.raises(ValidationError, match="normalized"):
             ExpressionHead(**data)
 
-    def test_invalid_scale_value_rejected(self) -> None:
-        """非法 prosody_scale 值被拒绝。"""
+    def test_unknown_scale_value_is_accepted_not_rejected(self) -> None:
+        """**未知** prosody_scale 值被收下且值可读——不再整条载荷拒收。
+
+        ⚠ 语义重整（2026-07-29），非机械删：本用例前身 `test_invalid_scale_value_rejected`
+        pin 的是 `Literal["ratio","normalized"]` 把 "linear" 拒掉。契约放宽为 `str | None` 后
+        语义**反转**——解析层不判枚举，未知值一律收下，由消费方降级 + warning
+        （`src/mcp/zero/mappers/prosody.py`；那条 warn 此前是死代码，可达性实证见
+        tests/mcp/test_zero_prosody_mapper.py::TestUnknownScaleFallback）。
+
+        为何放宽：`Literal` 与 `extra="forbid"` 同为拒收面，在「Zero 先发、我方后升级」的
+        部署错位方向上，会把本属 additive 的枚举演进变成 breaking——每步 `zero.step` 解析失败
+        → `graceful_step` 静默降级成 None，整条链路无声失效。
+
+        正控（防恒真式 pitfalls⑥）：不止断言「没抛异常」，还断言该值**确实被读进模型**——
+        否则若实现把未知值悄悄吞成 None，本用例照样绿。
+        """
         data = _make_expression_head()
         data["prosody_scale"] = "linear"
-        with pytest.raises(ValidationError):
-            ExpressionHead(**data)
+
+        head = ExpressionHead(**data)
+
+        assert head.prosody_scale == "linear"
+
+    def test_unknown_scale_does_not_trigger_normalized_narrowing(self) -> None:
+        """未知值不套用 normalized 的 [0,1] 收窄——倍率量级三值照样收下。
+
+        判别力：若实现把未知值当成 normalized 处理，speech_rate=1.5 会被收窄规则拒掉而红。
+        """
+        data = _make_expression_head()
+        data["prosody"] = {"speech_rate": 1.5, "pitch": 1.3, "energy": 0.7}
+        data["prosody_scale"] = "linear"
+
+        head = ExpressionHead(**data)
+
+        assert head.prosody_scale == "linear"
+        assert head.prosody.speech_rate == pytest.approx(1.5)
+
+    def test_bundle_accepts_unknown_scale_value(self) -> None:
+        """顶层 hoist 的一份同样放宽（两处必须同步，否则一处收下另一处拒＝整条载荷仍炸）。"""
+        data = _make_expression_bundle_dict()
+        data["prosody_scale"] = "linear"
+
+        bundle = ExpressionBundle(**data)
+
+        assert bundle.prosody_scale == "linear"
 
     def test_scale_inside_prosody_dict_rejected(self) -> None:
         """兄弟键约束：塞进 prosody 子 dict 会被 ProsodyChannel extra=forbid 拒。"""
@@ -459,6 +498,108 @@ class TestProsodyScale:
         data["prosody_scale"] = "ratio"
         bundle = ExpressionBundle(**data)
         assert bundle.prosody_scale == "ratio"
+
+
+# ---------------------------------------------------------------------------
+# 4c. physiology_scale 兄弟键的**解析层**放宽（2026-07-29）
+#
+# 背景（我方自锁，且我方是唯一能解的一方）：我方回件给 Zero 立了接受条件「请勿在我方确认
+# 升级完成前发布 physiology_scale 键」，Zero 照做在等放行信号；而我方消费侧一行未动——
+# ExpressionHead/ExpressionBundle 仍 `extra="forbid"`，该键一到就整条 expression 解析失败、
+# `graceful_step` 静默降级成 None，链路无声失效。本节锁「解析层收得下 + 值可读」。
+#
+# ⚠ 本节**不涉消费**：mapper 的 skin_conductance_max_us 等数值一律不动
+# （「解析层就绪 ≠ 已授权 Zero 发布 ≠ 已消费」，三件事各自独立）。
+# ---------------------------------------------------------------------------
+
+
+class TestPhysiologyScaleParseWidening:
+    """physiology_scale 照 prosody_scale 先例落**两处**：头内一份 + expression 顶层 hoist 一份。
+
+    缺任一处，Zero 一旦发布该键就会在缺的那一侧被 extra=forbid 拒掉整条载荷——两处必须同批。
+    """
+
+    def test_head_accepts_physiology_scale(self) -> None:
+        """ExpressionHead 收下 physiology_scale，且值可读（正控，非只断言不抛）。"""
+        data = _make_expression_head()
+        data["physiology_scale"] = "microsiemens"
+
+        head = ExpressionHead(**data)
+
+        assert head.physiology_scale == "microsiemens"
+
+    def test_head_physiology_scale_defaults_none(self) -> None:
+        """零回归：不带该键时缺省 None（additive，既有载荷行为不变）。"""
+        head = ExpressionHead(**_make_expression_head())
+        assert head.physiology_scale is None
+
+    def test_bundle_accepts_hoisted_physiology_scale(self) -> None:
+        """ExpressionBundle 顶层收下 hoist 的那一份，且值可读。"""
+        data = _make_expression_bundle_dict()
+        data["physiology_scale"] = "microsiemens"
+
+        bundle = ExpressionBundle(**data)
+
+        assert bundle.physiology_scale == "microsiemens"
+
+    def test_bundle_physiology_scale_defaults_none(self) -> None:
+        """零回归：顶层不带该键时缺省 None。"""
+        bundle = ExpressionBundle(**_make_expression_bundle_dict())
+        assert bundle.physiology_scale is None
+
+    def test_value_is_not_enum_constrained(self) -> None:
+        """值不受枚举约束（`str | None`，不是 Literal）——Zero 可「加值不改旧值」演进。
+
+        判别力：若日后有人把它收窄成 Literal，这里任取一个不在枚举里的值即红。
+        """
+        for value in ("microsiemens", "normalized", "legacy_unit", "some_future_dialect"):
+            data = _make_expression_head()
+            data["physiology_scale"] = value
+            assert ExpressionHead(**data).physiology_scale == value
+
+    def test_full_bundle_with_both_heads_and_hoist_parses(self) -> None:
+        """端到端：Zero 真发布该键时的完整形状（两头各一份 + 顶层一份）能被 from_step_output 解析。
+
+        这正是自锁的现场——放宽前本用例在 ValidationError 上炸，`graceful_step` 会静默降 None。
+        正控：三处的值都逐一断言读到，而非只断言「解析成功」。
+        """
+        expression = _make_expression_bundle_dict(0.6, 0.4)
+        expression["spontaneous"]["physiology_scale"] = "microsiemens"
+        expression["voluntary"]["physiology_scale"] = "microsiemens"
+        expression["physiology_scale"] = "microsiemens"
+        step_out = {"expression": expression, "trace": {"step_id": "abc"}}
+
+        bundle = ExpressionBundle.from_step_output(step_out)
+
+        assert bundle.physiology_scale == "microsiemens"
+        assert bundle.spontaneous.physiology_scale == "microsiemens"
+        assert bundle.voluntary.physiology_scale == "microsiemens"
+
+    def test_other_unknown_sibling_keys_still_rejected(self) -> None:
+        """边界：**只**对具名的 physiology_scale 开口，extra="forbid" 未被顺手放开。
+
+        判别力：若有人图省事把 extra 改成 "ignore"/"allow" 来解自锁，本用例即红——那会同时
+        丢掉「防跨仓漂移悄悄塞字段」的守卫（如 physiology_units 拼错名会静默蒸发）。
+        """
+        head_data = _make_expression_head()
+        head_data["physiology_units"] = "us"
+        with pytest.raises(ValidationError):
+            ExpressionHead(**head_data)
+
+        bundle_data = _make_expression_bundle_dict()
+        bundle_data["physiology_units"] = "us"
+        with pytest.raises(ValidationError):
+            ExpressionBundle(**bundle_data)
+
+    def test_scale_inside_physiology_dict_rejected(self) -> None:
+        """兄弟键约束：塞进 physiology 子 dict 会被 PhysiologyChannel extra=forbid 拒。
+
+        与 prosody 同构（见 TestProsodyScale::test_scale_inside_prosody_dict_rejected）。
+        """
+        data = _make_expression_head()
+        data["physiology"] = {**_make_physiology(), "physiology_scale": "microsiemens"}
+        with pytest.raises(ValidationError):
+            ExpressionHead(**data)
 
 
 # ---------------------------------------------------------------------------
