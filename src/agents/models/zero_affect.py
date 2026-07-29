@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -207,6 +207,11 @@ class PhysiologyChannel(BaseModel):
     **故「收窄 temperature_c 为必填 + 删 pupil_mm」不是待办**，仅在部署侧能保证充要条件时才可议；
     依据见 notes/2026-07-23-zero-link-physiology-consume-gate-landed.md §1。
     契约不硬卡数值范围，消费方（mapper）按实际引擎范围归一。
+
+    ⚠ 本通道**自身不带量纲标记**：量纲走**兄弟键** `physiology_scale`（在 ExpressionHead /
+    ExpressionBundle 上，与 prosody 同构）。该键**解析层已就绪但 Zero 尚未发布、消费方也未接**
+    ——所以 `skin_conductance` 到底是 μS 还是 legacy [0,1]，当前仍只能靠形状启发式猜
+    （`src/mcp/zero/mappers/physiology.py::_detect_scale_mismatch`）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -228,6 +233,21 @@ class ExpressionHead(BaseModel):
     输出的 "prosody_scale" 兄弟键）——"ratio"=倍率占位、
     "normalized"=归一真模型；缺省 None（decoder 未标注量纲，如 mock，additive 零回归）。
     当 "normalized" 时校验 prosody 三值收窄到 [0,1]。
+
+    physiology_scale：生理量纲**兄弟键**，照 prosody_scale 先例落在同两处（头内一份 +
+    ExpressionBundle 顶层 hoist 一份）。**本轮只放宽解析层、不接消费逻辑**，边界见该字段
+    的 Field description。
+
+    ⚠ **量纲兄弟键的值一律 `str | None`，不用 `Literal`**（2026-07-29 定；本次把 prosody_scale
+    一并从 `Literal["ratio", "normalized"]` 放宽）：本模型有两道拒收面——未知**键**的
+    `extra="forbid"` 与未知**值**的 `Literal`——它们在「对方先发、我方后收」这个**部署错位
+    方向**上同构且同样致命：Zero 一发新键/新值，我方每步 `zero.step` 解析即失败、
+    `graceful_step` 静默降级成 None，整条链路无声失效——**本来 additive 的演进被拒收面变成
+    breaking change**。prosody_scale 当年是两侧同轮落地才侥幸没踩。故量纲枚举**不在解析处
+    拒收未知值**：一律收下，由消费方（`src/mcp/zero/mappers/*`）按未知值降级 + warning 处理
+    （可观测、可回退、不炸链路），Zero 也才可以按「加值不改旧值」演进枚举。
+    ⚠ 这**不是**把 `extra="forbid"` 也放开：未知**键**仍拒（那是防跨仓漂移悄悄塞字段的有效
+    守卫），只对**已知会来的**具名键逐个显式开口（本轮即 physiology_scale）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -236,7 +256,19 @@ class ExpressionHead(BaseModel):
     text_label: str
     physiology: PhysiologyChannel
     prosody: ProsodyChannel
-    prosody_scale: Literal["ratio", "normalized"] | None = None
+    prosody_scale: str | None = None
+    physiology_scale: str | None = Field(
+        default=None,
+        description=(
+            "生理量纲兄弟键（对齐 prosody_scale）。**解析层就绪 ≠ 已授权 Zero 发布**："
+            "我方 2026-07-29 回件给 Zero 立过接受条件『请勿在我方确认升级完成前发布 "
+            "physiology_scale 键』，Zero 已照做（其 src/+tests/ 对该键零命中，在等我方放行）。"
+            "本轮解的是我方自锁的**解析侧**（收得下、不炸链路），**不含消费逻辑**——"
+            "`src/mcp/zero/mappers/physiology.py` 的 skin_conductance_max_us 等数值一律不动，"
+            "W6 的 ~20× 欠标度**未解决**。且『该键到底发不发』仍是**待用户拍板项**"
+            "（加兄弟键 vs 写进 README 接受现状），本仓不越权替用户给对方放行信号。"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> ExpressionHead:
@@ -300,6 +332,14 @@ class ExpressionBundle(BaseModel):
     `src/agents/expression.py`），
     供 MCP TTS mapper 单点读；两头共用同一无状态 decoder 故量纲一致。缺省 None
     （decoder 未标注量纲时不挂键，additive 零回归）。各头内也各带一份同名兄弟键。
+
+    physiology_scale：生理量纲标记，**照 prosody_scale 的两处先例**——头内一份 +
+    expression 顶层 hoist 一份，故本类与 ExpressionHead 都要有，缺一处就会在 Zero 发布该键时
+    于另一处被 `extra="forbid"` 拒掉整条载荷。
+
+    两个 `*_scale` 键的值均为 `str | None`（**有意不用 `Literal`**）、且 physiology_scale
+    「解析层就绪 ≠ 已授权发布」——完整理由见 `ExpressionHead` 的类 docstring 与该字段的
+    Field description，此处不复述以免两处漂移。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -307,7 +347,14 @@ class ExpressionBundle(BaseModel):
     valence_arousal: tuple[float, float]
     spontaneous: ExpressionHead
     voluntary: ExpressionHead
-    prosody_scale: Literal["ratio", "normalized"] | None = None
+    prosody_scale: str | None = None
+    physiology_scale: str | None = Field(
+        default=None,
+        description=(
+            "生理量纲兄弟键在 expression 顶层的 hoist 副本（语义与边界同 "
+            "ExpressionHead.physiology_scale：解析层就绪，未授权 Zero 发布、不接消费逻辑）。"
+        ),
+    )
     language: LanguageOutput | None = None
 
     @classmethod
