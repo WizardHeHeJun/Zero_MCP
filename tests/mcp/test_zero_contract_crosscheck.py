@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -139,11 +141,19 @@ fields = AffectState.model_fields
 precision_cap = fields["external_prior_precision_cap"].default
 max_streams = fields["max_external_streams"].default
 
-print(json.dumps({
+# 运行期旋钮的**真值来源**（函数默认不治理生产：affect_core 逐参覆写为这些 state 字段）。
+# ⚠ 缺字段给哨兵字符串而**不是** KeyError：KeyError 会让子进程非零退出 →
+# `_fetch_affect_state_defaults_or_skip` 判 skip 而非红，守卫悄悄退化成恒 skip
+# （与 Zero 自己记在头上的「恒 skip」是同一种病）。哨兵值进断言必然红，归因也明确。
+payload = {
     "skip": False,
     "precision_cap": precision_cap,
     "max_streams": max_streams,
-}))
+}
+for key in ("gate_fusion", "exclude_physio_fusion", "sample_sigma_cap"):
+    payload[key] = fields[key].default if key in fields else "<MISSING>"
+
+print(json.dumps(payload))
 """
 
 
@@ -485,18 +495,7 @@ class TestExternalPriorValidationDefaults:
     def _fetch_defaults_or_skip(self) -> dict[str, Any]:
         """运行子进程读 Zero AffectState 默认，任何失败均 skip。"""
         self._skip_if_zero_unavailable()
-        try:
-            data = _run_subprocess_with_script(_DEFAULTS_SCRIPT)
-        except subprocess.TimeoutExpired:
-            pytest.skip("子进程超时，跳过 M3/M6 默认值断言")
-        except RuntimeError as exc:
-            pytest.skip(f"子进程非零退出，跳过: {exc}")
-        except json.JSONDecodeError as exc:
-            pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
-
-        if data.get("skip"):
-            pytest.skip(data.get("reason", "D:\\Zero import 失败，跳过 M3/M6 默认值断言"))
-        return data
+        return _fetch_affect_state_defaults_or_skip()
 
     def test_precision_cap_default_matches_zero(self) -> None:
         """M3：本仓 ZERO_EXTERNAL_PRIOR_PRECISION_CAP_DEFAULT 与 Zero AffectState 字段默认相等。"""
@@ -546,54 +545,275 @@ def _run_subprocess_with_script(script: str) -> dict[str, Any]:
     return json.loads(result.stdout)  # type: ignore[no-any-return]
 
 
+def _fetch_affect_state_defaults_or_skip() -> dict[str, Any]:
+    """运行子进程回读 Zero `AffectState` 的字段默认；任何失败 / Zero 不在位均 skip。
+
+    模块级而非某个测试类的私有方法：`AffectState` 的字段默认是**运行期真旋钮**（函数默认
+    不治理生产），M3/M6 与点燃门两组守卫都要读它，共用一份避免两处子进程脚本各自漂移。
+    """
+    if not _zero_available():
+        pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过 AffectState 默认值断言")
+    try:
+        data = _run_subprocess_with_script(_DEFAULTS_SCRIPT)
+    except subprocess.TimeoutExpired:
+        pytest.skip("子进程超时，跳过 AffectState 默认值断言")
+    except RuntimeError as exc:
+        pytest.skip(f"子进程非零退出，跳过: {exc}")
+    except json.JSONDecodeError as exc:
+        pytest.skip(f"子进程输出非合法 JSON，跳过: {exc}")
+
+    if data.get("skip"):
+        pytest.skip(data.get("reason", "D:\\Zero import 失败，跳过 AffectState 默认值断言"))
+    return data
+
+
 # ---------------------------------------------------------------------------
-# T6·② unknown-session 机读标记跨仓一致性（防 marker 静默漂移）
+# Zero 机读错误码全表跨仓一致性（2026-07-29 令牌换代，取代原 `_UNKNOWN_SESSION_MARKER` 单点守卫）
 #
-# Zero server 与本仓 client 各自持有 `_UNKNOWN_SESSION_MARKER` 常量；step 命中未知/过期
-# session_id 时 Zero 用它作 ToolError 前缀，本仓 client 用它判定并抛 ZeroLinkUnknownSessionError。
-# 两侧任一改动而另一侧未跟 → unknown-session 判定静默失效（回执点名的「脆弱字符串匹配」风险的
-# 机读版）。此回归以正则从 Zero 源码直读该常量（不 import，避开 FastMCP/torch 重依赖），断言与
-# 本仓一致。D:\Zero 不在位 → skip。
+# 换代背景：旧契约是**位置 0 的裸前缀** `unknown-session:`，而 FastMCP 在工具层把 ToolError 包成
+# "Error executing tool <name>: <原文>" ⇒ 前缀在 wire 上永不在位置 0 ⇒ 本仓 `startswith` 判定
+# 恒 False，T6·④ resume 通路是**生产死码**（两侧实证）。现契约为位置无关令牌 `[zero:<code>]`。
+#
+# 旧守卫为何在 STRICT 下红：它用正则找 `_UNKNOWN_SESSION_MARKER = "字面量"`，而 Zero 现在等号
+# 右边是**标识符**（别名指向 ZERO_ERROR_CODE_UNKNOWN_SESSION）→ 不匹配 → skip → STRICT 转 fail。
+#
+# 新守卫 pin 三件事，且**本仓持有自己的期望**（不是「对方有什么就认什么」的恒真式）：
+#   1. 符号集：Zero 顶层 `ZERO_ERROR_CODE_*` 全集 == 本仓 `_EXPECTED_ZERO_ERROR_CODE_SYMBOLS`；
+#   2. 逐符号值：Zero 每个符号的字面量 == 本仓 client 同名常量
+#      （本仓字面量独立持有 → 单边改值即红）；
+#   3. 令牌格式：`_tool_error` 的构造前缀 == `[zero:`（本仓消费正则的依据，换分隔符即红）。
+# 另核旧别名 `_UNKNOWN_SESSION_MARKER` 仍在且指向 unknown-session 符号（过渡兼容期的两侧承诺）。
+#
+# 解析一律走 AST（同 `_top_level_func` 的教训：文本切法会被 docstring/注释里的同形 token 污染）。
+# D:\Zero 或 server.py 不在位 → skip（环境缺口）；**文件在位但结构对不上 → 判红**
+# ——这正是本轮教训「检查比消费方宽松 ⇒ 绿灯从没能红」的直接修正。
 # ---------------------------------------------------------------------------
 
-# Zero server 定义 unknown-session marker 的源文件（相对 D:\Zero）
+# Zero server 定义机读错误码的源文件（相对 D:\Zero）
 _ZERO_SERVER_PY = _ZERO_SRC / "mcp_server" / "server.py"
-# 匹配 `_UNKNOWN_SESSION_MARKER = "unknown-session"`（单/双引号皆容）
-_MARKER_ASSIGN_RE = re.compile(
-    r"""^_UNKNOWN_SESSION_MARKER\s*=\s*["']([^"']+)["']""",
-    re.MULTILINE,
+# Zero 机读码常量的符号名前缀 / 登记表名 / 旧别名
+_ZERO_CODE_SYMBOL_PREFIX = "ZERO_ERROR_CODE_"
+_ZERO_CODE_REGISTRY_NAME = "ZERO_ERROR_CODES"
+_ZERO_LEGACY_ALIAS_NAME = "_UNKNOWN_SESSION_MARKER"
+_ZERO_TOOL_ERROR_FUNC = "_tool_error"
+
+# 本仓对 Zero 码表的**独立期望**（符号名集合）。Zero 改名/加码/删码而本仓未跟 → 下面第 1 条红。
+# 值不写在这里（按 Zero 要求「按符号名 pin」），而是与本仓 client 的同名常量逐个比对（第 2 条）
+# ——本仓那份字面量是独立持有的，故值漂移同样红。
+_EXPECTED_ZERO_ERROR_CODE_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "ZERO_ERROR_CODE_UNKNOWN_SESSION",
+        "ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE",
+        "ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID",
+        "ZERO_ERROR_CODE_PAYLOAD_INVALID",
+        "ZERO_ERROR_CODE_CONFIG_INVALID",
+        "ZERO_ERROR_CODE_DEPLOY_ENV_INVALID",
+    }
 )
+# 令牌构造前缀：本仓消费正则 `\[zero:([a-z][a-z0-9-]*)\]` 的依据。
+_EXPECTED_TOKEN_PREFIX = "[zero:"
+
+
+def _zero_server_tree_or_skip() -> ast.Module:
+    """解析 Zero server.py 为 AST；D:\\Zero / 文件不在位 → skip，语法错 → 判红。"""
+    if not _zero_available():
+        pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过机读错误码跨仓断言")
+    if not _ZERO_SERVER_PY.is_file():
+        pytest.skip(f"Zero server.py 不存在（路径 {_ZERO_SERVER_PY}），跳过机读错误码跨仓断言")
+    source = _ZERO_SERVER_PY.read_text(encoding="utf-8")
+    try:
+        return ast.parse(source)
+    except SyntaxError as exc:  # 文件在位却解析不了 = 真问题，不 skip
+        pytest.fail(f"Zero server.py 解析失败（{_ZERO_SERVER_PY}）：{exc}")
+
+
+def _module_assign_targets(node: ast.stmt) -> tuple[list[str], ast.expr | None]:
+    """取顶层赋值语句的目标名列表与右值（同时支持 `A = x` 与 `A: T = x`）；非赋值 → ([], None)。"""
+    if isinstance(node, ast.Assign):
+        return ([t.id for t in node.targets if isinstance(t, ast.Name)], node.value)
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return ([node.target.id], node.value)
+    return ([], None)
+
+
+def _zero_error_code_literals(tree: ast.Module) -> dict[str, str]:
+    """取 Zero 顶层 `ZERO_ERROR_CODE_* = "字面量"` 的 符号名 → 码值。
+
+    只认**字符串字面量**右值：若 Zero 把某个码改成计算式/引用，本函数不收 → 符号集断言即红
+    （宁可红也不猜，跨仓契约不接受「大概是这个值」）。
+    """
+    literals: dict[str, str] = {}
+    for node in tree.body:
+        names, value = _module_assign_targets(node)
+        if value is None or not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for name in names:
+            if name.startswith(_ZERO_CODE_SYMBOL_PREFIX):
+                literals[name] = value.value
+    return literals
+
+
+def _zero_registry_symbols(tree: ast.Module) -> list[str] | None:
+    """取 Zero `ZERO_ERROR_CODES = frozenset({SYM, …})` 里列的**符号名**；找不到返回 None。"""
+    for node in tree.body:
+        names, value = _module_assign_targets(node)
+        if _ZERO_CODE_REGISTRY_NAME not in names or value is None:
+            continue
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)):
+            return None
+        if value.func.id != "frozenset" or not value.args:
+            return None
+        elts = value.args[0]
+        if not isinstance(elts, ast.Set | ast.List | ast.Tuple):
+            return None
+        return [e.id for e in elts.elts if isinstance(e, ast.Name)]
+    return None
+
+
+def _zero_alias_target(tree: ast.Module, alias_name: str) -> str | None:
+    """取 Zero 顶层 `alias_name = <标识符>` 的右值符号名；不是标识符别名 → None。"""
+    for node in tree.body:
+        names, value = _module_assign_targets(node)
+        if alias_name in names and isinstance(value, ast.Name):
+            return value.id
+    return None
+
+
+def _zero_tool_error_token_prefix(tree: ast.Module) -> str | None:
+    """取 Zero `_tool_error` 里 f-string 的**首段常量**（即令牌构造前缀）；取不到 → None。
+
+    形如 `return ToolError(f"[zero:{code}] {message…}")` → JoinedStr 的第一个 Constant 段。
+    """
+    func = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == _ZERO_TOOL_ERROR_FUNC
+        ),
+        None,
+    )
+    if func is None:
+        return None
+    for node in ast.walk(func):
+        if not isinstance(node, ast.JoinedStr) or not node.values:
+            continue
+        head = node.values[0]
+        if isinstance(head, ast.Constant) and isinstance(head.value, str):
+            return head.value
+    return None
 
 
 @pytest.mark.zerorepo
-class TestUnknownSessionMarkerCrosscheck:
-    """T6·② 跨仓 marker 一致性——本仓 client 与 Zero server 的 `_UNKNOWN_SESSION_MARKER` 相等。
+class TestZeroErrorCodeCrosscheck:
+    """Zero 机读错误码全表跨仓一致——符号集 / 逐符号值 / 令牌格式 / 旧别名。
 
-    D:\\Zero 或 server.py 不在位 → skip（不拖红）。
+    D:\\Zero 或 server.py 不在位 → skip（不拖红）；**在位但结构对不上 → 红**。
     """
 
-    def test_unknown_session_marker_matches_zero(self) -> None:
-        """本仓 `_UNKNOWN_SESSION_MARKER` == Zero server 侧同名常量（正则直读源码，不 import）。"""
-        if not _zero_available():
-            pytest.skip(f"D:\\Zero\\src 不存在（路径 {_ZERO_SRC}），跳过 marker 跨仓断言")
-        if not _ZERO_SERVER_PY.is_file():
-            pytest.skip(f"Zero server.py 不存在（路径 {_ZERO_SERVER_PY}），跳过 marker 跨仓断言")
+    def test_error_code_symbol_set_matches_expectation(self) -> None:
+        """① Zero 顶层 `ZERO_ERROR_CODE_*` 符号集 == 本仓独立期望集（改名/增删码即红）。"""
+        tree = _zero_server_tree_or_skip()
+        zero_symbols = frozenset(_zero_error_code_literals(tree))
 
-        source = _ZERO_SERVER_PY.read_text(encoding="utf-8")
-        match = _MARKER_ASSIGN_RE.search(source)
-        if match is None:
-            pytest.skip(
-                f'Zero server.py 未找到 `_UNKNOWN_SESSION_MARKER = "..."` 定义'
-                f"（{_ZERO_SERVER_PY}）——可能 Zero 侧尚未接线或改了命名，跳过"
+        assert zero_symbols == _EXPECTED_ZERO_ERROR_CODE_SYMBOLS, (
+            f"Zero 机读错误码**符号集**跨仓漂移（{_ZERO_SERVER_PY}）：\n"
+            f"  Zero 有而本仓未期望：{sorted(zero_symbols - _EXPECTED_ZERO_ERROR_CODE_SYMBOLS)}\n"
+            f"  本仓期望而 Zero 无：{sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS - zero_symbols)}\n"
+            "两仓须协调：新增码要同步 client._CODE_TO_EXCEPTION 的归类（可重试 / 须重开会话 / "
+            "调用方传参错 / 部署端问题），否则新码落基类被静默降级。"
+        )
+
+    def test_error_code_values_match_client_constants(self) -> None:
+        """② **逐符号**比对码值：Zero 字面量 == 本仓 client 同名常量（值单边漂移即红）。
+
+        本仓那份字面量独立写在 `src/mcp/zero/client.py`，故本条不是恒真式。
+        另断言两侧全表（值集合）相等——防「符号对上但登记表漏一条」。
+        """
+        tree = _zero_server_tree_or_skip()
+        zero_literals = _zero_error_code_literals(tree)
+
+        from src.mcp.zero import client as zero_client
+
+        for symbol in sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS):
+            assert symbol in zero_literals, (
+                f'Zero 未定义 `{symbol} = "…"`（{_ZERO_SERVER_PY}）——见符号集断言。'
+            )
+            ours = getattr(zero_client, symbol, None)
+            assert ours is not None, f"本仓 client 缺同名常量 `{symbol}`，两仓须同步。"
+            assert zero_literals[symbol] == ours, (
+                f"机读码值跨仓漂移：`{symbol}` Zero={zero_literals[symbol]!r}，"
+                f"本仓 client={ours!r}。改值会让本仓查表落空 → 归类退化成基类、静默降级。"
             )
 
-        from src.mcp.zero.client import _UNKNOWN_SESSION_MARKER
+        assert frozenset(zero_literals.values()) == zero_client.ZERO_ERROR_CODES, (
+            f"机读码**全表**跨仓不等：Zero={sorted(zero_literals.values())}，"
+            f"本仓 ZERO_ERROR_CODES={sorted(zero_client.ZERO_ERROR_CODES)}。"
+        )
 
-        zero_marker = match.group(1)
-        assert zero_marker == _UNKNOWN_SESSION_MARKER, (
-            f"T6·② unknown-session marker 跨仓漂移：Zero server="
-            f"{zero_marker!r}，本仓 client={_UNKNOWN_SESSION_MARKER!r}。"
-            "两仓须协调同步——否则 unknown-session 判定静默失效。"
+    def test_zero_registry_lists_every_code_symbol(self) -> None:
+        """③ Zero 的 `ZERO_ERROR_CODES` 登记表列全所有码符号（防「定义了码却漏登记」）。
+
+        Zero `_tool_error` 对未登记码构造即抛，故漏登记 = 该错误出口在 Zero 侧直接崩；
+        本仓也拿不到该码。两仓都受害，故此结构也要 pin。
+        """
+        tree = _zero_server_tree_or_skip()
+        registry = _zero_registry_symbols(tree)
+
+        assert registry is not None, (
+            f"Zero 未找到 `{_ZERO_CODE_REGISTRY_NAME} = frozenset({{…}})` 的可解析定义"
+            f"（{_ZERO_SERVER_PY}）——契约结构变了，本仓消费/守卫都要跟。"
+        )
+        assert frozenset(registry) == _EXPECTED_ZERO_ERROR_CODE_SYMBOLS, (
+            f"Zero `{_ZERO_CODE_REGISTRY_NAME}` 登记的符号 {sorted(registry)} "
+            f"≠ 本仓期望 {sorted(_EXPECTED_ZERO_ERROR_CODE_SYMBOLS)}。"
+        )
+
+    def test_token_prefix_pinned(self) -> None:
+        """④ 令牌构造前缀 == `[zero:`——本仓消费正则的依据，Zero 换分隔符即红。
+
+        这是**格式契约**本身：上一轮的死码正是「格式不对」而非「码值不对」，故必须单独 pin。
+        """
+        tree = _zero_server_tree_or_skip()
+        prefix = _zero_tool_error_token_prefix(tree)
+
+        assert prefix is not None, (
+            f"Zero `{_ZERO_TOOL_ERROR_FUNC}` 里未找到可解析的 f-string 首段常量"
+            f"（{_ZERO_SERVER_PY}）——令牌构造方式变了，本仓消费正则须重核。"
+        )
+        assert prefix == _EXPECTED_TOKEN_PREFIX, (
+            f"机读令牌前缀跨仓漂移：Zero={prefix!r}，本仓期望={_EXPECTED_TOKEN_PREFIX!r}。"
+            "本仓 `_ZERO_ERROR_TOKEN_RE` 依赖该前缀，改了即全部错误码提取失效（静默）。"
+        )
+        # 本仓正则确能从「按该前缀渲染出的样本」提到码——把格式 pin 与消费口径接上，
+        # 避免只 pin 前缀却漏掉后半段（闭合括号）变化。
+        from src.mcp.zero.client import classify_zero_error
+
+        sample = f"Error executing tool zero.step: {prefix}unknown-session] 文案"
+        assert classify_zero_error(sample) == "unknown-session", (
+            f"按 Zero 前缀 {prefix!r} 渲染的样本，本仓 classify_zero_error 提不到码：{sample!r}"
+        )
+
+    def test_legacy_alias_preserved(self) -> None:
+        """⑤ 旧别名 `_UNKNOWN_SESSION_MARKER` 仍在且指向 unknown-session 符号（过渡期承诺）。
+
+        本仓仍导出同名别名（值相等）供历史调用点与本守卫引用；Zero 撤别名时本条红 →
+        提醒同步撤除本仓别名与 `_LEGACY_UNKNOWN_SESSION_RE` 兼容分支。
+        """
+        tree = _zero_server_tree_or_skip()
+        target = _zero_alias_target(tree, _ZERO_LEGACY_ALIAS_NAME)
+
+        assert target == "ZERO_ERROR_CODE_UNKNOWN_SESSION", (
+            f"Zero `{_ZERO_LEGACY_ALIAS_NAME}` 不再是指向 ZERO_ERROR_CODE_UNKNOWN_SESSION 的别名"
+            f"（实际={target!r}）。若 Zero 已撤别名，本仓应同步撤除 client 侧别名与旧裸前缀兼容层。"
+        )
+
+        from src.mcp.zero.client import (
+            _UNKNOWN_SESSION_MARKER,
+            ZERO_ERROR_CODE_UNKNOWN_SESSION,
+        )
+
+        assert _UNKNOWN_SESSION_MARKER == ZERO_ERROR_CODE_UNKNOWN_SESSION, (
+            "本仓别名与新常量值不等——两者须始终同值（Zero 侧亦然）。"
         )
 
 
@@ -660,18 +880,26 @@ class TestPhysiologyDecoderContractCrosscheck:
 # ---------------------------------------------------------------------------
 # 在线真模型路径的**反归一化常量** pin（Zero 07-28 回执 ③(b) 补正）
 #
-# 此前我方只 pin 了**占位**路径（affect_math.py:479-481，见 TestCanonicalPlaceholder…）与真模型
-# 路径的**键名**（上一个类）——漏了真模型路径的**值级常量**。Zero 指出：设 ZERO_PHYSIOLOGY_MODEL_PATH
-# 后 composite.py:134-135 **整块覆盖** channels["physiology"]，占位式根本不执行，走的是
-# physiology_decoder.py:35-37 的**另一套常量**（temp 对 30/10 ≠ 占位的 36/3）。
+# 此前我方只 pin 了**占位**路径（Zero `src/agents/affect_math.py::decode_channels` 的 physiology
+# 占位式，见 TestCanonicalPlaceholder…）与真模型路径的**键名**（上一个类）——漏了真模型路径的
+# **值级常量**。Zero 指出：设 ZERO_PHYSIOLOGY_MODEL_PATH 后
+# `src/agents/models/composite.py::CompositeChannelDecoder.predict_channels` 的
+# `if self.physiology_model is not None:` 分支**整块覆盖** channels["physiology"]，占位式根本
+# 不执行，走的是 `src/agents/models/physiology_decoder.py::PhysiologyDecoder.predict_physiology`
+# 的**另一套反归一化常量**（temp 对 30/10 ≠ 占位的 36/3）。
 #
 # 为何这对**消费正确性**要命（W6 同类：静默标度差）：本仓 LinearPhysiologyMapper 的默认量纲
 # （skin_conductance_max_us=20.0、temperature_range=(30,40)）正是按**在线 decoder** 标定的。
 # Zero 若把 `vec[1]*20.0` 改成 `*10.0`，我方解析照样成功、mapper 照样不报错，但 level 静默错 2×
 # （与 W6 legacy sc 欠标度 20× 同族）。故此处不止 pin 常量，还断言**常量 ⇔ mapper 默认**的耦合。
 #
-# 另 wesad.py:59-62 的训练侧归一化与 decoder 反归一化是**逆变换对，必须成对同改**（Zero ③(b)）：
-# 单改一侧 → 权重与解码口径错配，输出物理量整体偏移。故一并 pin，任一侧漂移即红 → 触发 ping。
+# 另 Zero `src/agents/datasets/wesad.py` 特征提取里的训练侧归一化（hr/eda/temp 三条 clamp 式）
+# 与 decoder 反归一化是**逆变换对，必须成对同改**（Zero ③(b)）：单改一侧 → 权重与解码口径错配，
+# 输出物理量整体偏移。故一并 pin，任一侧漂移即红 → 触发 ping。
+#
+# 📌 跨仓引用口径：本文件一律写「Zero `<仓内相对路径>::<符号名>`」，**不写对方行号**——Zero 侧
+# 行号漂移剧烈（同一天内其 HEAD 与未提交工作树就有 7 处再漂、最大 +44 行），且行号腐烂**不驱红**
+# ＝静默失效。所有正则/切块锚点同样按符号名与 AST 结构，不按行号、不按文本 partition。
 # ---------------------------------------------------------------------------
 
 _ZERO_WESAD_PY = _ZERO_SRC / "agents" / "datasets" / "wesad.py"
@@ -683,7 +911,8 @@ _WESAD_HR_RE = re.compile(r"clamp\(\(hr\s*-\s*([\d.]+)\)\s*/\s*([\d.]+)")
 _WESAD_EDA_RE = re.compile(r"clamp\(eda_mean\s*/\s*([\d.]+)")
 _WESAD_TEMP_RE = re.compile(r"clamp\(\(temp_mean\s*-\s*([\d.]+)\)\s*/\s*([\d.]+)")
 
-# 在线 decoder 反归一化常量（Zero 07-28 现场核验：physiology_decoder.py:35-37）
+# 在线 decoder 反归一化常量（Zero 07-28 现场核验：
+# `src/agents/models/physiology_decoder.py::PhysiologyDecoder.predict_physiology` 的 return dict）
 # key → (offset, span)；offset=None 表示纯标度（无偏置）
 _ONLINE_PHYSIO_CONSTANTS: dict[str, tuple[float | None, float]] = {
     "heart_rate_bpm": (50.0, 70.0),  # 50 + vec*70 → [50,120] bpm
@@ -784,10 +1013,12 @@ class TestPhysiologyDecoderOnlineConstantsPin:
 # ignition 点燃门跨仓耦合：Zero 门控常量 ⊗ 本仓推荐精度的**可达性**
 #
 # Zero 07-28 回执 A 条提醒 SALIENCE_THRESHOLD 会门掉 value 流。本仓据此追查发现该门**同样**
-# 作用于 external_priors：`affect_core.py:100-108` 在 expand 后**无条件**进 ignite()，而
-# `expand_external_priors`（affect_math.py:974）只校验不改精度。默认 IGNITION_BETA=None 即硬门。
+# 作用于 external_priors：Zero `src/agents/affect_core.py` 里 `expand_external_priors(...)` 的产物
+# **无条件**进 `ignite(...)`（两个调用点相邻、之间无筛选），而 `affect_math::expand_external_priors`
+# 只校验不改精度。默认 IGNITION_BETA=None 即硬门。
 #
-# salience(μ,Π) = hypot(μ)·mean(Π)（affect_math.py:673）——|μ| 的线性函数、门是**锐阶跃**。
+# salience(μ,Π) = hypot(μ)·mean(Π)（`affect_math::stream_salience`）
+# ——|μ| 的线性函数、门是**锐阶跃**。
 # 跨阈需 |μ| ≥ threshold/mean(Π)；而 ModalityPrior 各维 ∈[-1,1] → |μ| ≤ √2≈1.4142。
 # 本仓推荐精度的可达性（2026-07-28 真 server A/B 实测，与解析值吻合到小数点后四位）：
 #   face   Π̄=0.1600 → 需 |μ|≥1.1250 ≤ √2  **可达**（实测 μ=(-0.95,0.95) 点燃 |Δ|=1.55e-02）
@@ -833,10 +1064,24 @@ class TestPhysiologyDecoderOnlineConstantsPin:
 #     从不读 Zero 函数体；而新架构以 default-off 开关落地、旧式原样保留 → 公式若真被换掉本类仍全绿。
 #     此为**已知盲区**，靠 Zero 的人工 ping 兜底（其 PRP tasks 已列 ping 义务）。
 #
-# 📌 **当前状态（2026-07-29 实测，非推断）**：本分支对 Zero main `9617372`
-#   `ZERO_LINK_E2E_STRICT=1 pytest -m zerorepo` = **45 passed / 0 skipped**；
-#   而本仓 `main` 分支上**是红的**（尚未跟上重标，属结构性假红，合并后即消）。
-#   → **回答「跨仓守卫绿不绿」必须带 ref 限定**，两个 ref 的答案不同。
+# 📌 **当前状态（2026-07-29 实测，非推断；任何红绿结论都必须带 ref 限定）**：
+#   · 本文件的跨仓守卫一律 `read_text()` 磁盘上的**工作副本**、不读 git 对象，故报红绿必须同时
+#     给出「本仓 commit + Zero HEAD + **Zero 工作树是否脏**」三项，只说「绿了」没有意义。
+#     ⚠ 这不是纸面风险：本次改动过程中 Zero 就从「HEAD `11c25b0` + 12 个未提交 M」变成了
+#     「HEAD `df496da` + 工作树 clean」，同一份守卫代码的红绿结论**在同一小时内翻了面**。
+#   · ⚠ 旧注释写的「本仓 `main` 上是红的（尚未跟上重标，属结构性假红，合并后即消）」**已过期**，
+#     本次订正：重标早已合入 main。改动当天在 main 上实测到的那一条红是**另一件事**——Zero
+#     **未提交**的 docstring 里写了 `if gate_fusion:` 这句散文，撞坏了当时的文本切分锚点
+#     （根因见 `test_gate_open_branch_has_no_fallback_and_excludes_physio` 的 docstring）。
+#     ⚠ **诚实记账**：Zero 随后提交（`df496da`）时改写了那段 docstring，该次红已**自行消失**，
+#     即它是随对方工作树状态来去的**瞬时**红，不是持续故障。本次迁 AST 修的是**那一类**结构
+#     脆弱性（用文本在源码里找结构锚点），不是修一条一直红着的用例——Zero 常态性在 docstring
+#     里引用代码 token，同样的撞法随时会再发生一次。
+#   · 本次改动后实测（对 Zero `11c25b0`+12M 与 `df496da`+clean **两个 ref 各跑一遍，结论一致**）：
+#     `pytest tests/mcp/test_zero_contract_crosscheck.py` = 37 passed；
+#     `ZERO_LINK_E2E_STRICT=1 pytest tests/mcp -m zerorepo` = **48 passed / 0 skipped / 0 failed**
+#     （较改前的 45 项多出的 3 项 = 本次新增的 gate 运行期默认 pin、sample_sigma_cap 通路 pin、
+#     以及门判前缺口守卫的十一态判别性自证）。
 # ---------------------------------------------------------------------------
 
 _ZERO_AFFECT_MATH_PY = _ZERO_SRC / "agents" / "affect_math.py"
@@ -852,11 +1097,12 @@ _ZERO_GATE_CONSTANTS: dict[str, float] = {
     "AROUSAL_GAIN": 1.0,
 }
 
-# occ_prior σ 标度系数（affect_math.py:126-127）——Zero 07-28 ④ 订正：**这才是真旋钮**
-# （MIN_SIGMA 在 MCP 路径恒不咬合：mapping.py:53 钳 |I|≤1 → σ∈[0.10,0.35] 恒 >0.05）。
+# occ_prior σ 标度系数（Zero `src/agents/affect_math.py::occ_prior` 内的 conf/sigma 两式）
+# ——Zero 07-28 ④ 订正：**这才是真旋钮**（MIN_SIGMA 在 MCP 路径恒不咬合：
+# `src/mcp_server/mapping.py::stimulus_from_payload` 把 |I| 钳到 ≤1 → σ∈[0.10,0.35] 恒 >0.05）。
 _ZERO_SIGMA_CONF_RE = re.compile(rf"conf\s*=\s*clamp\(({_NUM})\s*\+\s*({_NUM})\s*\*\s*abs\(")
 _ZERO_SIGMA_RE = re.compile(rf"sigma\s*=\s*max\(MIN_SIGMA,\s*({_NUM})\s*\*\s*\(1\.0\s*-\s*conf\)")
-# precision() 的 α/β 默认（affect_math.py:155）——在 sigmoid **分子**，直接线性缩放判别信号
+# `affect_math::precision` 的 α/β 形参默认——在 sigmoid **分子**，直接线性缩放判别信号
 _ZERO_ALPHA_BETA_RE = re.compile(
     rf"def precision\([^)]*alpha:\s*float\s*=\s*({_NUM})[^)]*beta:\s*float\s*=\s*({_NUM})",
     re.DOTALL,
@@ -878,7 +1124,7 @@ def _mean_precision(precision: tuple[float, float]) -> float:
 # 模式黄灯，仅 STRICT 转红）——守卫承诺的红是它给不出的。现基线缺省按 0.0 进入主
 # 断言 → 去地板落地当天全模式红。
 # ⚠ 必须先切出 fast_survival_prior 函数体再匹配：基线一变可选，全文件 search 会被
-# occ_prior 的多行 `clamp(\n 0.4·|I| + …)`（affect_math.py:118）抢先匹配成「无基线」，
+# `affect_math::occ_prior` 的多行 `clamp(\n 0.4·|I| + …)` 抢先匹配成「无基线」，
 # 在 Zero 未动手时就假阳性红（本仓 07-28 实踩，见判别性自证测试）。
 _ZERO_SURVIVAL_AROUSAL_RE = re.compile(
     rf"arousal\s*=\s*clamp\(\s*(?:({_NUM})\s*\+\s*)?({_NUM})\s*\*\s*abs\(intensity\)"
@@ -900,31 +1146,126 @@ def _extract_function_body(source: str, name: str) -> str | None:
     return match.group(0) if match else None
 
 
-def _split_if_block(body: str, header: str) -> tuple[str, str] | None:
-    """按**缩进**把 `header`（如 `if gate_fusion:`）的块体与其后的同级代码切开。
+def _top_level_func(source: str, name: str) -> ast.FunctionDef | None:
+    """按 AST 取**顶层**函数节点；语法错 / 不存在返回 None。
 
-    返回 (块体, 块后剩余)；`header` 不在 body 里返回 None。
+    为什么跨仓结构守卫一律走 AST，而不再用任何文本切法（两次实踩的同源教训）：
 
-    为什么按缩进而不按 `partition("return ")`：后者在「真分支不再 return」这种改动下会
-    落到函数**末尾**那个 return 上、把切点挪走，守卫照样绿——实测确认（本仓
-    pitfalls「绿灯必须先证明它能红」同族）。缩进是块结构的定义本身，不会被这样绕过。
+    1. `partition("return ")`（2026-07-28 踩）——在「真分支不再 return」这种改动下切点会
+       落到函数**末尾**那个 return 上、把改动整个跳过，守卫照样绿（永绿=恒真）。
+    2. `body.find("if gate_fusion:")`（2026-07-29 踩，本次修复对象）——Zero 的 docstring /
+       `#` 注释里**常态性**出现 `if gate_fusion:`、`_PHYSIO_PREFIXES` 这类 token（其
+       `src/agents/affect_math.py::ignite` 的 docstring「收口条件」段就写了「把前缀过滤提到
+       `if gate_fusion:` 之前」）。首次命中落到这句散文上 → 按散文行长算缩进 → 块体为空 →
+       守卫**假红**。实测对照：同一守卫在 Zero HEAD 上绿、在其工作副本上红，红与 `ignite`
+       的结构**完全无关**。
+
+    AST 里没有 `#` 注释，docstring 是可识别的独立 `Expr(Constant(str))` 节点（由
+    `_body_without_docstring` 剥掉），两类污染一次消除。缩进/文本只在解析失败时才有价值，
+    而解析失败本身就该走「找不到 → 调用方判红或 skip」。
     """
-    idx = body.find(header)
-    if idx < 0:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
         return None
-    header_indent = len(body[:idx].rsplit("\n", 1)[-1])
-    lines = body[idx:].split("\n")[1:]  # 跳过 header 行本身
-    block: list[str] = []
-    for pos, line in enumerate(lines):
-        if line.strip() and len(line) - len(line.lstrip()) <= header_indent:
-            return "\n".join(block), "\n".join(lines[pos:])
-        block.append(line)
-    return "\n".join(block), ""
+    # ⚠ 只遍历 tree.body 顶层，**不用** ast.walk(tree)——后者会把嵌套/同名函数一起捞进来。
+    return next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+
+def _body_without_docstring(func: ast.FunctionDef) -> list[ast.stmt]:
+    """剥掉函数体首条 docstring 语句，返回其余语句列表。"""
+    body = list(func.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def _split_ignite_on_gate(
+    func: ast.FunctionDef,
+) -> tuple[list[ast.stmt], ast.If, list[ast.stmt]] | None:
+    """把 ignite 体切成 (门判之前, `if gate_fusion:` 节点, 门判之后)。无该二分返回 None。
+
+    返回三段而非两段：现行形态是「真分支提前 return + 落穿」，门开分支**不在** If 节点的
+    orelse 里而在其后的同级语句里；写成 if/else 形态时则在 orelse 里。两种都要覆盖，故
+    「门开分支」= `[*gate_if.orelse, *tail]`。
+    """
+    body = _body_without_docstring(func)
+    for pos, stmt in enumerate(body):
+        if (
+            isinstance(stmt, ast.If)
+            and isinstance(stmt.test, ast.Name)
+            and stmt.test.id == "gate_fusion"
+        ):
+            return body[:pos], stmt, body[pos + 1 :]
+    return None
+
+
+def _referenced_names(nodes: Iterable[ast.AST]) -> set[str]:
+    """给定语句集合里**被引用到的标识符**（Name 节点）集合。
+
+    签名形参、docstring 正文、`#` 注释均不产生 Name 节点，故三者都不会误报。
+    ⚠ 由此推出一条使用前提：只能喂**函数体语句**（`func.body` 的切片），不能把 `func`
+    整体丢进来——`exclude_physio_fusion` 同时出现在 `ignite` 的签名里（`func.args`），
+    喂整节点会让「门判前是否已施 physio 过滤」这条断言恒红。
+    """
+    return {sub.id for node in nodes for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+
+# physio 排除相关标识符：前缀表本身 + 开关名（Zero 若抽 helper 并显式传 flag 也能接住）。
+# 用**集合交**而非字符串 `in`：后者会被 `_PHYSIO_PREFIXES_LEGACY` 之类的新名字误命中。
+_PHYSIO_FILTER_NAMES = frozenset({"_PHYSIO_PREFIXES", "exclude_physio_fusion"})
+
+_PARAM_REQUIRED = "<REQUIRED>"  # 形参在、但没有默认值（被改成必填）
+_PARAM_MISSING = "<MISSING>"  # 形参根本不在签名里（被删 / 改名）
+_PARAM_NON_LITERAL = "<NON-LITERAL>"  # 默认值不是字面量（如从常量/env 读）
+
+
+def _signature_default(func: ast.FunctionDef, name: str) -> object:
+    """取函数签名里形参 `name` 的默认值字面量（位置形参与仅关键字形参都覆盖）。
+
+    三种「不是普通默认值」的情形各返回**不同的**哨兵，而不是统一 None——判据必须能分清
+    红的原因，否则「形参被删」会伪装成「默认值翻转」，归因指错方向（本仓 pitfalls 同族）。
+
+    为什么用 AST 而不是对整份源码跑 `re.search(r"gate_fusion\\s*:\\s*bool\\s*=\\s*(True|False)")`：
+    Zero 侧 `gate_fusion` / `exclude_physio_fusion` 这类名字在 `orchestration/runner.py`、
+    `orchestration/state.py`、以及 `affect_math` 内其它函数里都可能同名出现，全文件正则会锚点
+    滑走；AST 把「哪个函数的哪个形参」这件事变成结构事实而非文本巧合。
+    """
+    args = func.args
+    positional = [*args.posonlyargs, *args.args]
+    pos_defaults: list[ast.expr | None] = [None] * (len(positional) - len(args.defaults))
+    pos_defaults.extend(args.defaults)
+    pairs: list[tuple[ast.arg, ast.expr | None]] = [
+        *zip(positional, pos_defaults, strict=True),
+        *zip(args.kwonlyargs, args.kw_defaults, strict=True),
+    ]
+    for arg, default in pairs:
+        if arg.arg != name:
+            continue
+        if default is None:
+            return _PARAM_REQUIRED
+        try:
+            return ast.literal_eval(default)
+        except ValueError:
+            return _PARAM_NON_LITERAL
+    return _PARAM_MISSING
 
 
 # 我方实际发往 Zero 的 physio 流名（合并态 / 未合并态）。用于核对 Zero 的 D7 前缀排除
 # 是否真的覆盖我方载荷——「对方加了排除」不等于「排除到我方头上」。
 _MCP_PHYSIO_STREAM_NAMES = ("physio", "eda/sc", "hrv/rmssd")
+
+# Zero `src/agents/affect_math.py::_PHYSIO_PREFIXES` 的**全等**期望集（顺序不 pin，见下）。
+# 消费点是 `str.startswith(tuple)`，对顺序不敏感 → pin 成有序列表会在 Zero 纯重排（语义无变）
+# 时假红；但成员**增删都要红**：删项 ⇒ 该类流漏出 D7 排除与 M2 Πv 归零；增项 ⇒ Zero 单边
+# 扩大了排除面（可能连带扫掉我方未来的新流名）。旧写法只断言 `{physio,eda,hrv} <= 集合`，
+# 实测对「删 scr」「加 rsp」两个变异都绿——这是 Zero 2026-07-29 回执点名的 pin 差口 D-1。
+_ZERO_PHYSIO_PREFIXES_EXPECTED = frozenset({"physio", "eda", "hrv", "pupil", "scr"})
 
 
 def _survival_arousal_floors(source: str) -> list[float] | None:
@@ -1140,7 +1481,7 @@ class TestIgnitionGateReachabilityCrosscheck:
             consts[name] = float(match.group(1))
 
         # ⚠ 此处**从 Zero 源码读** fast_survival_prior 的 arousal 基线系数，不再手抄。
-        # 现行形态（Zero 复议 §六(e):186 裁定的 default-off 门控）：两分支，基线 {0.0, 0.5}。
+        # 现行形态（Zero 复议 §六(e) 裁定的 default-off 门控）：两分支，基线 {0.0, 0.5}。
         # 仍要求「形态一变就红」：任何第三种分支、或基线集合变化，都落到下面的逐值断言上。
         floors = _survival_arousal_floors(source)
         if floors is None:
@@ -1253,6 +1594,16 @@ class TestIgnitionGateReachabilityCrosscheck:
 
         本例只 pin 结构与默认值，不 pin 行号（Zero 侧行号漂移剧烈）。Zero 若把 fallback
         挪进门开分支、或把 `exclude_physio_fusion` 默认翻成 False，本例即红。
+
+        ⚠ **2026-07-29 迁 AST（修假红，不是放宽守卫）**：①段原走一个按缩进切块的文本 helper
+        （`_split_if_block`，已随本次删除），其 `body.find("if gate_fusion:")` 被 Zero 当日
+        **未提交**的新 docstring 撞上
+        ——其 `ignite` docstring「收口条件」段原文就写着「把前缀过滤提到 `if gate_fusion:`
+        之前」，首次命中落到这句散文上、按散文行长算缩进 ⇒ 块体为空 ⇒ 本例红。实测对照：
+        同一守卫在 Zero HEAD `11c25b0` 上**绿**、在其工作副本（12 个未提交 M）上**红**，
+        红与 `ignite` 的结构完全无关。迁 AST 后本例由红转绿，判别力不降反升（6 态矩阵：
+        base 绿 / docstring 污染 绿 / fallback 挪进门开 红 / 真分支去 return 红 / 二分被拆
+        红 / else 形态 绿）。②段（默认值与前缀集 pin）不受切分影响，原样保留并补齐 pin 差口。
         """
         source = self._source()
 
@@ -1262,33 +1613,31 @@ class TestIgnitionGateReachabilityCrosscheck:
             pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
         assert "max(" in select_fired, "_select_fired 内已无 max-fallback，可达性结论须重评"
 
-        ignite_body = _extract_function_body(source, "ignite")
-        if ignite_body is None:
-            pytest.skip("未找到 ignite，Zero 结构可能大改，跳过")
-        assert "if gate_fusion:" in ignite_body, (
-            "ignite 不再以 `if gate_fusion:` 二分——门控形态变了，须按新形态重标"
-        )
-        # 按**缩进**切出 `if gate_fusion:` 块体与其后的门开分支（不按 return 切，理由见
-        # `_split_if_block` docstring：按 return 切会被「真分支不再 return」绕过）。
-        split = _split_if_block(ignite_body, "if gate_fusion:")
-        assert split is not None
-        gate_closed_part, gate_open_only = split
+        func = _top_level_func(source, "ignite")
+        assert func is not None, "未找到顶层 ignite——锚点失效，须按新形态重标（勿降级为 skip）"
+        split = _split_ignite_on_gate(func)
+        assert split is not None, "ignite 不再以 `if gate_fusion:` 二分——门控形态变了，须重标"
+        _prelude, gate_if, tail = split
+        closed = list(gate_if.body)
+        opened = [*gate_if.orelse, *tail]
         # ⚠ 切分有效性守卫：两侧都非空才谈得上「分支归属」；否则下面的 `not in` 恒真=空断言
         # （本仓 pitfalls「绿灯必须先证明它能红」第 ⑥ 例正是这么踩的）。
-        assert gate_closed_part.strip() and gate_open_only.strip(), (
+        assert closed and opened, (
             "切不出 ignite 的门关/门开两分支——结构变了，须按新形态重标（勿让本例退化成空断言）"
         )
-        assert "_select_fired" in gate_closed_part, (
+        assert "_select_fired" in _referenced_names(closed), (
             "gate_fusion 真分支里已无 _select_fired——阈值通路被重构，须重标"
         )
         # 真分支必须**提前 return**：否则会落穿到门开分支，两条路径同时执行，
-        # 「门关不走融合分支」这个前提就不成立了（按 return 切分时抓不到这种改动）。
-        closed_statements = [ln.strip() for ln in gate_closed_part.split("\n") if ln.strip()]
-        assert closed_statements and closed_statements[-1].startswith("return "), (
-            f"gate_fusion 真分支不再以 return 收尾（末句 {closed_statements[-1:]!r}）"
-            "——会落穿到门开分支，本仓的门关/门开二态刻画须重评。"
-        )
-        assert "_select_fired" not in gate_open_only, (
+        # 「门关不走融合分支」这个前提就不成立了。
+        # ⚠ 落穿检查**只在无 else 形态下要求**：写成 if/else 时结构上不可能落穿，此时这条
+        # 断言不执行是**正确的**（矩阵 (5) else 形态期望绿），不是漏洞——别日后看到就补死。
+        if not gate_if.orelse:
+            assert isinstance(closed[-1], ast.Return), (
+                f"gate_fusion 真分支不再以 return 收尾（末句 {type(closed[-1]).__name__}）"
+                "——会落穿到门开分支，本仓的门关/门开二态刻画须重评。"
+            )
+        assert "_select_fired" not in _referenced_names(opened), (
             "门开分支里出现了 _select_fired——max-fallback 被挪回数值通路，"
             "本仓「门开时 physio 不经 fallback」的结论须撤回并重评。"
         )
@@ -1300,19 +1649,153 @@ class TestIgnitionGateReachabilityCrosscheck:
             "exclude_physio_fusion 默认翻为 False——D7「physio 不进数值通路」的跨仓承诺"
             "已被解除，我方 physio 先验会在门开时真正参与后验，须立即跨仓确认。"
         )
+        # 补口（本次判别力实证当场揪出的覆盖缺口）：上面那条 pin 与下面的前缀集 pin 只证明
+        # 「开关还在、前缀表还在」，**不证明过滤本体还在**。实测：把门开分支里那行
+        # `fusion = [t for t in fusion if not t[0].lower().startswith(_PHYSIO_PREFIXES)]` 单独删掉
+        # （D12 raise 文案里对前缀表的引用保留），本例改口前的**所有**断言照样全绿——D7 被抽空
+        # 而我方毫无察觉。故补一条「过滤本体存在」的正向断言。
+        # 判据刻意写成**位置无关**（只问 ignite 体内有没有，不问在哪个分支）：Zero 的收口方案是
+        # 把过滤**移到**门判前，若写成「门开分支里必须有」，其收口当天会红在「D7 被删」这条
+        # 归因错误的消息上——把好事读成坏事。
+        guarded_filters = [
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.If)
+            and "exclude_physio_fusion" in _referenced_names([node.test])
+            and "_PHYSIO_PREFIXES" in _referenced_names(node.body)
+        ]
+        assert guarded_filters, (
+            "ignite 体内已找不到「由 exclude_physio_fusion 守卫、且引用 _PHYSIO_PREFIXES」的过滤"
+            "分支——D7 排除的**执行体**被删（开关与前缀表可能都还在，故那两条 pin 不会红），"
+            "我方 physio 先验会重新进入数值通路，须立即跨仓确认。"
+        )
+        # D-2 第一层（Zero 2026-07-29 回执点名的 pin 差口）：`gate_fusion` 的**函数级**默认。
+        # 锚在 ignite 的 AST 签名内，不做全文件正则——Zero 的 runner.py / state.py 里都有同名
+        # 形参/字段，跨文件复用同一正则会锚点滑走。⚠ 本条只管函数默认，**不治理运行期**：
+        # 真旋钮是 `AffectState.gate_fusion`（下面第二/第三层）。
+        gate_default = _signature_default(func, "gate_fusion")
+        assert gate_default is not _PARAM_MISSING, (
+            "ignite 签名内已无 gate_fusion 形参（被删 / 改名）——门控形态变了，须重标"
+        )
+        assert gate_default is not _PARAM_REQUIRED, (
+            "ignite 的 gate_fusion 被改成必填形参（无默认值）——调用方全部须显式传值，"
+            "「函数默认=门关」这条前提消失，须重标"
+        )
+        assert gate_default is True, (
+            f"ignite 的 gate_fusion 默认变为 {gate_default!r}（期望 True=门关=零回归，"
+            "注意方向与其它旋钮相反）——门开成为**函数级**默认，须跨仓确认；"
+            "注意本条只管函数默认，运行期真值见 AffectState.gate_fusion 的独立 pin。"
+        )
+        # D-2 第三层（使前两层语义诚实）：pin 调用点覆写事实。生产路径**永不使用**上面那个
+        # 函数默认——affect_core 逐参覆写为 state 字段。只 pin 函数默认 = 制造「函数默认治理
+        # 生产」的错觉，正是 Zero 自己在 MAX_SAMPLE_SIGMA 上记在头上的毛病，不要复刻。
+        core_source = self._zero_module_source("agents", "affect_core.py")
+        assert "gate_fusion=state.gate_fusion" in core_source, (
+            "affect_core 不再把 ignite 的 gate_fusion 覆写为 state.gate_fusion——运行期旋钮"
+            "换了位置（或改回吃函数默认），上面的函数默认 pin 与 AffectState 字段 pin 都可能"
+            "已不代表生产行为，须重新核对整条通路。"
+        )
+
+        # D-1（Zero 2026-07-29 回执点名的 pin 差口）：前缀集改**全等** pin。
         # 允许类型注解形态 `_PHYSIO_PREFIXES: tuple[str, ...] = (...)`
         prefixes = re.search(r"^_PHYSIO_PREFIXES\b[^=\n]*=\s*\(([^)]*)\)", source, re.MULTILINE)
-        assert prefixes is not None, "未找到 _PHYSIO_PREFIXES，须重标"
-        prefix_set = set(re.findall(r'"([^"]+)"', prefixes.group(1)))
-        assert {"physio", "eda", "hrv"} <= prefix_set, (
-            f"_PHYSIO_PREFIXES={prefix_set} 不再覆盖我方流名前缀——我方发出的 "
-            f"{_MCP_PHYSIO_STREAM_NAMES} 可能漏出 D7 排除，须跨仓确认。"
+        assert prefixes is not None, (
+            "未找到 _PHYSIO_PREFIXES 的 tuple 字面量定义"
+            "（Zero 可能改成 frozenset / 多处拼接），须重标"
         )
+        parsed = re.findall(r'"([^"]+)"', prefixes.group(1))
+        assert parsed, (
+            "_PHYSIO_PREFIXES 字面量解析为空——正则被结构变更绕过，须重标（勿退化成空断言）"
+        )
+        prefix_set = set(parsed)
+        assert prefix_set == _ZERO_PHYSIO_PREFIXES_EXPECTED, (
+            f"_PHYSIO_PREFIXES 成员集变为 {sorted(prefix_set)}、期望 "
+            f"{sorted(_ZERO_PHYSIO_PREFIXES_EXPECTED)}——**增删都要红**：删项 ⇒ 该类流漏出 D7 "
+            "排除与 M2 Πv 归零；增项 ⇒ Zero 单边扩大了排除面（可能连带扫掉我方未来的新流名）。"
+            "须跨仓确认。"
+        )
+        assert len(parsed) == len(prefix_set), f"_PHYSIO_PREFIXES 出现重复项 {parsed}，须跨仓确认"
         # 我方实际发出的流名必须落进该前缀集，否则 D7 对我方载荷根本不生效
+        # （与上面的成员集 pin 正交：那条问「表变没变」，这条问「排除有没有排到我方头上」）
         for name in _MCP_PHYSIO_STREAM_NAMES:
             assert name.lower().startswith(tuple(prefix_set)), (
                 f"我方流名 {name!r} 不匹配 Zero 的 _PHYSIO_PREFIXES={prefix_set}，D7 排除对该流失效"
             )
+
+    def test_gate_runtime_defaults_from_affect_state_pinned(self) -> None:
+        """D-2 第二层：**运行期**门控真值 = `AffectState` 字段默认，不是 ignite 的函数默认。
+
+        与上一例的分工必须写清，否则两条 pin 会被读成重复：
+        - 上一例 pin `ignite(gate_fusion=True, exclude_physio_fusion=True)` 的**函数默认**，
+          外加调用点覆写事实（`gate_fusion=state.gate_fusion`）；
+        - 本例 pin 被覆写进去的那个**真旋钮**。生产路径永不吃函数默认，只 pin 第一层等于
+          制造「函数默认治理生产」的错觉。
+
+        字段缺位时子进程回 `"<MISSING>"` 哨兵（不是 KeyError → 不是 skip），断言必然红。
+        """
+        data = _fetch_affect_state_defaults_or_skip()
+        assert data["gate_fusion"] is True, (
+            f"AffectState.gate_fusion 默认变为 {data['gate_fusion']!r}（期望 True=门关=零回归，"
+            "⚠ 方向与其它旋钮相反）——门开成为**生产默认**，全流原生 (μ,Π) 进融合，"
+            "本仓所有基于「门关」的可达性结论须整体重评，须立即跨仓确认。"
+        )
+        assert data["exclude_physio_fusion"] is True, (
+            f"AffectState.exclude_physio_fusion 默认变为 {data['exclude_physio_fusion']!r}"
+            "（期望 True）——D7「physio 不进数值通路」的跨仓承诺在**运行期**被解除，"
+            "我方反号 physio 先验会在门开时真正参与后验，须立即跨仓确认。"
+        )
+
+    def test_sample_sigma_cap_runtime_path_pinned(self) -> None:
+        """D-3：`MAX_SAMPLE_SIGMA=0.5` 的**运行期通路** pin。
+
+        补 `_ZERO_GATE_CONSTANTS` 里那条逐值 pin 的空头支票——逐值 pin 一个模块常量，
+        只有在「该常量确实是缺省生效值」时才有意义。下面三条把该前提
+        拆开来守（Zero 自己在回执里把 MAX_SAMPLE_SIGMA 标为「运行期有效值来自 state」，
+        我方原先只 pin 了常量值，等于把前提当结论）：
+        1. `sample_affect(sigma_cap=None)` 仍是默认 → 不传时才落到模块常量；
+        2. `cap = MAX_SAMPLE_SIGMA if sigma_cap is None else sigma_cap` 回退式未变形；
+        3. `min(cap, post_sigma[...])` 仍在钳采样 σ → 该常量仍有被观测对象。
+        再加一条 `AffectState.sample_sigma_cap` 默认 None（运行期确实不覆写）。
+        """
+        body = _extract_function_body(self._source(), "sample_affect")
+        if body is None:
+            pytest.skip("未找到 sample_affect，Zero 结构可能大改，跳过")
+        assert re.search(r"sigma_cap\s*:\s*float\s*\|\s*None\s*=\s*None", body), (
+            "sample_affect 的 sigma_cap 形参默认不再是 None——模块常量 MAX_SAMPLE_SIGMA 不再是"
+            "缺省通路，本仓对它的逐值 pin 失去运行期含义，须重标"
+        )
+        assert re.search(
+            r"cap\s*=\s*MAX_SAMPLE_SIGMA\s+if\s+sigma_cap\s+is\s+None\s+else\s+sigma_cap", body
+        ), "常量回退式变形——MAX_SAMPLE_SIGMA=0.5 的逐值 pin 可能已不代表运行期有效值，须重标"
+        assert re.search(r"min\(cap,\s*post_sigma\[0\]\)", body), (
+            "cap 不再钳采样 σ（post_sigma[0]）——本 pin 失去被观测对象，须重标"
+        )
+
+        data = _fetch_affect_state_defaults_or_skip()
+        assert data["sample_sigma_cap"] is None, (
+            f"AffectState.sample_sigma_cap 默认变为 {data['sample_sigma_cap']!r}（期望 None）"
+            "——运行期已覆写采样 σ 上限，MAX_SAMPLE_SIGMA=0.5 不再是生效值，须跨仓确认。"
+        )
+
+        # ⚠ 以下是**我方侧的前提记录，不是对 Zero 的观测**，别当守卫业绩上报：我方目前
+        # 无任何生产代码经 `open_session(config=...)` 注入 sample_sigma_cap，所以「Zero 的
+        # 缺省通路」对我方而言就是全部通路。它今天是**弱恒真式**（我方从不写该键 ⇒ 必绿），
+        # 价值只在未来有人加 config builder 时兑现。
+        # 为免退化成 pitfalls ⑥ 那种「解析出的空当被观测量」，配一道正控：扫描器必须真的
+        # 读到了源码内容（能看见 open_session 这个已知在位的 token），否则扫描根写错会让
+        # 本条永远 0 命中而假绿。
+        repo_src = Path(__file__).resolve().parents[2] / "src"
+        sources = {path: path.read_text(encoding="utf-8") for path in repo_src.rglob("*.py")}
+        assert sources, f"未扫到任何本仓 src/*.py（扫描根 {repo_src} 写错？）——本条会假绿"
+        assert any("open_session" in text for text in sources.values()), (
+            f"本仓 src/ 下扫不到 open_session（扫描根 {repo_src}）——扫描器没读到真内容，"
+            "下面的 not-in 断言会退化成恒真式"
+        )
+        injectors = sorted(str(p) for p, text in sources.items() if "sample_sigma_cap" in text)
+        assert not injectors, (
+            f"我方 src/ 出现 sample_sigma_cap 注入点 {injectors}——上面「Zero 缺省通路即我方全部"
+            "通路」的前提不再成立，须把注入值一并纳入可达性/抖动结论重评。"
+        )
 
     def test_soft_gate_bypasses_physio_exclusion(self) -> None:
         """**D7 承诺的已知覆盖缺口**（特征化，非缺陷断言）：软门分支不施 physio 排除。
@@ -1328,8 +1811,56 @@ class TestIgnitionGateReachabilityCrosscheck:
 
         本例把这个缺口做成**可执行记录**：若 Zero 日后在软门分支内也施加 physio 排除
         （缺口被堵），本例变红 → 提示我们更新跨仓认知并撤下相关风险提示。
+
+        ⚠ **2026-07-29 重锚**：Zero 回执明确其收口方案是「把前缀过滤提到 `if gate_fusion:`
+        **之前**、对硬门/软门/门开三条路径同施」，并主动提示我方——它若只改 `ignite()` 而
+        我方仍只锚在 `_select_fired` 函数体上，本守卫**不会变红而是静默失去刻画能力**。故
+        主锚点移到 `ignite()` 的门判之前；`_select_fired` 那两条降级为**副锚点**保留（Zero
+        也可能把过滤下沉进该 helper，那是另一条真实修法，两条都要守）。
+
+        **如实标注守不住什么**：Zero 若把过滤抽成**不透明 helper**（`streams =
+        _drop_physio(streams)`，开关从模块级读、不作实参传）并在门判前调用，本例看不见
+        （11 态矩阵第 (7) 态实测为**绿**）。缓解靠 Zero 的「落地即 ping」承诺（其
+        `ignite` docstring 内已写死该承诺，我方回执 notes/2026-07-29-zero-reply-and-
+        alignment-asks.md 亦有记载），不靠本守卫独担；写了盲点不等于覆盖了盲点。
         """
         source = self._source()
+
+        # ── 主锚点：ignite() 的**门判之前**（Zero 指定的 ② 落点）──────────────────
+        func = _top_level_func(source, "ignite")
+        assert func is not None, "未找到顶层 ignite——锚点失效，须按新形态重标（勿降级为 skip）"
+        split = _split_ignite_on_gate(func)
+        assert split is not None, "ignite 不再以 `if gate_fusion:` 二分——门控形态变了，须重标"
+        prelude, gate_if, tail = split
+
+        # 正控①（切分非退化）：门判前必须是真代码区且含已知语句；否则下面的集合交为空
+        # 是「切没了」而非「缺口仍在」——本仓 pitfalls ⑥「把解析出的空/0 当被观测量」。
+        assert prelude, "ignite 门判之前已无任何语句——切分退化，下面的断言会变恒真式"
+        prelude_names = _referenced_names(prelude)
+        assert "_score_streams" in prelude_names, (
+            f"ignite 门判之前不含 _score_streams（实得 {sorted(prelude_names)}）"
+            "——切分锚点可疑，须先确认切出来的确是门判前那段"
+        )
+
+        # 正控②（探测器可见性·**位置无关**）：同一探测器必须能在 ignite 体内看见该 token。
+        # 位置无关是刻意的：Zero ② 是**移动**过滤（门开那份会被删），若把正控写成「门开分支
+        # 里必须有」，② 落地当天会先红在一条**归因错误**的消息上（「D7 被删」）——第一版实测
+        # 就是这么错的，bool 判据看不出来，原因串判据才抓到。
+        whole = [*prelude, gate_if, *tail]
+        assert "_PHYSIO_PREFIXES" in _referenced_names(whole), (
+            "整个 ignite 体内都找不到 _PHYSIO_PREFIXES——要么 D7 排除被整体删除（须立即跨仓"
+            "确认），要么本例的 AST 探测器失效；两种都不许把下面的 not-in 读成「缺口仍在」"
+        )
+
+        # 主断言：缺口刻画——门判之前不施 physio 排除 ⇒ 硬门/软门两条路径都吃不到 D7。
+        hoisted = prelude_names & _PHYSIO_FILTER_NAMES
+        assert not hoisted, (
+            f"ignite 的 `if gate_fusion:` **之前**出现了 {sorted(hoisted)}——Zero 的收口方案"
+            "（前缀过滤提到门判前、对硬门/软门/门开三条路径同施）已落地，D7 覆盖缺口被堵上"
+            "（好事）。请更新本例文案、撤下软门旁路风险提示，并复核跨仓台账对应条目后再放行。"
+        )
+
+        # ── 副锚点：过滤下沉进 _select_fired 也是一条真实修法，不能只守主锚点 ──────
         select_fired = _extract_function_body(source, "_select_fired")
         if select_fired is None:
             pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
@@ -1391,17 +1922,25 @@ class TestIgnitionGateReachabilityCrosscheck:
         )
 
     def test_gate_branch_guard_goes_red_on_structural_relocation(self) -> None:
-        """判别性自证：门开分支结构守卫对三种「真会发生的改法」都能红，不是恒绿。
+        """判别性自证①：门开分支**结构** pin 六态——真会发生的改法必红、合法等价形态不误红。
 
-        「绿灯必须先证明它能红」同族第 ⑦ 例。上一版按 `partition("return ")` 切分支，
-        实测对「真分支不再 return」**绿**——切点会落到函数末尾那个 return 上，把改动
-        整个跳过去。改用缩进切块 + 显式断言真分支以 return 收尾后，三态全红：
+        「绿灯必须先证明它能红」同族第 ⑦ 例，两次修订都是被真事件推着走的：
+        1. 最初按 `partition("return ")` 切分支 → 对「真分支不再 return」实测**绿**（切点落到
+           函数**末尾**那个 return 上，把改动整个跳过），改缩进切块 + 显式 return 断言后转红；
+        2. 2026-07-29 缩进切块被 Zero 新写的 docstring 撞出**假红**——其 `ignite` docstring
+           散文里写了「把前缀过滤提到 `if gate_fusion:` 之前」，`body.find(header)` 首次命中
+           落到这句散文上、按散文行长算缩进 ⇒ 块体为空。改 AST 后消除。
+           ⚠ 上一版自证用的合成源码是**裸函数、无 docstring 无 `#` 注释**，所以对第 2 类 bug
+           在结构上就不可能报警——它绿、真守卫红，正是这个差。故 (1) 态专喂「docstring 与
+           `#` 注释同时含 header 和 `_select_fired`」的源码。
 
-        (1) fallback 被挪进门开分支 → 门开分支出现 `_select_fired` → 红；
-        (2) 真分支去掉提前 return（落穿，两条路径同时执行）→ 末句非 return → 红；
-        (3) `if gate_fusion:` 二分被拆掉 → 无二分 → 红。
+        六态期望（判据返回**红的原因串**而非 bool：只有原因串才分得清「红对了」与「红在别的
+        原因上」）：(0) 现行形态 绿 /(1) docstring+注释污染 绿 /(2) fallback 挪进门开 红 /
+        (3) 真分支去掉提前 return 红 /(4) gate 二分被拆 红 /(5) if/else 等价形态 绿。
 
-        不依赖 `D:\\Zero` 在位（用合成源码），判别力常年在测。
+        主体不依赖 `D:\\Zero` 在位（用合成源码），判别力常年在测；末尾附一格「Zero 真源码
+        在位时应绿」——合成源码只能证明**判据函数**有判别力，不能证明**守卫对真源码**没瞎，
+        今天这个 bug 的全部差距就在这两者之间。
         """
         base = (
             "def ignite(streams, *, threshold=0.18, gate_fusion=True):\n"
@@ -1417,27 +1956,43 @@ class TestIgnitionGateReachabilityCrosscheck:
         )
 
         def evaluate(source: str) -> str:
-            """复刻主守卫的判定，返回 '绿' 或红的原因（与主例逻辑一一对应）。"""
-            body = _extract_function_body(source, "ignite")
-            if body is None or "if gate_fusion:" not in body:
-                return "红:无 gate 二分"
-            split = _split_if_block(body, "if gate_fusion:")
+            """复刻主守卫 ①段的判定，返回 '绿' 或红的原因（与主例逻辑一一对应）。"""
+            func = _top_level_func(source, "ignite")
+            if func is None:
+                return "红:无顶层 ignite"
+            split = _split_ignite_on_gate(func)
             if split is None:
-                return "红:切分失败"
-            closed, opened = split
-            if not (closed.strip() and opened.strip()):
+                return "红:无 gate 二分"
+            _prelude, gate_if, tail = split
+            closed = list(gate_if.body)
+            opened = [*gate_if.orelse, *tail]
+            if not (closed and opened):
                 return "红:切分有效性"
-            if "_select_fired" not in closed:
+            if "_select_fired" not in _referenced_names(closed):
                 return "红:门关分支无 _select_fired"
-            statements = [ln.strip() for ln in closed.split("\n") if ln.strip()]
-            if not (statements and statements[-1].startswith("return ")):
-                return "红:真分支未提前 return"
-            if "_select_fired" in opened:
+            if not gate_if.orelse and not isinstance(closed[-1], ast.Return):
+                return "红:真分支未提前 return(会落穿)"
+            if "_select_fired" in _referenced_names(opened):
                 return "红:门开分支出现 _select_fired"
             return "绿"
 
         assert evaluate(base) == "绿", "现行形态应绿——否则守卫对 Zero 当前源码就是假阳性"
 
+        # (1) docstring 与 `#` 注释同时含 header 和 _select_fired ——**今天那条假红的复现件**。
+        # AST 里没有注释、docstring 是可识别的独立节点，两类污染都不该改变判定。
+        polluted = base.replace(
+            "    scored = _score_streams(streams)\n",
+            "    '''收口条件：把前缀过滤提到 `if gate_fusion:` 之前，\n"
+            "    届时 _select_fired 的语义随之变化。'''\n"
+            "    # 备注：`if gate_fusion:` 之前不得调用 _select_fired\n"
+            "    scored = _score_streams(streams)\n",
+        )
+        assert evaluate(polluted) == "绿", (
+            "docstring / `#` 注释里出现 header 与 _select_fired 时守卫必须仍绿——"
+            "2026-07-29 的假红正是这一格（文本切法在此实测为「红:切分有效性」）"
+        )
+
+        # (2) fallback 被挪回数值通路
         relocated = base.replace(
             "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]",
             "    fusion = _select_fired(scored, threshold=threshold)",
@@ -1446,15 +2001,202 @@ class TestIgnitionGateReachabilityCrosscheck:
             "fallback 被挪进门开分支时守卫必须红——这正是本仓结论赖以成立的那条结构前提"
         )
 
+        # (3) 真分支去掉提前 return（落穿，两条路径同时执行）
         fallthrough = base.replace(
             "        return [(mu, prec) for _, mu, prec in selected]", "        pass"
         )
-        assert evaluate(fallthrough) == "红:真分支未提前 return", (
-            "真分支落穿时守卫必须红——上一版按 return 切分在此**实测为绿**，是真盲点"
+        assert evaluate(fallthrough) == "红:真分支未提前 return(会落穿)", (
+            "真分支落穿时守卫必须红——最初按 return 切分在此**实测为绿**，是真盲点"
         )
 
+        # (4) `if gate_fusion:` 二分被拆掉
         no_gate = base.replace("    if gate_fusion:", "    if True:")
         assert evaluate(no_gate) == "红:无 gate 二分", "二分被拆掉时守卫必须红"
+
+        # (5) 改写成 if/else 等价形态——**合法等价，不该红**。落穿检查在此不执行是正确的
+        # （有 else 时结构上不可能落穿），不是漏洞；这一格就是用来锁住那条条件式断言的边界。
+        else_form = (
+            "def ignite(streams, *, threshold=0.18, gate_fusion=True):\n"
+            "    scored = _score_streams(streams)\n"
+            "    if gate_fusion:\n"
+            "        selected = _select_fired(scored, threshold=threshold)\n"
+            "        return [(mu, prec) for _, mu, prec in selected]\n"
+            "    else:\n"
+            "        fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
+            "        if exclude_physio_fusion:\n"
+            "            fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
+            "        return fusion\n"
+        )
+        assert evaluate(else_form) == "绿", "if/else 等价形态不该红（否则 Zero 一重构就噪声红）"
+
+        # 附加格：Zero 真源码在位时判据须为绿。合成源码只证明判据有判别力，不证明守卫对
+        # 真源码没瞎——今天这个 bug 的差距就在这里。Zero 不在位则跳过这一格（不拖红）。
+        if _zero_available() and _ZERO_AFFECT_MATH_PY.is_file():
+            verdict = evaluate(_ZERO_AFFECT_MATH_PY.read_text(encoding="utf-8"))
+            assert verdict == "绿", f"判据对 Zero 真源码判为 {verdict}——与主守卫结论必须一致"
+
+    def test_prelude_physio_guard_discriminates(self) -> None:
+        """判别性自证②：软门旁路缺口守卫（锚在 ignite 门判**之前**）十一态。
+
+        这条守卫的断言方向是「**没有**才绿」，天生比「有才绿」脆——全部可信度压在两道正控
+        （切分非退化 / 探测器位置无关可见）上。故十一态必须全跑，且判据返回**原因串**：
+        第一版把正控写成「门开分支里必须含 `_PHYSIO_PREFIXES`」时矩阵仍然「全红」看似通过，
+        但 Zero 的真修法是**移动**过滤（门开那份会被删）⇒ ② 落地当天会先红在
+        「D7 被删」这条**归因错误**的消息上。bool 判据放过了它，原因串判据才抓到。
+
+        十一态期望：
+        (0) 现行形态 绿 /(1) docstring 散文含两 token 绿 /(2) `#` 注释含两 token 绿 /
+        (3) if/else 形态 绿 /(4) Zero 的真修法·过滤移到门判前 红 /(5) 提到门判前但门开那份
+        也留着（复制）红 /(6) 提到门判前·helper 显式收 flag 红 /(7) 提到门判前·**不透明**
+        helper **绿（已知守不住，如实记账）** /(8) gate 二分被拆 红 /(9) ignite 改名/消失 红
+        /(10) D7 排除被整体删除 红。
+
+        (7) 是本守卫公开承认的盲点：Zero 若写 `streams = _drop_physio(streams)`（开关从模块级
+        读、不作实参传），`prelude` 里既无 `_PHYSIO_PREFIXES` 也无 `exclude_physio_fusion`。
+        缓解靠 Zero 的「落地即 ping」承诺，不靠本守卫独担。
+        """
+        base = (
+            "def ignite(streams, *, gate_fusion=True, exclude_physio_fusion=True):\n"
+            "    scored = _score_streams(streams)\n"
+            "    if gate_fusion:\n"
+            "        selected = _select_fired(scored)\n"
+            "        return [(mu, prec) for _, mu, prec in selected]\n"
+            "\n"
+            "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
+            "    if exclude_physio_fusion:\n"
+            "        fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
+            "    return fusion\n"
+        )
+
+        def evaluate(source: str) -> str:
+            """复刻主守卫的主锚点判定，返回 '绿' 或红的原因（与主例逻辑一一对应）。"""
+            func = _top_level_func(source, "ignite")
+            if func is None:
+                return "红:无顶层 ignite"
+            split = _split_ignite_on_gate(func)
+            if split is None:
+                return "红:无 gate 二分"
+            prelude, gate_if, tail = split
+            if not prelude:
+                return "红:门判前无语句(切分退化)"
+            names = _referenced_names(prelude)
+            if "_score_streams" not in names:
+                return "红:门判前不含 _score_streams(切分锚点可疑)"
+            if "_PHYSIO_PREFIXES" not in _referenced_names([*prelude, gate_if, *tail]):
+                return "红:ignite 体内已无 _PHYSIO_PREFIXES(D7 被删或探测器失效)"
+            hoisted = names & _PHYSIO_FILTER_NAMES
+            if hoisted:
+                return f"红:门判前已施排除{sorted(hoisted)}"
+            return "绿"
+
+        assert evaluate(base) == "绿", "现行形态应绿——否则守卫对 Zero 当前源码就是假阳性"
+
+        # (1)(2) 两类污染：docstring 散文 / `#` 注释里出现两个 token，都不该改变判定
+        doc_polluted = base.replace(
+            "    scored = _score_streams(streams)\n",
+            "    '''收口条件：把 _PHYSIO_PREFIXES 过滤提到 `if gate_fusion:` 之前，\n"
+            "    即 exclude_physio_fusion 对三条路径同施。'''\n"
+            "    scored = _score_streams(streams)\n",
+        )
+        assert evaluate(doc_polluted) == "绿", "docstring 散文含两 token 时守卫必须仍绿"
+        comment_polluted = base.replace(
+            "    scored = _score_streams(streams)\n",
+            "    # TODO: 把 _PHYSIO_PREFIXES 过滤提到 `if gate_fusion:` 之前\n"
+            "    # （届时 exclude_physio_fusion 对硬门/软门/门开三条路径同施）\n"
+            "    scored = _score_streams(streams)\n",
+        )
+        assert evaluate(comment_polluted) == "绿", "`#` 注释含两 token 时守卫必须仍绿"
+
+        # (3) if/else 等价形态（门开分支落在 orelse 里而非同级 tail）
+        else_form = (
+            "def ignite(streams, *, gate_fusion=True, exclude_physio_fusion=True):\n"
+            "    scored = _score_streams(streams)\n"
+            "    if gate_fusion:\n"
+            "        selected = _select_fired(scored)\n"
+            "        return [(mu, prec) for _, mu, prec in selected]\n"
+            "    else:\n"
+            "        fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
+            "        if exclude_physio_fusion:\n"
+            "            fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
+            "        return fusion\n"
+        )
+        assert evaluate(else_form) == "绿", "if/else 等价形态不该红"
+
+        # (4) Zero 的**真修法**：过滤整体移到门判前（门开那份随之删除）
+        hoist_prefix = (
+            "    if exclude_physio_fusion:\n"
+            "        scored = [t for t in scored if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
+        )
+        moved = base.replace(
+            "    if gate_fusion:\n", hoist_prefix + "    if gate_fusion:\n"
+        ).replace(
+            "    if exclude_physio_fusion:\n"
+            "        fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n",
+            "",
+        )
+        assert (
+            evaluate(moved) == "红:门判前已施排除['_PHYSIO_PREFIXES', 'exclude_physio_fusion']"
+        ), (
+            "Zero 的收口方案（过滤提到门判前）落地时守卫必须红，且必须红在「门判前已施排除」"
+            "这条消息上——红在「D7 被删」上属**归因错误**，会把好事读成坏事"
+        )
+
+        # (5) 提到门判前但门开那份也留着（复制而非移动）
+        copied = base.replace("    if gate_fusion:\n", hoist_prefix + "    if gate_fusion:\n")
+        assert (
+            evaluate(copied) == "红:门判前已施排除['_PHYSIO_PREFIXES', 'exclude_physio_fusion']"
+        ), "复制式收口同样必须红"
+
+        # (6) 提到门判前 + 抽 helper，但**显式把开关作实参传**——靠开关名接住。
+        # `_PHYSIO_PREFIXES` 退到 D12 报错文案里仍可见，故正控不误报「D7 被删」。
+        helper_with_flag = (
+            "def ignite(streams, *, gate_fusion=True, exclude_physio_fusion=True):\n"
+            "    scored = _score_streams(streams)\n"
+            "    scored = _drop_physio(scored, enabled=exclude_physio_fusion)\n"
+            "    if gate_fusion:\n"
+            "        selected = _select_fired(scored)\n"
+            "        return [(mu, prec) for _, mu, prec in selected]\n"
+            "\n"
+            "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
+            "    if streams and not fusion:\n"
+            "        raise ValueError(f'全部命中 physio 排除前缀 {_PHYSIO_PREFIXES}')\n"
+            "    return fusion\n"
+        )
+        assert evaluate(helper_with_flag) == "红:门判前已施排除['exclude_physio_fusion']", (
+            "helper 显式收 flag 时靠开关名接住——红的原因应只列开关名，不含前缀表"
+        )
+
+        # (7) **已知守不住**：不透明 helper，开关从模块级读、不作实参传 → 判据看不见。
+        # 这一格期望**绿**，是如实记账不是放行；缓解靠 Zero 的落地即 ping 承诺。
+        opaque_helper = helper_with_flag.replace(
+            "    scored = _drop_physio(scored, enabled=exclude_physio_fusion)\n",
+            "    scored = _drop_physio(scored)\n",
+        )
+        assert evaluate(opaque_helper) == "绿", (
+            "不透明 helper 是本守卫**已知的**盲点（docstring 已如实标注）；这一格期望绿——"
+            "它若哪天变红说明判据被改宽了口径，须回头核对是不是引入了误报"
+        )
+
+        # (8)(9)(10) 三种「锚点/被观测量整体消失」的形态，都必须红而不是 skip
+        no_gate = base.replace("    if gate_fusion:", "    if True:")
+        assert evaluate(no_gate) == "红:无 gate 二分", "二分被拆掉时守卫必须红"
+        renamed = base.replace("def ignite(", "def ignite_v2(")
+        assert evaluate(renamed) == "红:无顶层 ignite", (
+            "ignite 改名/消失时走**红**而非 skip——与本仓 conftest 的 STRICT 覆盖归零守卫同向"
+        )
+        d7_removed = base.replace(
+            "    if exclude_physio_fusion:\n"
+            "        fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n",
+            "",
+        )
+        assert evaluate(d7_removed) == "红:ignite 体内已无 _PHYSIO_PREFIXES(D7 被删或探测器失效)", (
+            "D7 排除被整体删除时守卫必须红——这条正控同时兜住「探测器自己瞎了」的情形"
+        )
+
+        # 附加格：Zero 真源码在位时判据须为绿（合成源码证明不了守卫对真源码没瞎）
+        if _zero_available() and _ZERO_AFFECT_MATH_PY.is_file():
+            verdict = evaluate(_ZERO_AFFECT_MATH_PY.read_text(encoding="utf-8"))
+            assert verdict == "绿", f"判据对 Zero 真源码判为 {verdict}——与主守卫结论必须一致"
 
     def test_survival_floor_guard_goes_red_not_skip_on_confirmed_change(self) -> None:
         """判别性自证：对 Zero 已确认必改的去地板形态，上例走**红**（断言失败）而非 skip。
@@ -1678,9 +2420,13 @@ _ZERO_VALUE_PY = _ZERO_SRC / "agents" / "value.py"
 _ZERO_MAPPING_PY = _ZERO_SRC / "mcp_server" / "mapping.py"
 
 # 快照值（2026-07-25 现场核验）
-_PINNED_TD_LR = 0.2  # affect_math.py:138 —— 直接缩放 ΔV=lr·δ；闭式复算红线 lr≲0.057 转红
-_PINNED_TD_NEXT_VALUE = 0.0  # affect_math.py:139 —— 恒 0 使 gamma 项消失（gamma 对本仓是死系数）
-_PINNED_MCP_STIMULUS_KEY = "mcp-step"  # mapping.py:27 —— 情境键，跨轮同键才累积 V(s)
+# Zero `src/agents/affect_math.py::td_update` 的 lr 形参默认；直接缩放 ΔV=lr·δ；
+# 闭式复算红线 lr≲0.057 转红
+_PINNED_TD_LR = 0.2
+# 同上 next_value 形参默认；恒 0 使 gamma 项消失（gamma 对本仓路径是死系数）
+_PINNED_TD_NEXT_VALUE = 0.0
+# Zero `src/mcp_server/mapping.py::stimulus_from_payload` 的 name 形参默认；跨轮同键才累积 V(s)
+_PINNED_MCP_STIMULUS_KEY = "mcp-step"
 
 # `def td_update(...)` 的形参默认值（形参各占一行，容忍空白/尾随逗号）
 _TD_KWARG_RE_TEMPLATE = r"^\s*{name}\s*:\s*float\s*=\s*([-\d.eE+]+)\s*,?\s*$"

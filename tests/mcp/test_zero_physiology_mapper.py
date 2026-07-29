@@ -13,18 +13,25 @@ skin_conductance 是 μS 物理单位（归一上界 skin_conductance_max_us，�
   6. 心率透传：heart_rate_bpm 原样透传；负值 clamp 0。
   7. 配置校验：cardio_respiratory_ratio / skin_conductance_max_us ≤0 → ValueError。
   8. PhysiologyParams 模型：frozen、extra=forbid、字段范围、temp/pupil 可空。
+  8.6 口径失配 warn（W6·D-5(a)）：形状 × 标度设定四格 + 判不出的盲区 + 实例级去重；只观测不改数值。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from src.agents.models.zero_affect import ExpressionHead
 from src.mcp.zero.expression_sink import PhysiologyMapper
-from src.mcp.zero.mappers.physiology import LinearPhysiologyMapper, PhysiologyParams
+from src.mcp.zero.mappers.physiology import (
+    _SCALE_MISMATCH_MARKER,
+    LinearPhysiologyMapper,
+    PhysiologyParams,
+)
 
 # ---------------------------------------------------------------------------
 # 辅助构造函数
@@ -454,6 +461,132 @@ class TestLegacyScaleConsumptionGap:
         )
         result = await LinearPhysiologyMapper().map(head)
         assert result.skin_conductance_level == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# 8.6 口径失配 warn（D-5(a)·Zero 2026-07-29 回执，零回归观测）
+#
+# 8.5 锁的是「失配时数值会错成什么样」；本节锁「失配时会不会出声」。warn **只观测不改数值**——
+# 8.5 那三条数值锁原样通过，就是本改动零回归的看门狗（本节也各自复述一遍同值）。
+#
+# 判别力四格（形状 × 标度设定，逐格实证）：
+#   legacy   形状 + 默认 20μS 上界 → 发（欠标度 20×）
+#   legacy   形状 + max_us=1.0     → 不发（标度正确）
+#   canonical形状 + 默认 20μS 上界 → 不发（生产默认路径 = 零回归主证）
+#   canonical形状 + max_us=1.0     → 发（反方向的过标度）
+# 每条「不发」都先跑正控证明同一 caplog 会话里该 warn 确实可见（防 pitfalls ⑥ 恒真式）。
+# ---------------------------------------------------------------------------
+
+_MAPPER_LOGGER = "src.mcp.zero.mappers.physiology"
+
+_LEGACY_PHYSIOLOGY: dict[str, float] = {
+    "heart_rate_bpm": 80.0,
+    "skin_conductance": 1.0,  # [0,1] 口径的最大值
+    "pupil_mm": 4.0,
+}
+_CANONICAL_PHYSIOLOGY: dict[str, float] = {
+    "heart_rate_bpm": 80.0,
+    "skin_conductance": 10.0,  # μS
+    "temperature_c": 35.0,
+}
+
+
+def _mismatch_warnings(caplog: Any) -> list[str]:
+    """只挑「口径失配」那一类 WARNING 的消息文本。
+
+    同模块另有「归一范围退化」warning：若按「有没有 WARNING」断言，用例会被别的原因染绿/染红
+    （本仓教训：红必须红在正确的原因上）。故按产品侧的稳定前缀常量筛。
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and _SCALE_MISMATCH_MARKER in record.getMessage()
+    ]
+
+
+class TestScaleMismatchWarning:
+    """口径失配观测 warn（W6·D-5(a)）：出声与否的四格 + 实例级去重，数值一律不动。"""
+
+    async def test_legacy_shape_with_default_mapper_warns(self, caplog: Any) -> None:
+        """legacy 形状（无 temp、有 pupil）+ 默认 μS 上界 = 20× 欠标度 → 必须出声。"""
+        head = _make_expression_head(dict(_LEGACY_PHYSIOLOGY))
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            result = await LinearPhysiologyMapper().map(head)
+        messages = _mismatch_warnings(caplog)
+        assert len(messages) == 1, f"应恰有一条口径失配 warn，实际日志：{caplog.text!r}"
+        assert "legacy" in messages[0], f"归因须指向 legacy 口径，实际：{messages[0]!r}"
+        assert "欠标度" in messages[0] and "20" in messages[0]
+        # 零回归：warn 不动数值（与 8.5 的数值锁同值）
+        assert result.skin_conductance_level == pytest.approx(0.05)
+
+    async def test_legacy_shape_with_unit_max_is_silent(self, caplog: Any) -> None:
+        """legacy 形状配 max_us=1.0（标度正确）→ 不出声。
+
+        先跑正控（同一夹具经默认 mapper 必出声）再断言静默——否则「无 warn」可能只是因为被观测量
+        根本不可见，断言退化成恒真式。
+        """
+        head = _make_expression_head(dict(_LEGACY_PHYSIOLOGY))
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            await LinearPhysiologyMapper().map(head)
+            assert _mismatch_warnings(caplog), "正控失败：本夹具下 warn 不可见，静默断言将是恒真式"
+            caplog.clear()
+            result = await LinearPhysiologyMapper(skin_conductance_max_us=1.0).map(head)
+        assert _mismatch_warnings(caplog) == []
+        assert result.skin_conductance_level == pytest.approx(1.0)
+
+    async def test_canonical_shape_with_default_mapper_is_silent(self, caplog: Any) -> None:
+        """**零回归主证**：生产默认路径（canonical 形状 + 默认 mapper）绝不出声。"""
+        head = _make_expression_head(dict(_CANONICAL_PHYSIOLOGY))
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            # 正控：同一 canonical 夹具换 max_us=1.0 会出声 ⇒ 观测通道确实通
+            await LinearPhysiologyMapper(skin_conductance_max_us=1.0).map(head)
+            assert _mismatch_warnings(caplog), "正控失败：本夹具下 warn 不可见，静默断言将是恒真式"
+            caplog.clear()
+            result = await LinearPhysiologyMapper().map(head)
+        assert _mismatch_warnings(caplog) == []
+        assert result.skin_conductance_level == pytest.approx(0.5)
+
+    async def test_canonical_shape_with_unit_max_warns_overscale(self, caplog: Any) -> None:
+        """反方向：canonical（μS）误配 max_us=1.0 → 过标度，同样出声。"""
+        head = _make_expression_head(dict(_CANONICAL_PHYSIOLOGY))
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            result = await LinearPhysiologyMapper(skin_conductance_max_us=1.0).map(head)
+        messages = _mismatch_warnings(caplog)
+        assert len(messages) == 1, f"应恰有一条口径失配 warn，实际日志：{caplog.text!r}"
+        assert "canonical" in messages[0] and "过标度" in messages[0], (
+            f"归因须指向 canonical 过标度，实际：{messages[0]!r}"
+        )
+        assert result.skin_conductance_level == pytest.approx(1.0)  # 10μS/1.0 后 clamp
+
+    async def test_ambiguous_shape_is_silent_by_design(self, caplog: Any) -> None:
+        """两个可选键都缺 → 判不出口径，静默放行（不猜、不误报）——启发式的**已知盲区**。
+
+        ⚠ 这一格同时是 Zero §4.4-4 动键集的风险面：若 temperature_c/pupil_mm 被删，所有来源都落
+        进这个分支，warn 静默消失而欠标度依旧。故回执里绝不能把本 warn 写成「20× 欠标度已解决」。
+        """
+        ambiguous = _make_expression_head({"heart_rate_bpm": 80.0, "skin_conductance": 1.0})
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            await LinearPhysiologyMapper().map(_make_expression_head(dict(_LEGACY_PHYSIOLOGY)))
+            assert _mismatch_warnings(caplog), "正控失败：本用例的静默断言将是恒真式"
+            caplog.clear()
+            result = await LinearPhysiologyMapper().map(ambiguous)
+        assert _mismatch_warnings(caplog) == []
+        assert result.skin_conductance_level == pytest.approx(0.05)  # 盲区里欠标度照旧发生
+
+    async def test_warn_deduplicated_per_instance_not_globally(self, caplog: Any) -> None:
+        """同实例连发只出声一次（防逐帧刷屏）；换实例重新出声（去重是实例级、非模块级）。
+
+        模块级去重会让用例顺序相关——先跑的吃掉 warning，后跑的假绿。
+        """
+        head = _make_expression_head(dict(_LEGACY_PHYSIOLOGY))
+        mapper = LinearPhysiologyMapper()
+        with caplog.at_level(logging.WARNING, logger=_MAPPER_LOGGER):
+            await mapper.map(head)
+            await mapper.map(head)
+            assert len(_mismatch_warnings(caplog)) == 1, "同一实例第二次 map 不应重复出声"
+            await LinearPhysiologyMapper().map(head)
+        assert len(_mismatch_warnings(caplog)) == 2, "新实例须重新出声（否则去重是模块级的）"
+        assert mapper.scale_mismatch_warned is True
 
 
 # ---------------------------------------------------------------------------

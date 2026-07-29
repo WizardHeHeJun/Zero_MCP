@@ -11,8 +11,13 @@ server 启动方式对齐 Zero 回执（`notes/2026-07-16-zero-answers-client-re
 
 覆盖（单会话一趟跑完，避免重复起 server 子进程）：
 open → step(裸) → step(带 external_priors 含 physio 流) → step(带 coping) → 同会话跨轮累积
-→ 未知 session（server ToolError→isError→ZeroLinkCallError）→ graceful_step 降级 None
-→ close → close 后 step 失败。
+→ 未知 session（server ToolError→isError→ZeroLinkUnknownSessionError + wire 加壳/令牌实证）
+→ graceful_step resume 重试成功 → close → close 后 step 失败。
+
+⚠ **wire 形态**：FastMCP 在工具层把 ToolError 包成 "Error executing tool <name>: <原文>"，
+故 e2e 里对错误文本的任何断言都必须按**加壳后**的样子写；单测夹具同理（见
+`tests/mcp/test_zero_client.py::_wire`）。旧口径按未加壳原文断言，正是让「裸前缀判定」这条
+生产死码长期假绿的原因。
 """
 
 from __future__ import annotations
@@ -35,9 +40,12 @@ from src.agents.models.zero_affect import (
     ModalityPrior,
 )
 from src.mcp.zero.client import (
+    ZERO_ERROR_CODE_UNKNOWN_SESSION,
     ZeroLinkCallError,
     ZeroLinkClient,
     ZeroLinkConnectionError,
+    ZeroLinkUnknownSessionError,
+    classify_zero_error,
     generate_session_id,
 )
 from src.mcp.zero.mappers import LinearPhysiologyMapper, LinearProsodyMapper, ProsodyParams
@@ -148,11 +156,19 @@ async def _assert_readout_deterministic(va_reference: tuple[float, float]) -> No
     """确定性 canary：同 `_RESUME_CONFIG` 再跑一次全新 1 步，应与 `va_reference` **逐字一致**。
 
     分离两种失败：**读出非确定** vs **resume 失效**。`affect_readout="map"` 是 `SessionConfig`
-    字段，经 `open_session(config=)` 传入；Zero `server.py:97-104` 对**未命中允许键的 override
-    静默丢弃、零日志**（非门控字段也走同一过滤器），一旦键名/白名单漂移就回落默认 `"sample"` +
-    `rng_seed=None`（`runner.py:49-51`）→ 每步新建 `random.Random()` 采样，噪声 σ≈O(0.1) 远大于
-    `_RESUME_TRANSPARENCY_TOL`。彼时下方 transparency 断言会以「运行态未跨重启恢复（sqlite/
-    resume-by-id 失效？）」的文案报红，把排障整轮带偏——故先用本 canary 报出真正的病因。
+    字段，经 `open_session(config=)` 传入；Zero `src/mcp_server/server.py::_build_session_config`
+    对 override 做**两条**过滤，未通过者**静默丢弃、零日志**：
+      (a) 键须在 `SessionConfig.model_fields` 内——拼错/改名的键直接蒸发；
+      (b) 键须**不在** `_MCP_GOVERNANCE_GATED_FLAGS` 内——该 frozenset 里的字段
+          （coping_potential_enabled / text_coping_enabled / fear_domain_enabled /
+          precision_commensurable / gate_fusion / exclude_physio_fusion …）只受
+          `ZERO_MCP_*` env 治理，client 经 config 传同名键一律忽略（防「生产关·MCP 开」旁路）。
+    `affect_readout` 走的是 (a) 这条：它不在门控集内，所以只要 Zero 侧字段名漂移，
+    本用例的 override 就会静默丢失、回落默认 `"sample"` + `rng_seed=None`
+    （Zero `src/orchestration/runner.py::SessionConfig.rng_seed` 默认 None）→ 每步新建
+    `random.Random()` 采样，噪声 σ≈O(0.1) 远大于 `_RESUME_TRANSPARENCY_TOL`。
+    彼时下方 transparency 断言会以「运行态未跨重启恢复（sqlite/resume-by-id 失效？）」
+    的文案报红，把排障整轮带偏——故先用本 canary 报出真正的病因。
     """
     va_again = await _run_strong_steps(1)
     assert _va_maxdiff(va_again, va_reference) < _RESUME_TRANSPARENCY_TOL, (
@@ -236,19 +252,38 @@ class TestZeroClientE2E:
             bundle4 = await client.step(sid, AffectStimulus(valence=0.2, arousal=0.1))
             assert len(bundle4.valence_arousal) == 2
 
-            # 6. 未知 session_id → server ToolError → ZeroLinkCallError（tool 字段正确）
-            # 注：Zero server T6·② 接线后 step 会返回带 `unknown-session:` 机读前缀的 ToolError，
-            # 本仓据此抛 ZeroLinkUnknownSessionError（ZeroLinkCallError 子类）——故此断言对新旧 Zero
-            # 均成立。待 Zero 侧提交该接线后，可收窄为 pytest.raises(ZeroLinkUnknownSessionError)。
-            with pytest.raises(ZeroLinkCallError) as exc_info:
+            # 6. 未知 session_id → server ToolError → ZeroLinkUnknownSessionError（机读令牌命中）。
+            # 【live 死码复现 + 修复实证】本条同时钉三件事，缺一就退化成摆设：
+            #   ① FastMCP 确实把 ToolError 加壳成 "Error executing tool <name>: …"
+            #      ⇒ **wire 文本永远带外壳**，这是本仓夹具必须加壳的现场依据；
+            #   ② 旧判据 `text.lstrip().startswith("unknown-session")` 在真 wire 上 **False**
+            #      ⇒ 复现「T6·④ resume 通路是生产死码」；
+            #   ③ 新判据（位置无关令牌）提取到 unknown-session ⇒ 修复生效。
+            with pytest.raises(ZeroLinkUnknownSessionError) as exc_info:
                 await client.step("bogus-sid-xyz", AffectStimulus(valence=0.0, arousal=0.0))
             assert exc_info.value.tool == "zero.step"
+            wire_text = str(exc_info.value).removeprefix("[zero.step] ")
+            assert wire_text.startswith("Error executing tool zero.step: "), (  # ①
+                f"FastMCP 加壳形态变了，本仓夹具口径须重核：{wire_text!r}"
+            )
+            assert wire_text.lstrip().startswith("unknown-session") is False, (  # ②
+                "旧裸前缀判据在真 wire 上竟然成立——说明加壳没发生，本条失去判别力，请重核"
+            )
+            assert classify_zero_error(wire_text) == ZERO_ERROR_CODE_UNKNOWN_SESSION  # ③
 
-            # 7. graceful_step 未知 session → None（优雅降级）
-            degraded = await client.graceful_step(
+            # 7. graceful_step 未知 session → **resume 重开续会话并重试成功** → 返回 bundle。
+            # ⚠ 本轮修复**改变了此处的 live 行为**：修复前判据恒 False，unknown-session 走不到
+            # resume 分支、被通用分支静默降级成 None；修复后 T6·④ 通路真通了——Zero
+            # `open_session(session_id=…)` 对未知 id 会新建绑该 thread_id（见其 resume 语义），
+            # 故重试的 step 成功。断言「非 None」正是死码复活的 live 证据。
+            resumed = await client.graceful_step(
                 "bogus-sid-xyz", AffectStimulus(valence=0.0, arousal=0.0)
             )
-            assert degraded is None
+            assert resumed is not None, (
+                "graceful_step 未走 resume 重试通路（修复前的死码症状：恒降级 None）"
+            )
+            assert isinstance(resumed, ExpressionBundle)
+            await client.close_session("bogus-sid-xyz")  # 清掉 resume 建出的会话
 
             # 8. close_session → 无错
             await client.close_session(sid)
@@ -682,8 +717,10 @@ class TestZeroClientResumeAcrossRestart:
     ) -> None:
         """负对照：`memory` 后端下同 id 重开 = **全新会话**（不报错但不恢复态）。
 
-        锁定 Zero `server.py:219` 语义「memory 后端重开=全新会话」，并证明上面 sqlite 用例的状态
-        连续性是**后端特有**（非 resume-by-id 本身平凡成立）——判别性负对照。
+        锁定 Zero `src/mcp_server/server.py::build_server` 内 `open_session` 工具的语义：
+        「`ZERO_CHECKPOINT_BACKEND=sqlite` 才跨重启恢复；memory 后端重开=全新会话」，
+        并证明上面 sqlite 用例的状态连续性是**后端特有**（非 resume-by-id 本身平凡成立）
+        ——判别性负对照。
         """
         if not _ZERO_SERVER.is_file():
             pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}）")

@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import types
@@ -40,12 +41,61 @@ from src.mcp.zero.external_priors import build_external_priors_override
 
 logger = logging.getLogger(__name__)
 
-# Zero 侧 unknown-session **机读标记**（zero-link T6·②）：与 Zero server
-# `src/mcp_server/server.py::_UNKNOWN_SESSION_MARKER` 逐字对齐。step 命中未知/过期 session_id
-# 时，Zero 抛的 ToolError 文本以此前缀打头（`f"{_UNKNOWN_SESSION_MARKER}: 未知 session_id=…"`）。
-# 用机读前缀而非中文文本判定 → 抗 Zero 侧文案漂移（回执明言「靠字符串匹配脆弱」）；
-# 两仓须同步改本常量，漂移由 `tests/mcp/test_zero_contract_crosscheck.py` 跨仓回归拦截。
-_UNKNOWN_SESSION_MARKER = "unknown-session"
+# ── Zero 机读错误码（zero-link 跨仓契约·2026-07-29 换代）───────────────────────
+# Zero server 的 ToolError 文案带**位置不敏感**令牌 `[zero:<code>]`（ASCII kebab-case，
+# 全文恰出现一次，位置不限），由 `src/mcp_server/server.py::_tool_error(code, message)` 构造。
+#
+# 🛑 为什么必须位置无关、不能用位置 0 的裸前缀（旧实现的致命缺陷，2026-07-29 两侧实证）：
+#   FastMCP 在**工具层**统一加壳——`mcp/server/fastmcp/tools/base.py::Tool.run` 的
+#   `except Exception as e: raise ToolError(f"Error executing tool {self.name}: {e}")`
+#   （ToolError 继承 Exception，自己也被这一支重新包一层）。⇒ wire 上的真实文本是
+#     "Error executing tool zero.step: <Zero 原文>"
+#   本仓 stdio 直连 D:\Zero `src.mcp_server` 实测（mcp SDK 见 environment）：
+#     text = "Error executing tool zero.step: [zero:unknown-session] 未知 session_id='bogus-…'；…"
+#     text.lstrip().startswith("unknown-session")      -> False   ← 旧判据恒 False
+#     re.search(r"\[zero:([a-z][a-z0-9-]*)\]", text)   -> "unknown-session"
+#   故旧判定（`startswith(_UNKNOWN_SESSION_MARKER)`）对真 server **恒不命中**，
+#   T6·④ 的 resume 重试通路曾是**生产死码**；两侧旧单测都喂**未加壳**夹具，故长期假绿。
+#   → 本仓夹具一律改用**真 wire 形态**（带 "Error executing tool <name>: " 外壳），
+#     见 tests/mcp/test_zero_client.py::_wire 的注释。
+#
+# 码值按**符号名**与 Zero `src/mcp_server/server.py` 的 `ZERO_ERROR_CODE_*` 对齐；本仓仍持有
+# 自己的期望值与全表（不是「对方有什么就认什么」），跨仓漂移由
+# `tests/mcp/test_zero_contract_crosscheck.py::TestZeroErrorCodeCrosscheck` 拦截。
+ZERO_ERROR_CODE_UNKNOWN_SESSION = "unknown-session"
+ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE = "config-incompatible"
+ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID = "external-prior-invalid"
+ZERO_ERROR_CODE_PAYLOAD_INVALID = "payload-invalid"
+ZERO_ERROR_CODE_CONFIG_INVALID = "config-invalid"
+ZERO_ERROR_CODE_DEPLOY_ENV_INVALID = "deploy-env-invalid"
+
+ZERO_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        ZERO_ERROR_CODE_UNKNOWN_SESSION,
+        ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE,
+        ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID,
+        ZERO_ERROR_CODE_PAYLOAD_INVALID,
+        ZERO_ERROR_CODE_CONFIG_INVALID,
+        ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
+    }
+)
+
+# 消费方提取正则——**Zero 指定口径**，位置无关（`search` 非 `match`/`startswith`）。
+_ZERO_ERROR_TOKEN_RE = re.compile(r"\[zero:([a-z][a-z0-9-]*)\]")
+
+# 兼容别名：旧名保留、值不变（Zero 侧亦保留同名别名）。仅供跨仓守卫与历史调用点引用，
+# **产品判定不再用它做前缀匹配**——前缀匹配正是上面那条死码的成因。
+_UNKNOWN_SESSION_MARKER = ZERO_ERROR_CODE_UNKNOWN_SESSION
+
+# 🕒 **过渡兼容**：老部署（Zero < 2026-07-29 令牌换代）发的是**裸前缀**
+# `f"unknown-session: 未知 session_id=…"`，经 FastMCP 加壳后落在文案中部。无令牌时退回本正则：
+# 要求 `unknown-session:` 出现在**行首或空白之后**（加壳恰好留一个空格），比裸子串判别性强
+# ——"error: unknown-session happened" 这类无冒号的偶然子串不命中。
+# ⏳ **何时可撤**：确认所连 Zero 部署全部 ≥ 令牌换代提交（Zero `_tool_error` 上线，
+# 本仓 crosscheck 守卫已 pin 其全表）后，删本正则与 `classify_zero_error` 里的回退分支即可；
+# 届时 `test_legacy_bare_prefix_still_recognized` 一并删（它是本兼容层的**唯一**理由）。
+_LEGACY_UNKNOWN_SESSION_RE = re.compile(r"(?:^|\s)unknown-session:")
+
 
 # ── 自定义异常 ─────────────────────────────────────────────────────────────────
 
@@ -80,12 +130,69 @@ class ZeroLinkUnknownSessionError(ZeroLinkCallError):
     """step 命中 Zero 侧**未知/过期 session_id**（server 重启或会话已 close）。
 
     是 `ZeroLinkCallError` 子类（zero-link T6·②）：
-    - `graceful_step` 仍按既有分支降级返回 `None`（零回归），但日志显式区分为「可 resume 续会话」；
-    - 直接调 `step()` 的编排层可 **catch 本子类** → 用同 id `open_session(session_id=…)` 重开
-      续会话再重试（配合 Zero resume-by-id，T6·④），区别于连接失败/畸形响应（不可 resume）。
+    - `graceful_step` **可自愈**：用同 id `open_session(session_id=…)` 重开续会话后重试一次，
+      仍失败才降级 `None`（配合 Zero resume-by-id，T6·④）；
+    - 直接调 `step()` 的编排层可 **catch 本子类**走同样的 resume 逻辑，区别于连接失败/畸形响应
+      （不可 resume）。
 
-    判定走机读前缀 `_UNKNOWN_SESSION_MARKER`（非中文文本），抗 Zero 侧文案漂移。
+    判定走机读令牌 `[zero:unknown-session]`（位置无关），抗 Zero 侧文案漂移与 FastMCP 加壳。
     """
+
+
+class ZeroLinkNonDegradableError(ZeroLinkCallError):
+    """**不可静默降级**的一类调用错误——`graceful_step` 遇到它一律**上抛**而非返回 `None`。
+
+    分界线：错误是否**每轮必复现且 client 无法自愈**。
+    - 可降级（返回 `None`）：连接抖动、偶发协议错误、未分类的 server 错误——重试有意义，
+      非关键路径丢一帧无所谓。
+    - 不可降级（本类）：配置/传参/部署问题——静默 `None` 会让**每一轮**都悄悄丢一次 step，
+      且与「偶发抖动」在观测上不可区分（看板只见帧率下降，不见根因），排障成本极高。
+
+    子类见 `ZeroLinkConfigIncompatibleError` / `ZeroLinkCallerFaultError` /
+    `ZeroLinkDeployEnvError`。仍是 `ZeroLinkCallError` 子类 → 既有
+    `except ZeroLinkCallError` 的调用点行为不变（零回归）。
+    """
+
+
+class ZeroLinkConfigIncompatibleError(ZeroLinkNonDegradableError):
+    """Zero 内核执行失败，且**活跃会话的 config 不可变** → 必须**以新配置重开会话**。
+
+    对应 Zero `[zero:config-incompatible]`（其 step 的 `except ValueError` 分支）：
+    多为会话级配置组合不兼容，表现为 **open 成功、每 step 崩**——改传参无效、重试无效，
+    只有换 config 重开会话能好。故 `graceful_step` 不吞它（Zero §4.4-9 明确要求）。
+    """
+
+
+class ZeroLinkCallerFaultError(ZeroLinkNonDegradableError):
+    """**调用方**传参/配置不合法——改传参就能好，属本仓自己的 bug。
+
+    对应 Zero `[zero:payload-invalid]` / `[zero:external-prior-invalid]` /
+    `[zero:config-invalid]`。与既有「M3/M6 `ValueError` 不 graceful、须透传」同口径：
+    `build_external_priors_override` 的本地预校验与 Zero 侧判定若出现分歧
+    （本地放行、Zero 拒），那是**跨仓契约漂移**，必须炸出来而不是每轮静默丢帧。
+    """
+
+
+class ZeroLinkDeployEnvError(ZeroLinkNonDegradableError):
+    """**部署端** env 值不合法（Zero `[zero:deploy-env-invalid]`）——改 client 传参永远改不好。
+
+    Zero 刻意把它与 client-config 错误分码，正是为了不让 client 照着 config 瞎改。
+    ⚠ stdio 传输下 server 进程环境**就是**本进程环境（`_build_subprocess_env` 全量拷贝
+    `os.environ`），所以「部署端」很可能就是本机 `.env` —— 须抛给人看，不可静默降级。
+    """
+
+
+# 码 → 异常类。未登记的新码（Zero 先行加码、本仓未跟）落到 `None` → 退回基类
+# `ZeroLinkCallError` + 一条 warning 日志，**不炸**（跨仓单边升级零回归）；
+# 表本身的漂移由 crosscheck 守卫判红。
+_CODE_TO_EXCEPTION: dict[str, type[ZeroLinkCallError]] = {
+    ZERO_ERROR_CODE_UNKNOWN_SESSION: ZeroLinkUnknownSessionError,
+    ZERO_ERROR_CODE_CONFIG_INCOMPATIBLE: ZeroLinkConfigIncompatibleError,
+    ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID: ZeroLinkCallerFaultError,
+    ZERO_ERROR_CODE_PAYLOAD_INVALID: ZeroLinkCallerFaultError,
+    ZERO_ERROR_CODE_CONFIG_INVALID: ZeroLinkCallerFaultError,
+    ZERO_ERROR_CODE_DEPLOY_ENV_INVALID: ZeroLinkDeployEnvError,
+}
 
 
 # ── 内部辅助 ───────────────────────────────────────────────────────────────────
@@ -166,34 +273,64 @@ def _build_http_client(token: str) -> httpx.AsyncClient | None:
     return httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
 
 
-def _is_unknown_session_text(text: str) -> bool:
-    """按 Zero 侧机读前缀判定 unknown-session（zero-link T6·②）。
+def classify_zero_error(text: str) -> str | None:
+    """从 Zero 错误文案中提取**机读错误码**；无从判定返回 ``None``。
 
-    Zero 的 step ToolError 文本形如 ``"unknown-session: 未知 session_id=…"``——用**前缀**判定
-    而非「未知 session」等中文子串，抗 Zero 侧文案改动。容忍前导空白（防未来包裹换行/缩进）。
-    仅前缀命中才算，避免把恰好含 "unknown-session" 子串的其它消息误判（判别性）。
+    判定顺序（**位置无关**，故对 FastMCP 加壳后的 wire 文本同样成立）：
+    1. 令牌 ``[zero:<code>]``——`re.search` 非 `startswith`，这是 Zero 指定的消费口径；
+       Zero 保证「全文恰出现一次」（其 `_tool_error` 会把人读文案里回显的同形字面量
+       `[zero:` 净化成 `(zero:`），故取首个匹配即可。
+    2. **过渡兼容**：无令牌时退回旧裸前缀 `unknown-session:`（老部署，见
+       `_LEGACY_UNKNOWN_SESSION_RE` 的撤除条件）。
+
+    返回的码**不保证**在 `ZERO_ERROR_CODES` 内——Zero 可能先行加码；调用方按 `_CODE_TO_EXCEPTION`
+    查表，查不到即按基类处理（不炸）。
     """
-    return text.lstrip().startswith(_UNKNOWN_SESSION_MARKER)
+    match = _ZERO_ERROR_TOKEN_RE.search(text)
+    if match is not None:
+        return match.group(1)
+    if _LEGACY_UNKNOWN_SESSION_RE.search(text):
+        return ZERO_ERROR_CODE_UNKNOWN_SESSION
+    return None
+
+
+def _exception_for_error_text(tool_name: str, text: str, message: str) -> ZeroLinkCallError:
+    """按机读码把 Zero 错误文案映射成对应异常实例（查不到码 → 基类）。
+
+    ⚠ `unknown-session` 语义**只对 `zero.step` 成立**（会话不存在 → 可用同 id resume）：
+    open/close_session 即便文案带该码也不升级为子类，保「子类 ⇒ resume 通路可走」严格成立
+    （code-review W1 结论沿用）。其余码与工具无关（如 payload-invalid 两个工具都会出）。
+    """
+    code = classify_zero_error(text)
+    if code is None:
+        return ZeroLinkCallError(tool_name, message)
+    if code == ZERO_ERROR_CODE_UNKNOWN_SESSION and tool_name != "zero.step":
+        return ZeroLinkCallError(tool_name, message)
+    exc_type = _CODE_TO_EXCEPTION.get(code)
+    if exc_type is None:
+        logger.warning(
+            "Zero 返回本仓未登记的机读错误码 %r（tool=%s）——按通用调用错误处理；"
+            "请同步 client._CODE_TO_EXCEPTION 与跨仓守卫。",
+            code,
+            tool_name,
+        )
+        return ZeroLinkCallError(tool_name, message)
+    return exc_type(tool_name, message)
 
 
 def _extract_text(result: Any, tool_name: str) -> str:
     """从 CallToolResult 中提取文本内容。
 
-    result.isError=True 时抛 ZeroLinkCallError；错误文本带 unknown-session 机读前缀时
-    抛更精确的 ZeroLinkUnknownSessionError 子类（zero-link T6·②，供上层 resume 判定）。
-    content 为空或首元素无 text 属性时也抛错。
+    result.isError=True 时按 Zero 机读令牌 `[zero:<code>]` 分类抛出对应
+    `ZeroLinkCallError` 子类（unknown-session / config-incompatible / caller-fault /
+    deploy-env）；无码或未登记码 → 基类。content 为空或首元素无 text 属性时也抛错。
     """
     if result.isError:
         err_text = ""
         if result.content and isinstance(result.content[0], TextContent):
             err_text = result.content[0].text
         message = err_text or "server 返回 isError=True"
-        # unknown-session 机读标记语义**只对 zero.step 成立**（会话不存在 → 可用同 id resume）；
-        # open/close_session 即便文本恰好带前缀也不升级为该子类，保子类语义与触发路径严格对齐
-        # （code-review W1）。工具名沿用调用处字面量口径（无常量层）。
-        if tool_name == "zero.step" and _is_unknown_session_text(err_text):
-            raise ZeroLinkUnknownSessionError(tool_name, message)
-        raise ZeroLinkCallError(tool_name, message)
+        raise _exception_for_error_text(tool_name, err_text, message)
 
     if not result.content:
         raise ZeroLinkCallError(tool_name, "server 返回空 content")
@@ -501,18 +638,30 @@ class ZeroLinkClient:
     ) -> ExpressionBundle | None:
         """容错版单步调用，供编排层在「非关键路径」降级使用。
 
-        不 catch ValueError（M3/M6 fail-fast 是调用方参数错误，须透传）。
-        以下情况静默返回 None：
+        **降级 vs 上抛的分界线 = 错误是否每轮必复现且 client 无法自愈**（Zero §4.4-9）：
+
+        静默返回 None（可降级）：
         - ZERO_LINK_ENABLED=false（未启用）。
         - session_id 为 None（会话未建立）。
-        - ZeroLinkCallError / ZeroLinkConnectionError / McpError（连接/调用失败）。
+        - 未分类的 ZeroLinkCallError / ZeroLinkConnectionError / McpError
+          （连接抖动、偶发协议错误）。
+
+        **上抛不吞**（`ZeroLinkNonDegradableError` 及其子类；连同既有的 `ValueError`）：
+        - `[zero:config-incompatible]` → `ZeroLinkConfigIncompatibleError`：活跃会话 config
+          **不可变**，须**以新配置重开会话**。静默 None 会让每一轮都悄悄丢一次 step，且与偶发抖动
+          在观测上不可区分（看板只见帧率下降、不见根因）——故必须炸给调用方去换 config 重开。
+        - `[zero:payload-invalid]` / `[zero:external-prior-invalid]` / `[zero:config-invalid]`
+          → `ZeroLinkCallerFaultError`：调用方 bug，改传参就能好，与既有 M3/M6 fail-fast 同口径。
+        - `[zero:deploy-env-invalid]` → `ZeroLinkDeployEnvError`：部署端 env 问题，client 改不好，
+          须抛给人。
 
         **unknown-session resume 重试（zero-link T6·④）**：step 命中 Zero 侧未知/过期 session
         （`ZeroLinkUnknownSessionError`，server 重启 / 会话已 close）时，用**同一 session_id 重开
         （+再供 `resume_config`）后重试一次 step**——Zero `ZERO_CHECKPOINT_BACKEND=sqlite` 时按
         thread_id 自动续运行态，memory 后端则重开=全新会话（不报错）。重开或重试再失败 → 降级 None
-        （只重试一次、不递归）。⚠ SessionConfig 不进 checkpoint，未供 `resume_config` 则 resume 会话
-        走 Zero env 默认门控（非原会话 config）；须续原门控时调用方应传原 config。
+        （只重试一次、不递归；但重试路径上的**不可降级错误同样上抛**）。⚠ SessionConfig 不进
+        checkpoint，未供 `resume_config` 则 resume 会话走 Zero env 默认门控（非原会话 config）；
+        须续原门控时调用方应传原 config。
 
         Args:
             session_id:    Zero 会话 ID（None 时立即返回 None）。
@@ -525,7 +674,9 @@ class ZeroLinkClient:
             ExpressionBundle 或 None（降级时）。
 
         Raises:
-            ValueError: priors 不满足 M3/M6 约束（透传，不 graceful）。
+            ValueError:                    priors 不满足 M3/M6 约束（透传，不 graceful）。
+            ZeroLinkNonDegradableError:    config-incompatible / 调用方传参错 / 部署端 env 错
+                                           （见上「上抛不吞」；均为 ZeroLinkCallError 子类）。
         """
         if not _is_enabled():
             logger.debug("graceful_step: ZERO_LINK_ENABLED=false，跳过")
@@ -536,10 +687,10 @@ class ZeroLinkClient:
         try:
             return await self.step(session_id, stimulus, priors)
         except ZeroLinkUnknownSessionError:
-            # 机读标记命中 Zero 侧未知/过期 session（server 重启 / 会话已 close）：据 Zero 回执
+            # 机读令牌命中 Zero 侧未知/过期 session（server 重启 / 会话已 close）：据 Zero 回执
             # （T6·④）用**同一 session_id 重开(+再供 config)后重试一次** step。重试的 step 若再抛
-            # ZeroLinkUnknownSessionError（是 ZeroLinkCallError 子类）会被**内层** except
-            # (ZeroLinkCallError, …) 兜住 → None，故不递归、至多重试一次。
+            # ZeroLinkUnknownSessionError（是 ZeroLinkCallError 子类）会被**内层**
+            # except (ZeroLinkCallError, …) 兜住 → None，故不递归、至多重试一次。
             logger.warning(
                 "graceful_step: session=%s 未知/过期（Zero unknown-session）；"
                 "用同 id resume 重开续会话并重试一次。",
@@ -548,6 +699,11 @@ class ZeroLinkClient:
             try:
                 await self.open_session(session_id=session_id, config=resume_config)
                 return await self.step(session_id, stimulus, priors)
+            except ZeroLinkNonDegradableError:
+                # resume 路径上同样不吞不可降级错误（如重开时 resume_config 不合法 →
+                # caller-fault）。写在通用分支**之前**：它是 ZeroLinkCallError 子类，
+                # 顺序颠倒会被通用分支先兜住 → 又变成静默 None。
+                raise
             except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
                 logger.warning(
                     "graceful_step: session=%s resume 重试仍失败（exc=%s）：%s；降级 None。",
@@ -556,6 +712,9 @@ class ZeroLinkClient:
                     exc,
                 )
                 return None
+        except ZeroLinkNonDegradableError:
+            # 必须排在下面通用分支之前（子类先于基类），否则被静默吞成 None。
+            raise
         except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
             logger.warning(
                 "graceful_step 降级（session=%s, exc=%s）：%s",

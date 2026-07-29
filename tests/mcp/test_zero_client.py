@@ -14,6 +14,9 @@
 - graceful_step session_id=None → None
 - graceful_step ZeroLinkCallError → None
 - graceful_step ValueError (M6) → 透传（不吞）
+- 机读错误码：令牌 `[zero:<code>]` 位置无关提取 + 六码归类 + 旧裸前缀过渡兼容
+  （⚠ 本组夹具一律经 `_wire()` 加壳，见 Task 5.18 段头「夹具必须加壳」）
+- graceful_step 不可降级族（config-incompatible / caller-fault / deploy-env）→ 上抛不吞
 - __aexit__ 清理 session / exit_stack
 - _build_transport_params stdio 分支
 - _build_transport_params http 分支
@@ -31,15 +34,24 @@ from mcp.types import CallToolResult, ErrorData, TextContent
 
 from src.agents.models.zero_affect import AffectStimulus, ExpressionBundle, ModalityPrior
 from src.mcp.zero.client import (
+    ZERO_ERROR_CODE_CONFIG_INVALID,
+    ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
+    ZERO_ERROR_CODE_PAYLOAD_INVALID,
+    ZERO_ERROR_CODE_UNKNOWN_SESSION,
+    ZERO_ERROR_CODES,
+    ZeroLinkCallerFaultError,
     ZeroLinkCallError,
     ZeroLinkClient,
+    ZeroLinkConfigIncompatibleError,
     ZeroLinkConnectionError,
+    ZeroLinkDeployEnvError,
     ZeroLinkDisabledError,
+    ZeroLinkNonDegradableError,
     ZeroLinkUnknownSessionError,
     _build_http_client,
     _build_transport_params,
     _is_enabled,
-    _is_unknown_session_text,
+    classify_zero_error,
     generate_session_id,
 )
 
@@ -556,44 +568,120 @@ async def test_step_stim_includes_coping_when_set(monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
-# Task 5.18 unknown-session 机读标记（zero-link T6·②）
+# Task 5.18 Zero 机读错误码（zero-link T6·② → 2026-07-29 位置无关令牌换代）
 #
-# Zero step 命中未知/过期 session_id → ToolError 文本以机读前缀 "unknown-session:" 打头
-# （Zero server `_UNKNOWN_SESSION_MARKER`）。本仓据此前缀抛更精确的 ZeroLinkUnknownSessionError
-# 子类，供上层区分「可 resume 续会话」态。判别性重点：**只认前缀**，不误判 Zero 的其它含
-# "session_id" 中文错误（如 open_session 的 config 校验）→ 证明是机读标记而非脆弱文本匹配。
+# 🛑 **夹具必须加壳**：FastMCP 在工具层把 ToolError 统一包成
+#     "Error executing tool <tool_name>: <原文>"
+# （`mcp/server/fastmcp/tools/base.py::Tool.run` 的 `except Exception` 分支；ToolError 自己
+# 也继承 Exception，照样被再包一层）。**wire 上的文本永远带这层外壳**。
+# 旧夹具直接喂未加壳原文，于是「`startswith(marker)` 判定」在单测里绿、对真 server 恒 False
+# ——T6·④ 的 resume 重试通路长期是**生产死码**。本仓 stdio 直连 D:\Zero 实测：
+#     "Error executing tool zero.step: [zero:unknown-session] 未知 session_id='bogus-sid-xyz'；…"
+#     .lstrip().startswith("unknown-session") -> False
+# ⇒ 本组用例一律经 `_wire()` 构造夹具；新增夹具**不得**绕过它，否则又变成假绿。
+# 判别性重点：位置无关的令牌提取（`re.search`），且不误判其它含 "session_id" 中文的错误。
 # ---------------------------------------------------------------------------
 
-# Zero server 真实抛出的 unknown-session 文本（逐字对齐 server.py step 分支，session_id='sid-1'）。
-# ⚠ 冒号后中文仅供可读性——判定只看机读前缀 `unknown-session:`，Zero 若改中文措辞不影响本仓判定。
-_ZERO_UNKNOWN_SESSION_TEXT = (
+
+def _wire(tool: str, inner: str) -> str:
+    """把 Zero 侧 ToolError 原文包成**真 wire 形态**（FastMCP 工具层加壳后的样子）。
+
+    外壳文案逐字对齐 SDK 源码 `f"Error executing tool {self.name}: {e}"`，
+    并与 stdio 直连 D:\\Zero 的实测输出一致。
+    """
+    return f"Error executing tool {tool}: {inner}"
+
+
+# Zero server 真实抛出的 unknown-session 原文（`_tool_error(ZERO_ERROR_CODE_UNKNOWN_SESSION, …)`）。
+# ⚠ 令牌后中文仅供人读——判定只看 `[zero:unknown-session]`，Zero 改中文措辞不影响本仓判定。
+_ZERO_UNKNOWN_SESSION_INNER = (
+    "[zero:unknown-session] 未知 session_id='sid-1'；"
+    "请先调 zero.open_session（可用同 id resume 续会话）"
+)
+_ZERO_UNKNOWN_SESSION_TEXT = _wire("zero.step", _ZERO_UNKNOWN_SESSION_INNER)
+
+# 老部署（Zero 令牌换代**之前**）的裸前缀原文——过渡兼容路径的夹具。
+_LEGACY_UNKNOWN_SESSION_INNER = (
     "unknown-session: 未知 session_id='sid-1'；请先调 zero.open_session（可用同 id resume 续会话）"
+)
+_LEGACY_UNKNOWN_SESSION_TEXT = _wire("zero.step", _LEGACY_UNKNOWN_SESSION_INNER)
+
+# config-incompatible：Zero step 的内核执行失败分支（活跃会话 config 不可变 → 须以新配置重开）。
+_ZERO_CONFIG_INCOMPATIBLE_TEXT = _wire(
+    "zero.step",
+    "[zero:config-incompatible] 内核执行失败（**非** external_priors 传参问题，改传参无效）："
+    "boom；多为会话级配置组合不兼容，须以新配置重开会话",
 )
 
 
-def test_is_unknown_session_text_matches_zero_marker() -> None:
-    """机读前缀命中：Zero 真实 unknown-session 文本 + 前导空白包裹变体 → True。"""
-    assert _is_unknown_session_text(_ZERO_UNKNOWN_SESSION_TEXT) is True
-    # 容忍未来包裹换行/缩进（lstrip 后仍以前缀打头）
-    assert _is_unknown_session_text("\n  unknown-session: 未知 session_id='x'") is True
+def test_wire_fixture_defeats_old_startswith_judgement() -> None:
+    """**死码复现守卫**：真 wire 文本上，旧判据（裸前缀 startswith）恒 False，新判据 True。
 
-
-def test_is_unknown_session_text_rejects_non_marker() -> None:
-    """判别性：非 unknown-session 消息一律 False，避免误判。
-
-    覆盖三类易误判：(a) 通用错误；(b) Zero 其它含「session_id」的中文错误（open_session
-    的 config 校验，不该被当成 unknown-session）；(c) marker 出现在**中间**而非前缀。
+    这是本轮修复的存在理由，也是防回退的锚：谁把判定改回 `startswith`／把夹具改回未加壳，
+    本条即红。三个断言缺一不可——
+    ① 加壳确实发生（否则夹具没判别力，等于回到旧假绿）；
+    ② 旧判据在该文本上确实 False（死码复现）；
+    ③ 新判据（位置无关令牌）确实提取到码。
     """
-    assert _is_unknown_session_text("boom") is False
-    assert _is_unknown_session_text("server 返回 isError=True") is False
-    # Zero open_session 的 config 校验错误——含 "session_id" 中文，但非 unknown-session
-    assert _is_unknown_session_text("session_id 须为非空字符串，实际为 ''") is False
-    # marker 只出现在中间（非前缀）→ 不算，防子串误判
-    assert _is_unknown_session_text("error: unknown-session happened downstream") is False
+    assert _ZERO_UNKNOWN_SESSION_TEXT.startswith("Error executing tool zero.step: ")  # ①
+    assert _ZERO_UNKNOWN_SESSION_TEXT.lstrip().startswith("unknown-session") is False  # ②
+    assert classify_zero_error(_ZERO_UNKNOWN_SESSION_TEXT) == ZERO_ERROR_CODE_UNKNOWN_SESSION  # ③
+    # 旧格式同理：裸前缀经加壳后也不在位置 0（说明这不是「换个码值」能修的，是格式契约要换）
+    assert _LEGACY_UNKNOWN_SESSION_TEXT.lstrip().startswith("unknown-session") is False
+
+
+def test_classify_zero_error_extracts_token_anywhere() -> None:
+    """令牌提取**位置无关**：开头/中部/末尾都能取到，且六个码全覆盖。"""
+    assert classify_zero_error("[zero:payload-invalid] 开头") == ZERO_ERROR_CODE_PAYLOAD_INVALID
+    # ⑤ 令牌出现在**中间**（真 wire 形态即如此）
+    assert classify_zero_error(_wire("zero.open_session", "[zero:config-invalid] x")) == (
+        ZERO_ERROR_CODE_CONFIG_INVALID
+    )
+    # 令牌在末尾（假想的其它包装方式，同样要认）
+    assert classify_zero_error("something failed [zero:deploy-env-invalid]") == (
+        ZERO_ERROR_CODE_DEPLOY_ENV_INVALID
+    )
+    # 六码全表逐个可提取（不是只有 unknown-session 一条通路）
+    for code in ZERO_ERROR_CODES:
+        assert classify_zero_error(_wire("zero.step", f"[zero:{code}] 文案")) == code
+
+
+def test_classify_zero_error_legacy_bare_prefix_still_recognized() -> None:
+    """② 过渡兼容：老部署的**裸前缀**格式（无令牌）仍被识别为 unknown-session。
+
+    覆盖两态：加壳后的（真 wire）与未加壳的（位置 0，历史夹具口径）。
+    ⏳ 撤除条件见 client `_LEGACY_UNKNOWN_SESSION_RE` 注释——本条是该兼容层的**唯一**理由，
+    撤兼容时连同本条一起删。
+    """
+    assert classify_zero_error(_LEGACY_UNKNOWN_SESSION_TEXT) == ZERO_ERROR_CODE_UNKNOWN_SESSION
+    assert classify_zero_error(_LEGACY_UNKNOWN_SESSION_INNER) == ZERO_ERROR_CODE_UNKNOWN_SESSION
+
+
+def test_classify_zero_error_rejects_non_marker() -> None:
+    """④ 判别性：无令牌、无旧前缀的普通错误一律 None（不误判、不硬套码）。
+
+    覆盖四类易误判：(a) 通用错误；(b) Zero 其它含「session_id」中文错误（open_session 的
+    payload 校验的**人读部分**）；(c) 含 "unknown-session" 但无冒号的偶然子串；
+    (d) 形似但不合语法的令牌（大写 / 前导数字 / 缺方括号）。
+    """
+    assert classify_zero_error("boom") is None
+    assert classify_zero_error("server 返回 isError=True") is None
+    assert classify_zero_error("session_id 须为非空字符串，实际为 ''") is None
+    assert classify_zero_error("error: unknown-session happened downstream") is None
+    assert classify_zero_error("[zero:UNKNOWN-SESSION] 大写不合 kebab-case") is None
+    assert classify_zero_error("[zero:1bad] 首字符须字母") is None
+    assert classify_zero_error("zero:payload-invalid 缺方括号") is None
+
+
+def test_classify_zero_error_unregistered_code_returned_as_is() -> None:
+    """Zero 先行加码、本仓未跟：`classify` 如实返回该码（不吞不炸），由查表层降级处理。"""
+    code = classify_zero_error(_wire("zero.step", "[zero:brand-new-code] 未来码"))
+    assert code == "brand-new-code"
+    assert code not in ZERO_ERROR_CODES
 
 
 async def test_step_unknown_session_raises_subclass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """step 命中 unknown-session isError → 抛 ZeroLinkUnknownSessionError，
+    """① 加壳的 unknown-session isError → 抛 ZeroLinkUnknownSessionError，
     且是 ZeroLinkCallError 子类、`.tool == 'zero.step'`（向后兼容 + 精确化）。"""
     client, mock_session = _build_client_with_session(monkeypatch)
     _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
@@ -602,29 +690,100 @@ async def test_step_unknown_session_raises_subclass(monkeypatch: pytest.MonkeyPa
     with pytest.raises(ZeroLinkUnknownSessionError) as exc_info:
         await client.step("sid-1", stimulus)
 
-    assert isinstance(exc_info.value, ZeroLinkCallError)  # 子类关系（graceful_step 仍兜住）
+    assert isinstance(exc_info.value, ZeroLinkCallError)  # 子类关系（既有调用点零回归）
     assert exc_info.value.tool == "zero.step"
+    # 不可降级族与它无关：unknown-session 是**可自愈**的，graceful_step 要 resume 而非上抛
+    assert not isinstance(exc_info.value, ZeroLinkNonDegradableError)
+
+
+async def test_step_legacy_unknown_session_raises_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """② 老部署裸前缀（加壳后）同样抛 ZeroLinkUnknownSessionError（过渡兼容不留缺口）。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _LEGACY_UNKNOWN_SESSION_TEXT, is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkUnknownSessionError):
+        await client.step("sid-1", stimulus)
+
+
+async def test_step_config_incompatible_raises_non_degradable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """③ config-incompatible → ZeroLinkConfigIncompatibleError（不可降级族）。
+
+    判别性：它**不是** unknown-session 子类——不该走 resume 自愈路径。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _ZERO_CONFIG_INCOMPATIBLE_TEXT, is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkConfigIncompatibleError) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert isinstance(exc_info.value, ZeroLinkNonDegradableError)
+    assert isinstance(exc_info.value, ZeroLinkCallError)  # 既有 except 调用点零回归
+    assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("payload-invalid", ZeroLinkCallerFaultError),
+        ("external-prior-invalid", ZeroLinkCallerFaultError),
+        ("config-invalid", ZeroLinkCallerFaultError),
+        ("deploy-env-invalid", ZeroLinkDeployEnvError),
+    ],
+)
+async def test_step_other_codes_map_to_expected_class(
+    monkeypatch: pytest.MonkeyPatch, code: str, expected: type[ZeroLinkCallError]
+) -> None:
+    """其余四码的归类：调用方传参错 → CallerFault；部署端 env 错 → DeployEnv；均不可降级。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _wire("zero.step", f"[zero:{code}] 文案"), is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(expected) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert isinstance(exc_info.value, ZeroLinkNonDegradableError)
 
 
 async def test_step_generic_error_not_unknown_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """判别性：普通 isError（非 marker）→ 抛基类，**不是** unknown-session 子类。"""
+    """④ 判别性：无令牌的普通 isError → 抛基类，既非 unknown-session 也非不可降级族。"""
     client, mock_session = _build_client_with_session(monkeypatch)
-    _set_tool_return(mock_session, "boom", is_error=True)
+    _set_tool_return(mock_session, _wire("zero.step", "boom"), is_error=True)
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)
 
     with pytest.raises(ZeroLinkCallError) as exc_info:
         await client.step("sid-1", stimulus)
 
     assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+    assert not isinstance(exc_info.value, ZeroLinkNonDegradableError)
+
+
+async def test_step_unregistered_code_falls_back_to_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero 单边加新码 → 落基类 ZeroLinkCallError（不炸、不误升级），跨仓单边升级零回归。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _wire("zero.step", "[zero:brand-new-code] x"), is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkCallError) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert type(exc_info.value) is ZeroLinkCallError
 
 
 async def test_step_config_error_not_unknown_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """判别性：含「session_id」中文的 Zero 其它错误（如 config 校验）不被误判为 unknown-session。
+    """判别性：含「session_id」中文但**无令牌**的错误不被误判为 unknown-session。
 
-    证明区分走机读前缀而非脆弱中文匹配——回执明言「靠字符串匹配脆弱」正是要规避的。
+    证明区分走机读令牌而非脆弱中文匹配——回执明言「靠字符串匹配脆弱」正是要规避的。
     """
     client, mock_session = _build_client_with_session(monkeypatch)
-    _set_tool_return(mock_session, "session_id 须为非空字符串，实际为 ''", is_error=True)
+    _set_tool_return(
+        mock_session, _wire("zero.step", "session_id 须为非空字符串，实际为 ''"), is_error=True
+    )
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)
 
     with pytest.raises(ZeroLinkCallError) as exc_info:
@@ -665,11 +824,14 @@ async def test_graceful_step_resume_retry_unknown_again_no_recursion(
 async def test_unknown_session_only_for_step_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     """判别性（code-review W1）：unknown-session 子类语义**只对 zero.step 成立**。
 
-    open_session 即便返回带机读前缀的 isError（未来 Zero 内部路由变化的假想场景），也只抛基类
-    ZeroLinkCallError，不误升级为 ZeroLinkUnknownSessionError——保子类语义与触发路径严格对齐。
+    open_session 即便返回带 `[zero:unknown-session]` 令牌的 isError（未来 Zero 内部路由变化的
+    假想场景），也只抛基类 ZeroLinkCallError，不误升级为 ZeroLinkUnknownSessionError
+    ——保「子类 ⇒ resume 通路可走」严格成立。
     """
     client, mock_session = _build_client_with_session(monkeypatch)
-    _set_tool_return(mock_session, _ZERO_UNKNOWN_SESSION_TEXT, is_error=True)
+    _set_tool_return(
+        mock_session, _wire("zero.open_session", _ZERO_UNKNOWN_SESSION_INNER), is_error=True
+    )
 
     with pytest.raises(ZeroLinkCallError) as exc_info:
         await client._call_tool("zero.open_session", {})
@@ -753,9 +915,9 @@ async def test_graceful_step_resume_retry_fails_returns_none(
 
 
 async def test_graceful_step_generic_error_no_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """判别性：普通 isError（非 unknown-session）→ 不触发 resume，直接降级 None（不调 open）。"""
+    """④ 判别性：无令牌的普通 isError → 不触发 resume，直接降级 None（不调 open）。"""
     client, mock_session = _build_client_with_session(monkeypatch)
-    _set_tool_return(mock_session, "boom", is_error=True)
+    _set_tool_return(mock_session, _wire("zero.step", "boom"), is_error=True)
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)
 
     result = await client.graceful_step("sid-1", stimulus)
@@ -763,6 +925,69 @@ async def test_graceful_step_generic_error_no_resume(monkeypatch: pytest.MonkeyP
     assert result is None
     assert mock_session.call_tool.call_count == 1  # 只调 step，无 resume 的 open_session
     assert mock_session.call_tool.call_args.args[0] == "zero.step"
+
+
+# ---------------------------------------------------------------------------
+# Task 5.21 graceful_step 的「不可降级」分界（Zero §4.4-9）
+#
+# config-incompatible 意味活跃会话 config 不可变、须以新配置重开会话：静默 return None 会让
+# **每一轮**都悄悄丢一次 step，且与偶发抖动在观测上不可区分 → 必须上抛。其余码同理归类。
+# ---------------------------------------------------------------------------
+
+
+async def test_graceful_step_config_incompatible_raises_not_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """③ config-incompatible → graceful_step **上抛**（不静默 None）、不触发 resume。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _ZERO_CONFIG_INCOMPATIBLE_TEXT, is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkConfigIncompatibleError):
+        await client.graceful_step("sid-1", stimulus)
+
+    # 不可自愈 → 不该白白多打一次 open_session
+    assert mock_session.call_tool.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["payload-invalid", "external-prior-invalid", "config-invalid", "deploy-env-invalid"],
+)
+async def test_graceful_step_other_non_degradable_codes_raise(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    """调用方传参错 / 部署端 env 错同样上抛——静默每轮丢帧会把根因埋掉。"""
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _wire("zero.step", f"[zero:{code}] 文案"), is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkNonDegradableError):
+        await client.graceful_step("sid-1", stimulus)
+
+
+async def test_graceful_step_resume_path_non_degradable_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resume 路径上的不可降级错误同样上抛（顺序守卫）。
+
+    序列：step(unknown-session) → open_session([zero:config-invalid]，resume_config 不合法)。
+    若 `except ZeroLinkNonDegradableError: raise` 写在通用分支**之后**，它会被
+    `except (ZeroLinkCallError, …)` 先兜住 → 又静默 None；本条即红。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(
+            _wire("zero.open_session", "[zero:config-invalid] config 不合法：bad"), is_error=True
+        ),
+    ]
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(ZeroLinkCallerFaultError):
+        await client.graceful_step("sid-1", stimulus, resume_config={"bad": 1})
+
+    assert mock_session.call_tool.call_count == 2
 
 
 def test_generate_session_id_unguessable_and_unique() -> None:

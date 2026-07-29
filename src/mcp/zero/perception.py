@@ -1,8 +1,10 @@
 """感知输入通路骨架（MCP → Zero 方向）——T3。
 
 PerceptionChannel：单模态感知源 Protocol。
-PerceptionHub：汇聚多路 PerceptionChannel，产出独立先验列表，
-对齐 Zero affect_core streams 形状（D:\\Zero\\src\\affect_core.py:77-95）。
+PerceptionHub：汇聚多路 PerceptionChannel，产出独立先验列表，对齐 Zero agents 层
+affect_core 模块（现为 `src/agents/affect_core.py`，该路径仍在迁移中）的 external streams
+组装段——即 `expand_external_priors` 调用点前后那个 `streams` 列表，
+**形状 `(name, (μv, μa), (Πv, Πa))`**（形状写死在此处，比指向对方任何坐标都稳）。
 
 AD-3 硬约束：**禁止均值融合**——各先验独立保留，竞争融合是 Zero 内核的事。
 单通道失败（异常或返回 None）→ 降级跳过，不拖垮整体。
@@ -155,7 +157,8 @@ class PerceptionHub:
         """将先验列表转为 Zero 独立先验流形状（不均值，AD-3）。
 
         每条先验调用 ModalityPrior.as_stream() → (name, (μ_v,μ_a), (Π_v,Π_a))，
-        对齐 Zero 内部 streams 形状（D:\\Zero\\src\\affect_core.py:77-95）。
+        对齐 Zero agents 层 affect_core 模块的 external streams 组装段形状
+        （`expand_external_priors` 调用点前后的 `streams` 列表；跨仓只锚符号不锚行号）。
 
         **Q3 已交付（Zero 2026-07-15，commit 143ac72）**：正式多流注入口 = Zero 专用字段
         ``external_priors: list[(name, (μ_v,μ_a), (Π_v,Π_a))]``（默认空 = 零回归），
