@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -46,7 +47,9 @@ from src.mcp.zero.client import (
     ZeroLinkConnectionError,
     ZeroLinkDeployEnvError,
     ZeroLinkDisabledError,
+    ZeroLinkLockTimeoutError,
     ZeroLinkNonDegradableError,
+    ZeroLinkStepTimeoutError,
     ZeroLinkUnknownSessionError,
     _build_http_client,
     _build_transport_params,
@@ -750,6 +753,40 @@ async def test_step_other_codes_map_to_expected_class(
     assert isinstance(exc_info.value, ZeroLinkNonDegradableError)
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("timeout-lock", ZeroLinkLockTimeoutError),
+        ("timeout-step", ZeroLinkStepTimeoutError),
+    ],
+)
+async def test_step_timeout_codes_map_to_degradable_subclasses(
+    monkeypatch: pytest.MonkeyPatch, code: str, expected: type[ZeroLinkCallError]
+) -> None:
+    """超时两码各挂独立子类且属**可降级**族（本仓第二轮回件 §2.5 承诺的消费侧落地）。
+
+    判别性三连：不是 NonDegradable（graceful_step 不上抛）、不是 unknown-session
+    （不触发 resume 自愈）、两码互不为对方子类（重试语义相反，正是分码的理由——
+    编排层 catch `ZeroLinkLockTimeoutError` 退避重试时绝不能把 timeout-step 也捞进来）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _wire("zero.step", f"[zero:{code}] 文案"), is_error=True)
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with pytest.raises(expected) as exc_info:
+        await client.step("sid-1", stimulus)
+
+    assert isinstance(exc_info.value, ZeroLinkCallError)  # 既有 except 调用点零回归
+    assert not isinstance(exc_info.value, ZeroLinkNonDegradableError)
+    assert not isinstance(exc_info.value, ZeroLinkUnknownSessionError)
+    other = (
+        ZeroLinkStepTimeoutError
+        if expected is ZeroLinkLockTimeoutError
+        else (ZeroLinkLockTimeoutError)
+    )
+    assert not isinstance(exc_info.value, other)
+
+
 async def test_step_generic_error_not_unknown_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """④ 判别性：无令牌的普通 isError → 抛基类，既非 unknown-session 也非不可降级族。"""
     client, mock_session = _build_client_with_session(monkeypatch)
@@ -988,6 +1025,54 @@ async def test_graceful_step_resume_path_non_degradable_raises(
         await client.graceful_step("sid-1", stimulus, resume_config={"bad": 1})
 
     assert mock_session.call_tool.call_count == 2
+
+
+async def test_graceful_step_lock_timeout_degrades_without_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """timeout-lock → 降级 None、**不触发 resume**（会话仍在，只是锁竞争，重开纯属浪费）。
+
+    退避重试是关键路径编排层的事（catch `ZeroLinkLockTimeoutError` 自己做）；
+    graceful_step 的契约是非关键路径丢一帧，不在兜底层里内置重试。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(
+        mock_session,
+        _wire("zero.step", "[zero:timeout-lock] 等待会话锁超时（5.0s）"),
+        is_error=True,
+    )
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    result = await client.graceful_step("sid-1", stimulus)
+
+    assert result is None
+    assert mock_session.call_tool.call_count == 1  # 只调 step，无 open_session、无重试
+    assert mock_session.call_tool.call_args.args[0] == "zero.step"
+
+
+async def test_graceful_step_step_timeout_no_retry_error_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """timeout-step → §2.5 承诺三件套：**不重试** + **ERROR** 级日志 + 降级 None。
+
+    不重试是硬约束（半截运行态，原样重试会节点重跑/reducer 双重累加）；ERROR 级
+    （非通用分支的 warning）让「内核慢」与偶发抖动在观测上分开。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(
+        mock_session, _wire("zero.step", "[zero:timeout-step] 内核执行超时"), is_error=True
+    )
+    stimulus = AffectStimulus(valence=0.1, arousal=0.2)
+
+    with caplog.at_level(logging.ERROR, logger="src.mcp.zero.client"):
+        result = await client.graceful_step("sid-1", stimulus)
+
+    assert result is None
+    assert mock_session.call_tool.call_count == 1  # 绝不原样重试
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("timeout-step" in r.getMessage() for r in error_records), (
+        "timeout-step 降级必须留 ERROR 级日志（§2.5），否则慢内核在观测上与抖动不可分"
+    )
 
 
 def test_generate_session_id_unguessable_and_unique() -> None:

@@ -68,6 +68,10 @@ ZERO_ERROR_CODE_EXTERNAL_PRIOR_INVALID = "external-prior-invalid"
 ZERO_ERROR_CODE_PAYLOAD_INVALID = "payload-invalid"
 ZERO_ERROR_CODE_CONFIG_INVALID = "config-invalid"
 ZERO_ERROR_CODE_DEPLOY_ENV_INVALID = "deploy-env-invalid"
+# ── 超时是**两个码不是一个**（本仓第二轮回件 §2.1 建议、Zero 2026-07-29 采纳落地）：
+# 二者可否原样重试**相反**，单码会把判别推回人读文案。语义见各自异常类 docstring。
+ZERO_ERROR_CODE_TIMEOUT_LOCK = "timeout-lock"
+ZERO_ERROR_CODE_TIMEOUT_STEP = "timeout-step"
 
 ZERO_ERROR_CODES: frozenset[str] = frozenset(
     {
@@ -77,6 +81,8 @@ ZERO_ERROR_CODES: frozenset[str] = frozenset(
         ZERO_ERROR_CODE_PAYLOAD_INVALID,
         ZERO_ERROR_CODE_CONFIG_INVALID,
         ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
+        ZERO_ERROR_CODE_TIMEOUT_LOCK,
+        ZERO_ERROR_CODE_TIMEOUT_STEP,
     }
 )
 
@@ -139,6 +145,30 @@ class ZeroLinkUnknownSessionError(ZeroLinkCallError):
     """
 
 
+class ZeroLinkLockTimeoutError(ZeroLinkCallError):
+    """step 等待 Zero 会话锁超时（`[zero:timeout-lock]`）——**可退避后原样重试**。
+
+    Zero 只超时「获取锁」不超时「执行」：本轮**未进入内核、运行态未改动**（其
+    `_acquire_with_timeout` 明言），归责为并发/前一轮挂起。故属**可降级**族：
+    `graceful_step` 兜住降级 `None`（非关键路径丢一帧无所谓）；关键路径直调 `step()`
+    的编排层可 catch 本子类做退避重试——与不可原样重试的 `ZeroLinkStepTimeoutError`
+    重试语义**相反**，这正是两码不合并的理由（本仓第二轮回件 §2.1）。
+    ⚠ Zero 侧 default-off：`ZERO_MCP_STEP_LOCK_TIMEOUT` 未设时无限等锁、本码不产出。
+    """
+
+
+class ZeroLinkStepTimeoutError(ZeroLinkCallError):
+    """Zero 内核执行超时（`[zero:timeout-step]`）——**不可原样重试**。
+
+    取消 ainvoke 会在 checkpointer 留**半截运行态**：原样重试会让已跑完的节点重跑、
+    reducer 通道双重累加（机制两仓联合实证，见 notes/2026-07-29-mcp-reply-round2.md
+    §2.4；危害面待 Zero 核 LastValue 标量通道前按**最坏情况**处置）。`graceful_step`
+    按本仓 §2.5 承诺执行三件套：**不重试、日志 ERROR、降级 None**——仍是可降级族
+    （非每轮必复现的配置/部署错），但 ERROR 级日志保证「内核慢」有人看见。
+    ⚠ Zero 当前**只登记不产出**（执行超时尚未实现）；先落消费侧是让分类表一次到位。
+    """
+
+
 class ZeroLinkNonDegradableError(ZeroLinkCallError):
     """**不可静默降级**的一类调用错误——`graceful_step` 遇到它一律**上抛**而非返回 `None`。
 
@@ -192,6 +222,8 @@ _CODE_TO_EXCEPTION: dict[str, type[ZeroLinkCallError]] = {
     ZERO_ERROR_CODE_PAYLOAD_INVALID: ZeroLinkCallerFaultError,
     ZERO_ERROR_CODE_CONFIG_INVALID: ZeroLinkCallerFaultError,
     ZERO_ERROR_CODE_DEPLOY_ENV_INVALID: ZeroLinkDeployEnvError,
+    ZERO_ERROR_CODE_TIMEOUT_LOCK: ZeroLinkLockTimeoutError,
+    ZERO_ERROR_CODE_TIMEOUT_STEP: ZeroLinkStepTimeoutError,
 }
 
 
@@ -323,7 +355,8 @@ def _extract_text(result: Any, tool_name: str) -> str:
 
     result.isError=True 时按 Zero 机读令牌 `[zero:<code>]` 分类抛出对应
     `ZeroLinkCallError` 子类（unknown-session / config-incompatible / caller-fault /
-    deploy-env）；无码或未登记码 → 基类。content 为空或首元素无 text 属性时也抛错。
+    deploy-env / timeout-lock / timeout-step）；无码或未登记码 → 基类。
+    content 为空或首元素无 text 属性时也抛错。
     """
     if result.isError:
         err_text = ""
@@ -645,6 +678,12 @@ class ZeroLinkClient:
         - session_id 为 None（会话未建立）。
         - 未分类的 ZeroLinkCallError / ZeroLinkConnectionError / McpError
           （连接抖动、偶发协议错误）。
+        - `[zero:timeout-lock]` → `ZeroLinkLockTimeoutError`：等锁超时，未进内核、
+          运行态未改动，可退避后原样重试——非关键路径直接降级即可，关键路径的重试
+          由直调 `step()` 的编排层自己做。
+        - `[zero:timeout-step]` → `ZeroLinkStepTimeoutError`：内核执行超时，
+          **不重试**（半截运行态，原样重试会节点重跑/reducer 双重累加），
+          **ERROR** 级日志后降级（§2.5 承诺三件套；Zero 当前只登记不产出该码）。
 
         **上抛不吞**（`ZeroLinkNonDegradableError` 及其子类；连同既有的 `ValueError`）：
         - `[zero:config-incompatible]` → `ZeroLinkConfigIncompatibleError`：活跃会话 config
@@ -704,6 +743,15 @@ class ZeroLinkClient:
                 # caller-fault）。写在通用分支**之前**：它是 ZeroLinkCallError 子类，
                 # 顺序颠倒会被通用分支先兜住 → 又变成静默 None。
                 raise
+            except ZeroLinkStepTimeoutError as exc:
+                # resume 重试的 step 内核执行超时：同外层，ERROR 级日志 + 降级（不再重试）。
+                logger.error(
+                    "graceful_step: session=%s resume 重试遇内核执行超时（timeout-step）"
+                    "——不可原样重试，降级 None：%s",
+                    session_id,
+                    exc,
+                )
+                return None
             except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
                 logger.warning(
                     "graceful_step: session=%s resume 重试仍失败（exc=%s）：%s；降级 None。",
@@ -715,6 +763,17 @@ class ZeroLinkClient:
         except ZeroLinkNonDegradableError:
             # 必须排在下面通用分支之前（子类先于基类），否则被静默吞成 None。
             raise
+        except ZeroLinkStepTimeoutError as exc:
+            # §2.5 承诺三件套：**不重试**（半截运行态，原样重试会节点重跑/reducer 双重
+            # 累加）、**ERROR** 级日志（与偶发抖动的 warning 在观测上分开——「内核慢」
+            # 须有人看见）、降级 None。同样须排在通用分支之前，否则退化成 warning。
+            logger.error(
+                "graceful_step: session=%s Zero 内核执行超时（timeout-step）"
+                "——不可原样重试，降级 None：%s",
+                session_id,
+                exc,
+            )
+            return None
         except (ZeroLinkCallError, ZeroLinkConnectionError, McpError) as exc:
             logger.warning(
                 "graceful_step 降级（session=%s, exc=%s）：%s",
