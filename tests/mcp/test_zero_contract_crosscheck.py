@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -888,38 +890,229 @@ _ZERO_SURVIVAL_FUNC_RE = re.compile(
 )
 
 
-def _extract_function_body(source: str, name: str) -> str | None:
-    """按**符号名**切出顶层函数体（含 def 行），不依赖行号。
+_PHYSIO_PREFIXES_NAME = "_PHYSIO_PREFIXES"
 
-    Zero 侧行号漂移剧烈（`4760dfb` 一次就增约 190 行），跨仓守卫一律按符号名锚定；
-    行号只出现在人读的注释里，且不作断言依据。找不到返回 None → 调用方 skip。
+
+@dataclass(frozen=True)
+class _ZeroIgniteFacts:
+    """Zero `ignite()` / `_select_fired()` 的**结构事实**，按 AST **语句归属**解析。
+
+    为什么改用 AST 而不是「按缩进切块」（本文件上一版做法）：Zero 在 `ignite()` 的
+    **docstring 里逐字写着** ``if gate_fusion:``（2026-07-29 工作树新增的「收口条件」段），
+    `body.find("if gate_fusion:")` 会锚到**散文**上、切出空的门关分支——这是本仓
+    pitfalls ⑦「切分锚点滑走」的**第二次复发**（第一次是 `partition("return ")` 落到
+    函数末尾 return）。AST 里 docstring 只是一个 `Constant`、根本没有 `Name` 节点，
+    从结构上消灭这一整类误锚，同时也免疫注释与字符串里的同名文本。
+
+    锚定一律**按符号名**（`def ignite` / `def _select_fired`），**绝不按行号**——Zero 侧
+    行号漂移剧烈（`4760dfb` 一次就增约 190 行）；行号只出现在人读注释里，不作断言依据。
+
+    三个位置轴对应 `ignite()` 的三条路径（Zero 回执 Q3 ② 的「三条路径同施」即指此）：
+    - `*_before_gate`   ：`if gate_fusion:` 语句**之前**的同级语句（硬门/软门/门开**共用**）
+    - `*_in_gate_body`  ：`if gate_fusion:` 块体内（门关 = 硬门 + 软门）
+    - `*_on_open_path`  ：该 `if` 的 `else` 分支 + 其后的同级语句（门开）
     """
-    match = re.search(
-        rf"^def {re.escape(name)}\(.*?(?=\n(?:@|def |class )|\Z)", source, re.DOTALL | re.MULTILINE
+
+    physio_before_gate: bool
+    physio_in_gate_body: bool
+    physio_on_open_path: bool
+    physio_prefix_filter_on_open_path: bool
+    select_fired_before_gate: bool
+    select_fired_in_gate_body: bool
+    select_fired_on_open_path: bool
+    gate_body_ends_with_return: bool
+    physio_in_select_fired: bool
+    select_fired_has_soft_beta: bool
+    select_fired_has_max_fallback: bool
+
+
+def _refs_name(nodes: list[ast.stmt], name: str) -> bool:
+    """这批语句里是否**以变量身份**引用了 `name`（docstring/注释里的同名文本不算）。"""
+    return any(
+        isinstance(sub, ast.Name) and sub.id == name for node in nodes for sub in ast.walk(node)
     )
-    return match.group(0) if match else None
 
 
-def _split_if_block(body: str, header: str) -> tuple[str, str] | None:
-    """按**缩进**把 `header`（如 `if gate_fusion:`）的块体与其后的同级代码切开。
+def _has_physio_prefix_filter(nodes: list[ast.stmt]) -> bool:
+    """这批语句里是否出现 `<…>.startswith(_PHYSIO_PREFIXES)` 形状的**前缀过滤**。
 
-    返回 (块体, 块后剩余)；`header` 不在 body 里返回 None。
-
-    为什么按缩进而不按 `partition("return ")`：后者在「真分支不再 return」这种改动下会
-    落到函数**末尾**那个 return 上、把切点挪走，守卫照样绿——实测确认（本仓
-    pitfalls「绿灯必须先证明它能红」同族）。缩进是块结构的定义本身，不会被这样绕过。
+    比 `_refs_name` 严：`raise ValueError(f"…{_PHYSIO_PREFIXES}…")` 那种**报错文案里的
+    引用**也是 `Name` 节点，会被 `_refs_name` 记为引用，但它不是过滤。
     """
-    idx = body.find(header)
-    if idx < 0:
-        return None
-    header_indent = len(body[:idx].rsplit("\n", 1)[-1])
-    lines = body[idx:].split("\n")[1:]  # 跳过 header 行本身
-    block: list[str] = []
-    for pos, line in enumerate(lines):
-        if line.strip() and len(line) - len(line.lstrip()) <= header_indent:
-            return "\n".join(block), "\n".join(lines[pos:])
-        block.append(line)
-    return "\n".join(block), ""
+    for node in nodes:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "startswith"
+                and any(
+                    isinstance(arg, ast.Name) and arg.id == _PHYSIO_PREFIXES_NAME
+                    for arg in sub.args
+                )
+            ):
+                return True
+    return False
+
+
+def _zero_ignite_facts(source: str) -> _ZeroIgniteFacts | str:
+    """解析 Zero `affect_math` 源码，返回结构事实；**无法解析时返回说明原因的字符串**。
+
+    ⚠ 刻意**不返回 None / 不 skip**：`ignite` / `_select_fired` 消失、`if gate_fusion:`
+    二分被拆掉，都是**Zero 侧的语义结构变化**，正是跨仓守卫要报的事——skip 会让本仓
+    「门关/门开二态」的全部可达性结论无声地失去依据（本仓 pitfalls：绿灯与静默跳过
+    同样危险）。环境性缺失（`D:\\Zero` 不在位、文件不存在）仍由 `_source()` skip 兜住，
+    两者的区别就是「对方改了」与「这台机器上没有对方」。
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:  # pragma: no cover - Zero 侧语法错时才会走到
+        return f"affect_math 源码无法被 ast 解析（{exc}）——须人工核对"
+    funcs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    ignite = funcs.get("ignite")
+    if ignite is None:
+        return "Zero 顶层已无 `def ignite` —— 结构大改，本仓门控可达性结论全部须重评"
+    select_fired = funcs.get("_select_fired")
+    if select_fired is None:
+        return "Zero 顶层已无 `def _select_fired` —— 阈值/软门 helper 被重构，须重标"
+    gate_index = next(
+        (
+            index
+            for index, stmt in enumerate(ignite.body)
+            if isinstance(stmt, ast.If)
+            and isinstance(stmt.test, ast.Name)
+            and stmt.test.id == "gate_fusion"
+        ),
+        None,
+    )
+    if gate_index is None:
+        return "ignite 顶层已无 `if gate_fusion:` 二分 —— 门控形态变了，须按新形态重标"
+
+    gate_if = ignite.body[gate_index]
+    assert isinstance(gate_if, ast.If)  # 上面的 next(...) 已保证；仅为类型收窄
+    before = list(ignite.body[:gate_index])
+    gate_body = list(gate_if.body)
+    open_path = list(gate_if.orelse) + list(ignite.body[gate_index + 1 :])
+    select_body = list(select_fired.body)
+    return _ZeroIgniteFacts(
+        physio_before_gate=_refs_name(before, _PHYSIO_PREFIXES_NAME),
+        physio_in_gate_body=_refs_name(gate_body, _PHYSIO_PREFIXES_NAME),
+        physio_on_open_path=_refs_name(open_path, _PHYSIO_PREFIXES_NAME),
+        physio_prefix_filter_on_open_path=_has_physio_prefix_filter(open_path),
+        select_fired_before_gate=_refs_name(before, "_select_fired"),
+        select_fired_in_gate_body=_refs_name(gate_body, "_select_fired"),
+        select_fired_on_open_path=_refs_name(open_path, "_select_fired"),
+        gate_body_ends_with_return=bool(gate_body) and isinstance(gate_body[-1], ast.Return),
+        physio_in_select_fired=_refs_name(select_body, _PHYSIO_PREFIXES_NAME),
+        select_fired_has_soft_beta=_refs_name(select_body, "soft_beta")
+        or any(
+            arg.arg == "soft_beta" for arg in select_fired.args.kwonlyargs + select_fired.args.args
+        ),
+        select_fired_has_max_fallback=_refs_name(select_body, "max"),
+    )
+
+
+# Zero `affect_math` 当前形态的**合成骨架**，供判别性自证用（不依赖 D:\Zero 在位）。
+# ⚠ 刻意逐字保留 `ignite` docstring 里那句 ``if gate_fusion:`` **散文**——它就是 2026-07-29
+# 把上一版「按缩进切字符串块」的切点锚走、造成假红的元凶。基线绿 = 证明新判定免疫散文。
+# 内层 docstring 用 ''' 以免与外层 """ 冲突（本串是数据，不参与本仓格式化）。
+_SYNTHETIC_ZERO_IGNITE = """
+IGNITION_BETA: float | None = None
+_PHYSIO_PREFIXES: tuple[str, ...] = ("physio", "eda", "hrv", "pupil", "scr")
+
+
+def _select_fired(scored, *, threshold, survival_fallback, soft_beta):
+    '''今天 ignite() 的筛选逻辑，原样抽出供数值通路与报告通路共用。'''
+    if soft_beta is not None:
+        out = []
+        for name, mu, prec, sal in scored:
+            gate = sigmoid(soft_beta * (sal - threshold))
+            out.append((name, mu, (prec[0] * gate, prec[1] * gate)))
+        return out
+
+    fired = [(name, mu, prec) for name, mu, prec, s in scored if s >= threshold]
+    if fired:
+        return fired
+    if survival_fallback:
+        surv = next(((n, m, p) for n, m, p, _ in scored if n == "survival"), None)
+        if surv is not None:
+            return [surv]
+    top = max(scored, key=lambda item: item[3])
+    return [(top[0], top[1], top[2])]
+
+
+def ignite(
+    streams,
+    *,
+    threshold=SALIENCE_THRESHOLD,
+    survival_fallback=False,
+    soft_beta=IGNITION_BETA,
+    gate_fusion: bool = True,
+    exclude_physio_fusion: bool = True,
+):
+    '''GNW ignition：salience >= threshold 的流点燃进入全局广播。
+
+    收口条件（议会 design A4）：把前缀过滤提到 `if gate_fusion:`
+    之前、对三条路径同施。该改动会破软门零回归，属行为变更须走议会门。
+    '''
+    scored = _score_streams(streams)
+    if gate_fusion:
+        selected = _select_fired(
+            scored, threshold=threshold, survival_fallback=survival_fallback, soft_beta=soft_beta
+        )
+        return [(mu, prec) for _, mu, prec in selected], [name for name, _, _ in selected]
+
+    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]
+    if exclude_physio_fusion:
+        fusion = [t for t in fusion if not t[0].lower().startswith(_PHYSIO_PREFIXES)]
+    if streams and not fusion:
+        raise ValueError(f"全部命中 physio 排除前缀 {_PHYSIO_PREFIXES}")
+    return [(mu, prec) for _, mu, prec in fusion], [name for name, _, _ in fusion]
+"""
+
+
+def _open_branch_verdict(source: str) -> str:
+    """门开分支**结构**判定：返回 `"绿"`（当前跨仓认知成立）或以 `红:` 开头的原因。
+
+    守卫本体与判别性自证**共用本函数**——复刻两份判定逻辑必然漂移，那正是「自证绿了、
+    主守卫早就不是这个判据」的经典失效方式。
+    """
+    facts = _zero_ignite_facts(source)
+    if isinstance(facts, str):
+        return f"红:{facts}"
+    if not facts.select_fired_has_max_fallback:
+        return "红:_select_fired 内已无 max-fallback"
+    if facts.select_fired_before_gate:
+        return "红:_select_fired 被提到门判之前（两条路径都走阈值筛选）"
+    if not facts.select_fired_in_gate_body:
+        return "红:门关分支无 _select_fired"
+    if not facts.gate_body_ends_with_return:
+        return "红:门关分支未提前 return"
+    if facts.select_fired_on_open_path:
+        return "红:门开分支出现 _select_fired"
+    if not facts.physio_prefix_filter_on_open_path:
+        return "红:门开分支已无 physio 前缀过滤"
+    return "绿"
+
+
+def _physio_gap_verdict(source: str) -> str:
+    """**D7 覆盖缺口**判定：`"绿"` = 缺口**仍在**（门关路径上没有任何 physio 过滤）。
+
+    观测轴 = physio 前缀过滤**相对 `if gate_fusion:` 的位置**（Zero 回执 Q3 ② 的收口动作
+    就是把过滤挪到门判之前）。锚在 `_select_fired` 函数体上的旧写法对该动作**完全失明**：
+    Zero 只改 `ignite()` 时 `_select_fired` 一个字不动，旧断言照样绿。
+    """
+    facts = _zero_ignite_facts(source)
+    if isinstance(facts, str):
+        return f"红:{facts}"
+    if not facts.select_fired_has_soft_beta:
+        return "红:_select_fired 内已无 soft_beta 分支（软门被移除）"
+    if facts.physio_before_gate:
+        return "红:physio 过滤已提到 `if gate_fusion:` 之前"
+    if facts.physio_in_gate_body:
+        return "红:门关分支内已施 physio 过滤"
+    if facts.physio_in_select_fired:
+        return "红:_select_fired 内已施 physio 过滤"
+    return "绿"
 
 
 # 我方实际发往 Zero 的 physio 流名（合并态 / 未合并态）。用于核对 Zero 的 D7 前缀排除
@@ -1253,47 +1446,23 @@ class TestIgnitionGateReachabilityCrosscheck:
 
         本例只 pin 结构与默认值，不 pin 行号（Zero 侧行号漂移剧烈）。Zero 若把 fallback
         挪进门开分支、或把 `exclude_physio_fusion` 默认翻成 False，本例即红。
+
+        ⚠ 2026-07-29 重锚：判定改由 `_open_branch_verdict()`（**AST 语句归属**）给出。
+        上一版按缩进切 `if gate_fusion:` 字符串块，被 Zero 新写进 `ignite()` docstring 的
+        ``if gate_fusion:`` **散文**锚走了切点、切出空的门关分支而**假红**——实测确认
+        （pitfalls ⑦「切分锚点滑走」第二次复发）。AST 不看散文，只看语句。
         """
         source = self._source()
 
         # ① fallback 与阈值筛选都在 _select_fired 内；ignite 只在 gate_fusion 真分支调它。
-        select_fired = _extract_function_body(source, "_select_fired")
-        if select_fired is None:
-            pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
-        assert "max(" in select_fired, "_select_fired 内已无 max-fallback，可达性结论须重评"
-
-        ignite_body = _extract_function_body(source, "ignite")
-        if ignite_body is None:
-            pytest.skip("未找到 ignite，Zero 结构可能大改，跳过")
-        assert "if gate_fusion:" in ignite_body, (
-            "ignite 不再以 `if gate_fusion:` 二分——门控形态变了，须按新形态重标"
-        )
-        # 按**缩进**切出 `if gate_fusion:` 块体与其后的门开分支（不按 return 切，理由见
-        # `_split_if_block` docstring：按 return 切会被「真分支不再 return」绕过）。
-        split = _split_if_block(ignite_body, "if gate_fusion:")
-        assert split is not None
-        gate_closed_part, gate_open_only = split
-        # ⚠ 切分有效性守卫：两侧都非空才谈得上「分支归属」；否则下面的 `not in` 恒真=空断言
-        # （本仓 pitfalls「绿灯必须先证明它能红」第 ⑥ 例正是这么踩的）。
-        assert gate_closed_part.strip() and gate_open_only.strip(), (
-            "切不出 ignite 的门关/门开两分支——结构变了，须按新形态重标（勿让本例退化成空断言）"
-        )
-        assert "_select_fired" in gate_closed_part, (
-            "gate_fusion 真分支里已无 _select_fired——阈值通路被重构，须重标"
-        )
-        # 真分支必须**提前 return**：否则会落穿到门开分支，两条路径同时执行，
-        # 「门关不走融合分支」这个前提就不成立了（按 return 切分时抓不到这种改动）。
-        closed_statements = [ln.strip() for ln in gate_closed_part.split("\n") if ln.strip()]
-        assert closed_statements and closed_statements[-1].startswith("return "), (
-            f"gate_fusion 真分支不再以 return 收尾（末句 {closed_statements[-1:]!r}）"
-            "——会落穿到门开分支，本仓的门关/门开二态刻画须重评。"
-        )
-        assert "_select_fired" not in gate_open_only, (
-            "门开分支里出现了 _select_fired——max-fallback 被挪回数值通路，"
-            "本仓「门开时 physio 不经 fallback」的结论须撤回并重评。"
+        #    ② D7：门开分支仍按 `startswith(_PHYSIO_PREFIXES)` 剔 physio。
+        verdict = _open_branch_verdict(source)
+        assert verdict == "绿", (
+            f"门开分支结构判定为 {verdict}——本仓「门开时 physio 被点名排除、不经 fallback」"
+            "的跨仓结论所依赖的结构前提已变，须逐条重核后按新形态重标（勿放宽断言）。"
         )
 
-        # ② D7：门开分支默认按前缀剔 physio。默认值 pin 与前缀集 pin 都要。
+        # ③ D7 的默认值 pin 与前缀集 pin（值级，不是结构）。
         exclude_default = re.search(r"exclude_physio_fusion\s*:\s*bool\s*=\s*(True|False)", source)
         assert exclude_default is not None, "未找到 exclude_physio_fusion 形参默认值，须重标"
         assert exclude_default.group(1) == "True", (
@@ -1315,7 +1484,7 @@ class TestIgnitionGateReachabilityCrosscheck:
             )
 
     def test_soft_gate_bypasses_physio_exclusion(self) -> None:
-        """**D7 承诺的已知覆盖缺口**（特征化，非缺陷断言）：软门分支不施 physio 排除。
+        """**D7 承诺的已知覆盖缺口**（特征化，非缺陷断言）：门关路径上不施 physio 排除。
 
         `_select_fired` 在 `soft_beta`（`ZERO_IGNITION_BETA` / `state.ignition_beta`）非
         None 时走软门：**全部流含 physio 一律进 fuse_terms**（精度乘 logistic gate），
@@ -1326,20 +1495,28 @@ class TestIgnitionGateReachabilityCrosscheck:
         默认 `IGNITION_BETA=None` 故当前未触发；且 `ignition_beta` **不在** Zero 的 MCP
         治理门控白名单内，理论上 MCP client 可经 config overrides 自行打开。
 
-        本例把这个缺口做成**可执行记录**：若 Zero 日后在软门分支内也施加 physio 排除
-        （缺口被堵），本例变红 → 提示我们更新跨仓认知并撤下相关风险提示。
+        ── 🔁 2026-07-29 **重锚观测轴**（Zero 回执 Q3 ② 预警，本仓现场复现属实）──
+        旧写法把锚点放在 **`_select_fired` 的函数体**上（断言其中无 `_PHYSIO_PREFIXES`）。
+        但 Zero 计划的收口动作是**把前缀过滤提到 `ignite()` 里 `if gate_fusion:` 之前、
+        三条路径同施**——那样改 `_select_fired` **一个字不动**，旧断言原地变绿，守卫
+        **静默失去对该缺口的刻画能力**（文案说缺口在、断言却测不到）。合成源码实测确认。
+
+        新观测轴 = **physio 前缀过滤相对 `if gate_fusion:` 的位置**（`_physio_gap_verdict`，
+        按 AST 语句归属判定，见 `_ZeroIgniteFacts`）。绿 = 缺口仍在；下述任一形态即红：
+        - 过滤被提到 `if gate_fusion:` **之前**（= Zero Q3 ② 落地，三路径同施）；
+        - 过滤出现在 `if gate_fusion:` **块体内**（门关分支自行收口）；
+        - 过滤出现在 `_select_fired` **体内**（只堵软门，旧锚点覆盖的那一种）。
+
+        🛑 **变红 = Zero 把缺口堵上了，这是好事**。正确处置是：更新本例文案、撤下
+        `notes/` 与跨仓台账里对应的风险提示、把断言改成「过滤必须在门判之前」的**正向**
+        pin。**绝不允许**为了让它变绿而放宽/删除断言——那等于把已兑现的跨仓承诺重新丢失。
         """
         source = self._source()
-        select_fired = _extract_function_body(source, "_select_fired")
-        if select_fired is None:
-            pytest.skip("未找到 _select_fired，Zero 结构可能大改，跳过")
-
-        assert "soft_beta" in select_fired, (
-            "_select_fired 内已无 soft_beta 分支——软门被移除，本缺口记录可撤下"
-        )
-        assert "_PHYSIO_PREFIXES" not in select_fired, (
-            "_select_fired 内出现了 physio 前缀过滤——D7 覆盖缺口已被堵上（好事），"
-            "请更新本例文案与跨仓风险提示后再放行"
+        verdict = _physio_gap_verdict(source)
+        assert verdict == "绿", (
+            f"D7 覆盖缺口判定为 {verdict}——缺口已被堵上（好事）或门控形态已变。"
+            "请按 docstring 的处置指示更新文案与跨仓风险提示、把断言翻成正向 pin，"
+            "**不要**放宽本断言。"
         )
         # 默认值 pin：缺口当前不被触发，靠的是 IGNITION_BETA 默认 None
         beta_default = re.search(r"^IGNITION_BETA\s*[:=][^=\n]*=\s*(\S+)", source, re.MULTILINE)
@@ -1391,70 +1568,125 @@ class TestIgnitionGateReachabilityCrosscheck:
         )
 
     def test_gate_branch_guard_goes_red_on_structural_relocation(self) -> None:
-        """判别性自证：门开分支结构守卫对三种「真会发生的改法」都能红，不是恒绿。
+        """判别性自证：门开分支结构守卫对四种「真会发生的改法」都能红，不是恒绿。
 
-        「绿灯必须先证明它能红」同族第 ⑦ 例。上一版按 `partition("return ")` 切分支，
-        实测对「真分支不再 return」**绿**——切点会落到函数末尾那个 return 上，把改动
-        整个跳过去。改用缩进切块 + 显式断言真分支以 return 收尾后，三态全红：
+        「绿灯必须先证明它能红」同族第 ⑦ 例，本例已被**两次**实测打脸后重写：
+        - 第一版按 `partition("return ")` 切分支 → 对「真分支不再 return」**实测绿**
+          （切点滑到函数末尾那个 return 上）；
+        - 第二版改按缩进切字符串块 → 被 Zero 写进 docstring 的 ``if gate_fusion:``
+          **散文**锚走切点、切出空门关分支 → 对 Zero 当前源码**实测假红**（2026-07-29）。
+        现按 **AST 语句归属**判定（`_zero_ignite_facts`），散文/注释一律不参与。
 
         (1) fallback 被挪进门开分支 → 门开分支出现 `_select_fired` → 红；
-        (2) 真分支去掉提前 return（落穿，两条路径同时执行）→ 末句非 return → 红；
-        (3) `if gate_fusion:` 二分被拆掉 → 无二分 → 红。
+        (2) 门关分支去掉提前 return（落穿，两条路径同时执行）→ 红；
+        (3) `if gate_fusion:` 二分被拆掉 → 无二分 → 红；
+        (4) 门开分支的 physio 前缀过滤被撤掉（D7 在门开也失效）→ 红。
+        且 (0) 现行形态（**含 docstring 里那句 ``if gate_fusion:`` 散文**）必须绿。
 
+        判定与主守卫**共用** `_open_branch_verdict()`，不复刻——复刻两份必然漂移。
         不依赖 `D:\\Zero` 在位（用合成源码），判别力常年在测。
         """
-        base = (
-            "def ignite(streams, *, threshold=0.18, gate_fusion=True):\n"
-            "    scored = _score_streams(streams)\n"
-            "    if gate_fusion:\n"
-            "        selected = _select_fired(scored, threshold=threshold)\n"
-            "        return [(mu, prec) for _, mu, prec in selected]\n"
-            "\n"
-            "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]\n"
-            "    if exclude_physio_fusion:\n"
-            "        fusion = [t for t in fusion if not t[0].startswith(_PHYSIO_PREFIXES)]\n"
-            "    return fusion\n"
+        base = _SYNTHETIC_ZERO_IGNITE
+        assert _open_branch_verdict(base) == "绿", (
+            "现行形态应绿——否则守卫对 Zero 当前源码就是假阳性（本例合成源码刻意保留了"
+            "Zero docstring 里那句 ``if gate_fusion:`` 散文，正是它把上一版切点锚走的）"
         )
-
-        def evaluate(source: str) -> str:
-            """复刻主守卫的判定，返回 '绿' 或红的原因（与主例逻辑一一对应）。"""
-            body = _extract_function_body(source, "ignite")
-            if body is None or "if gate_fusion:" not in body:
-                return "红:无 gate 二分"
-            split = _split_if_block(body, "if gate_fusion:")
-            if split is None:
-                return "红:切分失败"
-            closed, opened = split
-            if not (closed.strip() and opened.strip()):
-                return "红:切分有效性"
-            if "_select_fired" not in closed:
-                return "红:门关分支无 _select_fired"
-            statements = [ln.strip() for ln in closed.split("\n") if ln.strip()]
-            if not (statements and statements[-1].startswith("return ")):
-                return "红:真分支未提前 return"
-            if "_select_fired" in opened:
-                return "红:门开分支出现 _select_fired"
-            return "绿"
-
-        assert evaluate(base) == "绿", "现行形态应绿——否则守卫对 Zero 当前源码就是假阳性"
 
         relocated = base.replace(
             "    fusion = [(name, mu, prec) for name, mu, prec, _ in scored]",
-            "    fusion = _select_fired(scored, threshold=threshold)",
+            "    fusion = _select_fired(scored, threshold=threshold, "
+            "survival_fallback=survival_fallback, soft_beta=soft_beta)",
         )
-        assert evaluate(relocated) == "红:门开分支出现 _select_fired", (
+        assert _open_branch_verdict(relocated) == "红:门开分支出现 _select_fired", (
             "fallback 被挪进门开分支时守卫必须红——这正是本仓结论赖以成立的那条结构前提"
         )
 
         fallthrough = base.replace(
-            "        return [(mu, prec) for _, mu, prec in selected]", "        pass"
+            "        return [(mu, prec) for _, mu, prec in selected], "
+            "[name for name, _, _ in selected]",
+            "        pass",
         )
-        assert evaluate(fallthrough) == "红:真分支未提前 return", (
-            "真分支落穿时守卫必须红——上一版按 return 切分在此**实测为绿**，是真盲点"
+        assert _open_branch_verdict(fallthrough) == "红:门关分支未提前 return", (
+            "门关分支落穿时守卫必须红——第一版按 return 切分在此**实测为绿**，是真盲点"
         )
 
         no_gate = base.replace("    if gate_fusion:", "    if True:")
-        assert evaluate(no_gate) == "红:无 gate 二分", "二分被拆掉时守卫必须红"
+        assert _open_branch_verdict(no_gate).startswith("红:ignite 顶层已无"), (
+            "二分被拆掉时守卫必须红"
+        )
+
+        no_d7 = base.replace(
+            "        fusion = [t for t in fusion "
+            "if not t[0].lower().startswith(_PHYSIO_PREFIXES)]\n",
+            "        pass\n",
+        )
+        assert _open_branch_verdict(no_d7) == "红:门开分支已无 physio 前缀过滤", (
+            "D7 过滤从门开分支消失时守卫必须红——那是我方 physio 唯一被结构性排除的地方"
+        )
+
+    def test_physio_gap_guard_goes_red_when_zero_closes_the_gap(self) -> None:
+        """判别性自证：**重锚后**的 D7 缺口守卫，对「缺口被堵」的三种落地形态都能红。
+
+        重锚动机（2026-07-29，Zero 回执 Q3 ② 预警 + 本仓合成源码实测复现）：旧锚点在
+        `_select_fired` 函数体上，而 Zero 计划的收口是改 `ignite()`——`_select_fired`
+        一个字不动，旧断言**实测仍绿**，守卫静默失能。新锚点是「physio 过滤相对
+        `if gate_fusion:` 的位置」。
+
+        (0) 现行形态（过滤只在门开分支）→ 绿，即「缺口仍在」；
+        (1) 过滤被提到 `if gate_fusion:` **之前**（Zero Q3 ② 落地，三路径同施）→ 红；
+        (2) 过滤只加在**门关分支块体内** → 红；
+        (3) 过滤只加在 `_select_fired` 的**软门分支内**（旧锚点覆盖的那一种）→ 红；
+        (4) `ignite` / `_select_fired` 整个不在了 → **红**（不是 skip）：本仓
+            「门关路径下 D7 不生效、physio 靠低 Πa 自律挡着」这一整条结论的依据没了，
+            静默跳过等于把它当成仍然成立。环境性缺失（Zero 不在位）另由 `_source()` skip。
+
+        判定与主守卫共用 `_physio_gap_verdict()`。不依赖 `D:\\Zero` 在位。
+        """
+        base = _SYNTHETIC_ZERO_IGNITE
+        assert _physio_gap_verdict(base) == "绿", (
+            "现行形态应绿（缺口仍在）——否则守卫对 Zero 当前源码就是假阳性"
+        )
+
+        hoisted = base.replace(
+            "    scored = _score_streams(streams)\n",
+            "    if exclude_physio_fusion:\n"
+            "        streams = [s for s in streams "
+            "if not s[0].lower().startswith(_PHYSIO_PREFIXES)]\n"
+            "    scored = _score_streams(streams)\n",
+        )
+        assert _physio_gap_verdict(hoisted) == "红:physio 过滤已提到 `if gate_fusion:` 之前", (
+            "Zero Q3 ② 落地（过滤提到门判之前、三路径同施）时守卫必须红——"
+            "旧锚点在 _select_fired 上，对这一形态**实测为绿**，正是本次重锚的起因"
+        )
+
+        in_gate_body = base.replace(
+            "        selected = _select_fired(\n",
+            "        scored = [s for s in scored "
+            "if not s[0].lower().startswith(_PHYSIO_PREFIXES)]\n"
+            "        selected = _select_fired(\n",
+        )
+        assert _physio_gap_verdict(in_gate_body) == "红:门关分支内已施 physio 过滤", (
+            "过滤下沉到门关分支块体内时守卫必须红"
+        )
+
+        in_select_fired = base.replace(
+            "    if soft_beta is not None:\n",
+            "    if soft_beta is not None:\n"
+            "        scored = [s for s in scored "
+            "if not s[0].lower().startswith(_PHYSIO_PREFIXES)]\n",
+        )
+        assert _physio_gap_verdict(in_select_fired) == "红:_select_fired 内已施 physio 过滤", (
+            "只堵软门（旧锚点唯一能看见的形态）时守卫仍必须红"
+        )
+
+        gone = base.replace("def ignite(", "def ignite_v2(")
+        assert _physio_gap_verdict(gone).startswith("红:Zero 顶层已无 `def ignite`"), (
+            "ignite 整个消失时选**红**而非 skip：本仓门关路径结论的依据没了，须人工重评"
+        )
+        no_helper = base.replace("def _select_fired(", "def _select_fired_v2(")
+        assert _physio_gap_verdict(no_helper).startswith("红:Zero 顶层已无 `def _select_fired`"), (
+            "_select_fired 消失时同样选红——软门旁路是否还在，须人工重评"
+        )
 
     def test_survival_floor_guard_goes_red_not_skip_on_confirmed_change(self) -> None:
         """判别性自证：对 Zero 已确认必改的去地板形态，上例走**红**（断言失败）而非 skip。
