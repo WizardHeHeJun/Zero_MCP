@@ -3,9 +3,10 @@
 本文件覆盖**两通道共有的通道级契约**（先验形状、signal_source、优雅回退、Protocol
 符合性、Hub 集成、默认关、NaN 守卫）与 **HrvChannel 的度量路径**。
 
-⚠ **EdaChannel 的度量语义**（SCL−基线 Δ、冷启动、基线历史裁剪、跨被试可比）不在本文件，
-在 `tests/mcp/test_zero_physio_eda_v2.py`。本文件对 EDA 只断言「通道级」行为，故用注入时钟
-预热到能出读数即可，不关心读数取值。
+⚠ **两通道的度量语义**（指标−基线 Δ、冷启动、基线历史裁剪、跨被试可比）不在本文件：
+EDA 在 `tests/mcp/test_zero_physio_eda_v2.py`、HRV 在 `tests/mcp/test_zero_physio_hrv_v2.py`。
+本文件对二者只断言「通道级」行为，故用注入时钟预热到能出读数即可，一般不关心读数取值
+（个别处用取值做正控，防断言退化成恒真式）。
 
 覆盖蓝图 E1-E13：
   E1.  EDA 非空 ndarray → sense 返回 ModalityPrior 非 None（已过冷启动）。
@@ -19,7 +20,7 @@
   E9.  HRV mock 处理失败 → None + warning。
   E10. EdaChannel / HrvChannel isinstance(PerceptionChannel) True。
   E11. 注册 PerceptionHub，含抛异常通道时该通道先验仍保留、异常通道跳过（AD-3）。
-  E12. HrvChannel 独立产 modality="hrv/rmssd"、Πv=MIN_PRECISION。
+  E12. HrvChannel 独立产 modality="hrv/rmssd"、Πv=MIN_PRECISION（须先跨过冷启动）。
   E13. ZERO_PHYSIO_CHANNEL_ENABLED=false（或未设）→ sense 返回 None。
 """
 
@@ -97,6 +98,26 @@ def _make_warm_eda_channel(**kwargs: Any) -> tuple[EdaChannel, _StepClock]:
     # 直接注入基线历史：等价于此前若干窗的观测，避免在本文件里重复 v2 的预热语义
     for _ in range(3):
         channel.baseline_history.append((clock.now, 5.0))
+        clock.advance()
+    return channel, clock
+
+
+_WARM_HRV_BASELINE_MS = 60.0
+"""预注入的 HRV 基线水平（ms）——取值本身在本文件无语义，只需与 mock 的 RMSSD 可比。"""
+
+
+def _make_warm_hrv_channel(**kwargs: Any) -> tuple[HrvChannel, _StepClock]:
+    """构造一个**已过冷启动**的 HrvChannel（同 EDA 侧：直接注入基线历史）。
+
+    ⚠ 2026-07-29 起 HrvChannel 与 EdaChannel 同构（窗间中位数基线 + 对称归一化 + 冷启动
+    返回 None），单发 ``sense()`` 必然返回 None。本文件测的是**通道级契约**（modality 名、
+    Πv、μv、μa 值域、Hub 集成），故只需跨过冷启动双门；度量语义在
+    `tests/mcp/test_zero_physio_hrv_v2.py`。
+    """
+    clock = _StepClock()
+    channel = HrvChannel(clock=clock, **kwargs)
+    for _ in range(3):
+        channel.baseline_history.append((clock.now, _WARM_HRV_BASELINE_MS))
         clock.advance()
     return channel, clock
 
@@ -306,24 +327,41 @@ class TestPhysioChannelInPerceptionHub:
 
 
 class TestHrvChannelPath:
-    """HrvChannel 独立产生 modality="hrv/rmssd"、Πv=MIN_PRECISION。"""
+    """HrvChannel 独立产生 modality="hrv/rmssd"、Πv=MIN_PRECISION（**已过冷启动**）。"""
 
     async def test_hrv_channel_returns_hrv_rmssd_modality(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """E12a：HrvChannel sense → modality == "hrv/rmssd"。"""
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-        ch = HrvChannel(sampling_rate=256)
+        ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
         nk = _make_nk_mock(rmssd_ms=40.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert result is not None
         assert result.modality == "hrv/rmssd"
 
+    async def test_hrv_cold_start_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """E12a-bis：**未**预热的新实例单发 sense → None（冷启动无基线证据）。
+
+        判别力定位：上面四条 E12* 全部依赖 `_make_warm_hrv_channel` 预热，若哪天预热被
+        误当成「可有可无的样板」删掉，它们会集体变红；本例反过来锁住「不预热就该是 None」
+        这一新契约本身——两者一起确保「暖机」不是绕过失败的手段。
+        """
+        monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
+        ch = HrvChannel(sampling_rate=256)
+        nk = _make_nk_mock(rmssd_ms=40.0)
+        with patch.dict("sys.modules", {"neurokit2": nk}):
+            result = await ch.sense(signal=_make_ecg_signal(rate=256))
+        assert result is None
+        assert len(ch.baseline_history) == 1, (
+            "冷启动返回 None，但本窗观测仍须进历史（否则永不暖机）"
+        )
+
     async def test_hrv_precision_v_is_min(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """E12b：HrvChannel Πv == MIN_PRECISION（效价精度）。"""
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-        ch = HrvChannel(sampling_rate=256)
+        ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
         nk = _make_nk_mock(rmssd_ms=40.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
@@ -333,7 +371,7 @@ class TestHrvChannelPath:
     async def test_hrv_mu_v_is_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """E12c：HrvChannel mu[0] == 0.0（valence 盲）。"""
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-        ch = HrvChannel(sampling_rate=256)
+        ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
         nk = _make_nk_mock(rmssd_ms=40.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
@@ -341,14 +379,19 @@ class TestHrvChannelPath:
         assert result.mu[0] == pytest.approx(0.0)
 
     async def test_hrv_mu_a_in_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """E12d：HrvChannel mu[1]（μa）∈ [-1, 1]。"""
+        """E12d：HrvChannel mu[1]（μa）∈ [-1, 1]——含远超 ref 的 Δ 也不越界（对称钳制）。
+
+        RMSSD=500ms 对 60ms 基线 → Δ=−440ms ≫ delta_ref=100ms → 钳到 −1.0（不是 NaN、
+        不是 −4.4）。⚠ 该 Δ 为**负**：RMSSD 远高于基线 = 迷走张力高 = 唤醒低。
+        """
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-        ch = HrvChannel(sampling_rate=256)
-        nk = _make_nk_mock(rmssd_ms=40.0)
+        ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
+        nk = _make_nk_mock(rmssd_ms=500.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert result is not None
         assert -1.0 <= result.mu[1] <= 1.0
+        assert result.mu[1] == pytest.approx(-1.0)
 
     async def test_hrv_is_physio_stream(self) -> None:
         """E12e：HrvChannel.name 满足 is_physio_stream（M2 命名约定）。"""
@@ -406,14 +449,33 @@ class TestPhysioChannelNaNGuard:
     """
 
     async def test_hrv_nan_rmssd_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """HRV_RMSSD=NaN（R 峰不足）→ sense() 返回 None。"""
+        """HRV_RMSSD=NaN（R 峰不足）→ sense() 返回 None，**且不写进基线历史**。
+
+        位置语义在 2026-07-29 升级：守卫从「归一化前」变成「**任何状态写入前**」——
+        NaN 一旦进 baseline_history 就污染后续所有窗的基线中位数（`np.median` 遇 NaN 即
+        产 NaN，穿透到 μa），远不止丢掉本轮读数。
+        判别力已实证：把产品码里的守卫下移到 append 之后，本例的历史长度断言立即变红。
+        """
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
-        ch = HrvChannel(sampling_rate=256)
+        ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
+        size_before = len(ch.baseline_history)
+        assert size_before > 0, "预热未生效，下面的『长度未变』断言会退化为恒真"
+
         nk = _make_nk_mock()
         nk.hrv_time.return_value = pd.DataFrame({"HRV_RMSSD": [float("nan")]})
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert result is None
+        assert len(ch.baseline_history) == size_before, "NaN 被写进了基线历史（守卫位置错）"
+        assert all(np.isfinite(v) for _, v in ch.baseline_history)
+
+        # 正控：同一实例随后喂正常 RMSSD 仍能出读数，且基线未被 NaN 破坏
+        # （基线中位数 = 60ms，Δ = 60−40 = +20ms，ref=100ms → μa=+0.2）
+        nk.hrv_time.return_value = _make_fake_hrv_df(40.0)
+        with patch.dict("sys.modules", {"neurokit2": nk}):
+            recovered = await ch.sense(signal=_make_ecg_signal(rate=256))
+        assert recovered is not None
+        assert recovered.mu[1] == pytest.approx(0.2, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -422,20 +484,28 @@ class TestPhysioChannelNaNGuard:
 
 
 class TestPhysioChannelReset:
-    """有状态通道（EdaChannel）的 reset 契约（W2：被试切换必须调用）。"""
+    """有状态通道（EdaChannel / HrvChannel）的 reset 契约（W2：被试切换必须调用）。"""
 
     def test_hub_reset_all_clears_stateful_skips_stateless(self) -> None:
-        """PerceptionHub.reset_all() 清空 EdaChannel 基线历史；无 reset 的通道安全跳过。"""
+        """PerceptionHub.reset_all() 清空**两条** physio 通道的基线历史；无 reset 的通道跳过。
+
+        ⚠ HrvChannel 自 2026-07-29 起也有基线历史。它若没实现 ``reset()``，``reset_all()``
+        的鸭子类型检测会**静默跳过**它——新被试沿用旧被试基线，无任何报错。故本例把 HRV
+        一并纳入：删掉 ``HrvChannel.reset`` 本例立即变红（判别力已实证）。
+        """
         eda, _clock = _make_warm_eda_channel()
+        hrv, _hrv_clock = _make_warm_hrv_channel()
         assert len(eda.baseline_history) > 0
+        assert len(hrv.baseline_history) > 0
 
         stateless: Any = MagicMock(spec=["name", "sense"])
         stateless.name = "stateless"
 
-        hub = PerceptionHub([eda, stateless])
+        hub = PerceptionHub([eda, hrv, stateless])
         hub.reset_all()  # 不应因 stateless 无 reset 而抛
 
         assert len(eda.baseline_history) == 0, "reset_all 应清空 EdaChannel 基线历史"
+        assert len(hrv.baseline_history) == 0, "reset_all 应清空 HrvChannel 基线历史"
 
 
 # ---------------------------------------------------------------------------
