@@ -83,7 +83,7 @@ class AffectStimulus(BaseModel):
 class ModalityPrior(BaseModel):
     """单模态的低精度先验（MCP → Zero 内核 streams 注入一条）。
 
-    对应 affect_core.py:77-95 的 streams 形状：
+    对应 Zero affect_core.py 里 streams 变量的形状（按符号名锚定：其行号已多次漂移）：
     streams = list[(name: str, (μ_v, μ_a), (Π_v, Π_a))]
 
     精度 (Π_v, Π_a) 必须 > 0（高斯精度，精度=0 无意义）。

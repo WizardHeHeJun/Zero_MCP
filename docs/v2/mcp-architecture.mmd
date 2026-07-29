@@ -1,9 +1,9 @@
 flowchart TB
   subgraph layers["三层单向依赖（只能自上而下）"]
-    orch["🧩 编排层 src/orchestration + src/agents<br/>LangGraph StateGraph · Supervisor · 安全门（白名单/TOCTOU/注入过滤）"]:::client
-    mem["🧠 记忆层 src/memory<br/>长期记忆·图谱读写封装（当前 MemoryAPI Protocol 打桩）"]:::memory
-    sto["🗄️ 存储层 src/storage<br/>Postgres / Neo4j / Redis（待建）"]:::storage
-    orch -->|"只能向下调用"| mem
+    orch["🧩 编排层 src/orchestration + src/agents<br/>LangGraph StateGraph · Supervisor · 安全门（白名单/TOCTOU/注入过滤）<br/>组装根 persistence.py 注入后端（节点只见 Protocol）"]:::client
+    mem["🧠 记忆层 src/memory<br/>ScopedMemoryAPI：显式 scope · 任务完成节流<br/>新事实使旧事实失效（打戳不删行）"]:::memory
+    sto["🗄️ 存储层 src/storage<br/>SQLite(aiosqlite)：snapshots / memory_facts 物理分表<br/>Postgres / Neo4j / Redis 为平行扩展点（待建）"]:::storage
+    orch -->|"只能向下调用<br/>未配 ZERO_MCP_PERSISTENCE_DB 则退打桩"| mem
     mem -->|"只能向下调用"| sto
   end
 
