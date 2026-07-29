@@ -28,8 +28,10 @@ from src.mcp.zero.external_priors import (
     PHYSIO_MERGE_OMEGA_DEFAULT,
     PHYSIO_PRECISION_A_SELF_IGNITE_BOUND,
     PHYSIO_SUBSOURCE_PRECISION_A,
+    ZERO_SALIENCE_THRESHOLD,
     ModalityKind,
     ModalityPrior,
+    build_external_priors_override,
     merge_physio_priors,
     recommended_precision,
 )
@@ -1924,6 +1926,55 @@ class TestIgnitionGateReachabilityCrosscheck:
             f"合并后 Πa={merged_pi_a} 已达自点燃上界 {bound:.4f}——线上载荷会自行过阈，"
             "须跨仓确认（本仓 pitfalls ① 已实证抬子源可靠度会让线上 salience 冲到 0.3896）。"
         )
+
+    def test_mirrored_salience_threshold_matches_zero_source(self) -> None:
+        """**产品码**里的点燃门镜像 `ZERO_SALIENCE_THRESHOLD` 须逐值等于 Zero 源码。
+
+        为什么单列一条而不靠上面两条：`_ZERO_GATE_CONSTANTS` 与
+        ``test_physio_default_precision_stays_below_self_ignite_bound`` pin 的都是**测试侧**
+        的现算/期望值；M8 落地后，`src/mcp/zero/external_priors.py` 里**多了一个产品码镜像**
+        （运行期守卫真正拿去比的那个数）。两者漂移会让守卫按错误阈值放行/误拦，而既有两条
+        都探测不到——它们根本没读过这个新常量。
+        """
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        zero_threshold = float(match.group(1))
+
+        assert ZERO_SALIENCE_THRESHOLD == zero_threshold, (
+            f"产品码镜像漂移：本仓 ZERO_SALIENCE_THRESHOLD={ZERO_SALIENCE_THRESHOLD}、"
+            f"Zero SALIENCE_THRESHOLD={zero_threshold}。M8 自点燃守卫按本仓这个值现算硬顶——"
+            "不同步会让守卫按错误阈值判定（Zero 调低阈值时我方会静默放行本应拦的载荷）。"
+        )
+
+    def test_m8_guard_blocks_self_igniting_payload_against_live_zero_threshold(self) -> None:
+        """端到端：按 **Zero 源码现算**出的越界 Πa 构造载荷，M8 必须真的拦下。
+
+        与上一条的分工：上一条只比常量，本条把「常量 → 守卫行为」这一环也接上——
+        避免出现「常量对了但守卫压根没消费它 / 被摘掉了」的假绿。
+        Πa 由 Zero 阈值现算（不手抄），故 Zero 调阈值时本例跟着走。
+        """
+        source = self._source()
+        match = re.search(rf"^SALIENCE_THRESHOLD\s*=\s*({_NUM})", source, re.MULTILINE)
+        if match is None:
+            pytest.skip("未找到 SALIENCE_THRESHOLD，跳过")
+        threshold = float(match.group(1))
+
+        # μv=0 下的硬顶；取恰好等于（`>=` 语义 ⇒ 取等即越界）
+        over_bound_pi_a = 2 * threshold - MIN_PRECISION
+        prior = ModalityPrior(
+            modality="physio", mu=(0.0, 0.5), precision=(MIN_PRECISION, over_bound_pi_a)
+        )
+        with pytest.raises(ValueError, match="M8 physio 自点燃越界"):
+            build_external_priors_override([prior])
+
+        # 正控：略低于硬顶必须放行（排除「守卫恒红」，否则上面的红无意义）
+        safe = ModalityPrior(
+            modality="physio", mu=(0.0, 0.5), precision=(MIN_PRECISION, over_bound_pi_a - 1e-6)
+        )
+        payload = build_external_priors_override([safe])
+        assert len(payload["external_priors"]) == 1, "正控失败：合法 physio 载荷未出线"
 
     def test_gate_branch_guard_goes_red_on_structural_relocation(self) -> None:
         """判别性自证①：门开分支**结构** pin 六态——真会发生的改法必红、合法等价形态不误红。
