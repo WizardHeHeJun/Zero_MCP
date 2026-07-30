@@ -39,6 +39,11 @@ poc = [
     "uiautomation>=2.0",
     "pywinauto>=0.6.8",
 ]
+sinks-vts = [
+    # VTube Studio Live2D 渲染终端（sinks/vts.py）；VTS_SINK_ENABLED 默认关，
+    # 依赖随惯例走 extra——默认关的能力默认不装（vts.py 内延迟 import）
+    "websockets>=13.0",
+]
 # GPU 为可选加速（硬前提 3）：EP 自适应 CUDA>DirectML>CPU
 gpu-cuda = [
     "onnxruntime-gpu>=1.18",
