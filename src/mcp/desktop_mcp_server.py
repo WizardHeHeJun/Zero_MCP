@@ -403,10 +403,13 @@ async def close_window(window_handle: int) -> str:
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    from src.logging_config import configure_logging  # noqa: PLC0415
+
+    # 接管 root：FastMCP 构造时 SDK 已抢注 RichHandler(stderr)，此前的内联
+    # basicConfig 因此实为 no-op 死码。configure_logging 摘掉抢注 handler，
+    # 统一为 LOG_FORMAT + stderr（不接管会 stderr 双份日志）；
+    # ZERO_MCP_LOG_LEVEL / ZERO_MCP_LOG_FILE 可调级别与落盘，见 .env.example。
+    configure_logging()
 
     enabled = _is_enabled()
     logger.info(

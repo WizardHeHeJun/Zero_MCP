@@ -17,13 +17,10 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 规范常量（来自 Zero `src/agents/models/facs_decoder.py` 与 `.../composite.py` 的同名符号）
