@@ -2819,7 +2819,24 @@ class TestIgnitionGateReachabilityCrosscheck:
             f"本仓 src/ 下扫不到 open_session（扫描根 {repo_src}）——扫描器没读到真内容，"
             "下面的 not-in 断言会退化成恒真式"
         )
-        injectors = sorted(str(p) for p, text in sources.items() if "sample_sigma_cap" in text)
+        # 🛑 判据从「出现过这个词」收窄成「**注入形**出现」（2026-07-30 修，起因是一次真误报）：
+        # 本仓接入 `zero.describe_config` 回读面后，`client.DESCRIBE_CONFIG_EXPECTED_KEYS` 里
+        # 必然出现字符串 `"sample_sigma_cap"` —— 那是**读**对方返回体的键名，读不可能覆写任何值，
+        # 而旧的裸子串扫描把它判成了「注入点」。放着不管的代价不是假绿而是**假红**：一条真守卫
+        # 从此长期红着，最后必然被人一键放宽（连同它真正要守的那半）。
+        # 收窄后仍**只认写入形**：dict 项 `"sample_sigma_cap": …` 与关键字实参
+        # `sample_sigma_cap=…`。读侧形态（集合成员字面量、`fields["sample_sigma_cap"]`）不命中。
+        injection_re = re.compile(r'"sample_sigma_cap"\s*:|\bsample_sigma_cap\s*=')
+        # 正控：收窄不得把守卫收成恒不命中（pitfalls ⑥）。两种注入形态各验一次，
+        # 外加一个读侧样本验其**不**命中——三格同时成立，收窄才既有判别力又不误报。
+        assert injection_re.search('config = {"sample_sigma_cap": 0.3}'), "收窄后认不出 dict 注入形"
+        assert injection_re.search("open_session(sample_sigma_cap=0.3)"), (
+            "收窄后认不出 kwarg 注入形"
+        )
+        assert not injection_re.search('KEYS = frozenset({"sample_sigma_cap"})'), (
+            "收窄后仍把**读侧**键名当注入——本条会重新变成假红"
+        )
+        injectors = sorted(str(p) for p, text in sources.items() if injection_re.search(text))
         assert not injectors, (
             f"我方 src/ 出现 sample_sigma_cap 注入点 {injectors}——上面「Zero 缺省通路即我方全部"
             "通路」的前提不再成立，须把注入值一并纳入可达性/抖动结论重评。"
@@ -3610,3 +3627,334 @@ class TestTdCoefficientCrosscheck:
             f"{_PINNED_MCP_STIMULUS_KEY!r}。若每步键不同，`value_table` 不再跨轮累积同一 V(s)"
             f"→ 本仓 resume 观测量漂移归零 → `state-matters` 守卫会先行 FAIL（非 flaky，是真失效）"
         )
+
+
+# ---------------------------------------------------------------------------
+# zero.describe_config 回读面跨仓守卫（本仓 2026-07-30 接入该工具时补）
+#
+# 守卫四件，**判红强度刻意分层**（不是越红越好，红错了会让 Zero 的正常演进变成互相锁死）：
+#   1. **工具名** —— 硬红。我方 client 按字符串工具名调用，Zero 一改名，我方的
+#      `list_tools` 归因会把它判成「老部署没这工具」⇒ **永久静默降级**，且降级看起来
+#      完全正常（那正是回退路径该有的样子）。这一格没有任何自愈可能，必须当场红。
+#   2. **字段集** —— 硬红。我方 `DESCRIBE_CONFIG_EXPECTED_KEYS` 是独立持有的期望，
+#      对方少键 ⇒ 我方那一位读不到（判读降级）、多键 ⇒ 我方漏读了对方的新能力。
+#      两者在**运行期**都只 warn（见 client `_log_describe_config_shape`），故静态这一层要硬。
+#   3. **版本号** —— warn + STRICT 转红（沿用 `_warn_unconsumed_zero_codes` 的成例）。
+#      bump 是**正常演进**，且我方 client 对不认识的版本**已有明确降级路径**（不炸），
+#      日常开发不该因为对方动了一个数字就全套变红；但联调/发版门必须当场表态：
+#      去现场核一遍返回体，确认 21 键语义未变后再把新版本收进
+#      `client.KNOWN_DESCRIBE_CONFIG_VERSIONS`——**不核就收，等于把版本号变成摆设**。
+#   4. **比对基准** —— 硬红。我方运行期拿 `error_codes` / `external_prior_schema_version`
+#      做的两项自检，必须确实以 Zero 自己的 `ZERO_ERROR_CODES` /
+#      `EXTERNAL_PRIOR_SCHEMA_VERSION` 为源。对方哪天改成回一份手写字面量，我方的
+#      「运行期核对」就变成跟一份影子表比对：**全绿、且永远不会红**，正是最坏的那种守卫失效。
+# ---------------------------------------------------------------------------
+
+_ZERO_DESCRIBE_FUNC = "describe_config"
+# describe_config 返回体里，本仓**依赖其取值来源**的两个键 → 期望的 Zero 侧源符号名。
+_DESCRIBE_VALUE_SOURCES: dict[str, str] = {
+    "error_codes": "ZERO_ERROR_CODES",
+    "external_prior_schema_version": "EXTERNAL_PRIOR_SCHEMA_VERSION",
+}
+
+
+def _zero_describe_config_func(tree: ast.Module) -> _FuncDef | None:
+    """在整棵树里找 `describe_config` 函数定义（它嵌在 `build_server` 内部，不在顶层）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, _FUNC_DEF_NODES) and node.name == _ZERO_DESCRIBE_FUNC:
+            return node
+    return None
+
+
+def _zero_describe_config_tool_name(func: _FuncDef) -> str | None:
+    """取装饰器上的工具名 `name="zero.describe_config"`；拿不到 → None（调用方判红）。"""
+    for deco in func.decorator_list:
+        if not isinstance(deco, ast.Call):
+            continue
+        for kw in deco.keywords:
+            if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                value = kw.value.value
+                return value if isinstance(value, str) else None
+    return None
+
+
+def _zero_describe_config_return_dict(func: _FuncDef) -> ast.Dict | None:
+    """取该函数**源码序最后一条** `return {...}` 的字典字面量；没有字面量 return → None。
+
+    🛑 按 `lineno` 取最大，**不是**按 `ast.walk` 的遍历序取最后一个（2026-07-30 审查订正）：
+    `ast.walk` 是 **BFS**（逐层展开），嵌在 `if` 里的早退 return 与函数体末尾的真返回分处
+    不同深度 ⇒ 遍历序与源码序无关。今天 Zero 的 `describe_config` 只有单一 return，两种取法
+    结果相同——但那是**偶然事实**，不该被守卫依赖：对方哪天加一条错误分支的早退
+    `return {...}`，BFS 取法就可能选中另一个字典字面量，轻则假红，重则**拿错误的返回体形状
+    去比对**（看着绿，守的却是别的东西）。
+    """
+    candidates = [
+        node.value
+        for node in ast.walk(func)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda node: node.lineno)
+
+
+def _dict_literal_keys(node: ast.Dict) -> tuple[frozenset[str], bool]:
+    """取字典字面量的字符串键集，并回报是否含**非字面量键**（`**spread` 或计算式）。
+
+    含非字面量键时第二位为 True —— 此时键集**不可信**，守卫应判红而不是拿半份键集比对
+    （半份键集比对必然报出一堆假的「缺键」，比不比更糟）。
+    """
+    keys: set[str] = set()
+    opaque = False
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+        else:
+            opaque = True
+    return frozenset(keys), opaque
+
+
+def _zero_module_int_literal(tree: ast.Module, name: str) -> int | None:
+    """取顶层 `NAME = <int 字面量>`；不存在/非 int 字面量 → None（`True` 不算 int）。"""
+    for node in tree.body:
+        names, value = _module_assign_targets(node)
+        if name not in names or not isinstance(value, ast.Constant):
+            continue
+        literal = value.value
+        if isinstance(literal, bool) or not isinstance(literal, int):
+            return None
+        return literal
+    return None
+
+
+def _warn_describe_config_version_bump(zero_version: int, known: frozenset[int]) -> None:
+    """Zero bump 了 describe_config 版本而本仓未跟 → 日常告警，STRICT 下判红。
+
+    为什么不无条件判红：bump 是对方的正常演进，我方 client 对不认识的版本**已有降级路径**
+    （仍解析、仍报告，但不把不一致升级成硬失败，见 `client.KNOWN_DESCRIBE_CONFIG_VERSIONS`），
+    故日常不必打断。为什么 STRICT 必须红：那条降级路径意味着 ①错误码表核对 ②发流前自检
+    的**强制力被关掉**，联调/发版前必须有人现场核过返回体再把版本号收进来。
+
+    「版本已认识 ⇒ 静默」的判断**放在本函数内**（与姊妹函数 `_warn_unconsumed_zero_codes`
+    同构，2026-07-30 补测时对齐）：放在调用点的话，「已认识不许响」这条就只能靠在测试里
+    照抄一遍 `if` 来验，那是在验测试自己写的分支，等于恒真式（pitfalls ⑥）。
+    """
+    from tests.mcp.conftest import zerorepo_strict_enabled
+
+    if zero_version in known:
+        return
+    message = (
+        f"Zero `DESCRIBE_CONFIG_VERSION={zero_version}` 不在本仓已核验集合 {sorted(known)}。"
+        "本仓 client 会因此**降级为只报告不强制**（schema 版本不一致由 raise 降为 warn）。"
+        "请现场核对方 describe_config 返回体的 21 键语义是否仍与本仓期望一致，"
+        "确认后把新版本号收进 client.KNOWN_DESCRIBE_CONFIG_VERSIONS，并写清核了什么。"
+    )
+    if zerorepo_strict_enabled():
+        pytest.fail(
+            f"[{STRICT_ENV}] {message}\n"
+            f"（STRICT 是联调/发版门：跨仓契约版本的单边 bump 要求当场表态，不接受挂账告警。）"
+        )
+    warnings.warn(message, stacklevel=2)
+
+
+@pytest.mark.zerorepo
+class TestDescribeConfigCrosscheck:
+    """`zero.describe_config` 回读面跨仓一致——工具名 / 字段集 / 版本号 / 比对基准。
+
+    D:\\Zero 或 server.py 不在位 → skip；**在位但对不上 → 按上方分层判红/告警**。
+    """
+
+    def _func_or_skip(self) -> _FuncDef:
+        tree = _zero_server_tree_or_skip()
+        func = _zero_describe_config_func(tree)
+        if func is None:
+            pytest.skip(
+                f"Zero server.py 里没有 `{_ZERO_DESCRIBE_FUNC}` 函数（{_ZERO_SERVER_PY}）——"
+                "该部署尚未上线回读面，本仓 client 走 NOT_REGISTERED 优雅回退，非缺陷"
+            )
+        return func
+
+    def test_tool_name_pinned(self) -> None:
+        """工具名漂移 → 本仓探测会**永久静默降级**成「老部署」，必须硬红。"""
+        from src.mcp.zero.client import _DESCRIBE_CONFIG_TOOL
+
+        func = self._func_or_skip()
+        name = _zero_describe_config_tool_name(func)
+        assert name == _DESCRIBE_CONFIG_TOOL, (
+            f"describe_config 工具名漂移：Zero={name!r}，本仓按 {_DESCRIBE_CONFIG_TOOL!r} 调用。"
+            "改名后我方 list_tools 归因会判成「老部署没这工具」→ 依赖回读面的能力"
+            "（错误码表运行期核对、发流前自检）全部静默关闭，且**看起来一切正常**。"
+        )
+
+    def test_field_set_matches_client_expectation(self) -> None:
+        """我方期望字段集 vs 对方真实返回体，逐键相等。"""
+        from src.mcp.zero.client import DESCRIBE_CONFIG_EXPECTED_KEYS
+
+        func = self._func_or_skip()
+        ret = _zero_describe_config_return_dict(func)
+        assert ret is not None, (
+            f"Zero `{_ZERO_DESCRIBE_FUNC}` 里找不到字典字面量的 return —— 返回体改成动态构造后"
+            "本守卫无法静态核验字段集，须改守卫（或要求对方保留字面量形态）"
+        )
+        zero_keys, opaque = _dict_literal_keys(ret)
+        assert not opaque, (
+            "Zero describe_config 返回体含非字面量键（`**spread` 或计算式），键集不可信 —— "
+            "拿半份键集比对会报出一堆假缺键，故此处直接判红要求人工核。"
+        )
+        missing = sorted(DESCRIBE_CONFIG_EXPECTED_KEYS - zero_keys)
+        extra = sorted(zero_keys - DESCRIBE_CONFIG_EXPECTED_KEYS)
+        assert not missing and not extra, (
+            f"describe_config 字段集漂移：本仓期望但对方没有={missing}；"
+            f"对方有但本仓未登记={extra}。"
+            "前者 ⇒ 我方那一位读不到（判读静默降级）；后者 ⇒ 我方漏读了对方的新能力。"
+            "两者在运行期都只 warn，故此处硬红。请同步 client.DESCRIBE_CONFIG_EXPECTED_KEYS。"
+        )
+
+    def test_version_is_known_to_client(self) -> None:
+        """版本 bump 提醒：日常 warn、STRICT 判红（分层理由见本节顶部注释）。"""
+        from src.mcp.zero.client import KNOWN_DESCRIBE_CONFIG_VERSIONS
+
+        tree = _zero_server_tree_or_skip()
+        if _zero_describe_config_func(tree) is None:
+            pytest.skip(f"Zero server.py 尚无 `{_ZERO_DESCRIBE_FUNC}`（{_ZERO_SERVER_PY}）")
+        zero_version = _zero_module_int_literal(tree, "DESCRIBE_CONFIG_VERSION")
+        assert zero_version is not None, (
+            "Zero 顶层 `DESCRIBE_CONFIG_VERSION` 不是 int 字面量（或已消失）——"
+            "版本位是本仓判断「能否强制」的唯一依据，形态变了必须人工核。"
+        )
+        # 「已认识就静默」由被调函数自己判（理由见其 docstring），此处无条件调用。
+        _warn_describe_config_version_bump(zero_version, KNOWN_DESCRIBE_CONFIG_VERSIONS)
+
+    def test_runtime_check_sources_are_zeros_own_registries(self) -> None:
+        """比对基准：两项运行期自检读的键，必须仍源自 Zero 自己的登记表/版本常量。"""
+        func = self._func_or_skip()
+        ret = _zero_describe_config_return_dict(func)
+        assert ret is not None, f"Zero `{_ZERO_DESCRIBE_FUNC}` 无字典字面量 return"
+        checked: set[str] = set()
+        for key_node, value_node in zip(ret.keys, ret.values, strict=True):
+            if not isinstance(key_node, ast.Constant):
+                continue
+            key = key_node.value
+            if not isinstance(key, str) or key not in _DESCRIBE_VALUE_SOURCES:
+                continue
+            checked.add(key)
+            expected_symbol = _DESCRIBE_VALUE_SOURCES[key]
+            referenced = {n.id for n in ast.walk(value_node) if isinstance(n, ast.Name)}
+            assert expected_symbol in referenced, (
+                f"describe_config[{key!r}] 的取值不再引用 Zero 的 {expected_symbol}"
+                f"（实际引用={sorted(referenced)}）——本仓运行期拿它做的自检会变成与一份影子"
+                "数据比对：恒绿且无判别力。"
+            )
+        assert checked == set(_DESCRIBE_VALUE_SOURCES), (
+            f"describe_config 返回体里没找到 "
+            f"{sorted(set(_DESCRIBE_VALUE_SOURCES) - checked)} 这些键"
+            "——本用例会退化成空真（pitfalls ⑥），故此处显式判红。"
+        )
+
+
+# 上面那组扫描器的**合成源码**判别力样本：不依赖 D:\Zero，故常驻可跑（Zero 不在位也跑），
+# 且不受「今天对方源码恰好长这样」的偶然事实庇护——两条 return 的形态今天的 Zero 没有，
+# 正因如此才必须用合成源码把它钉住。
+_SYNTHETIC_TWO_RETURN_DESCRIBE_SOURCE = '''
+"""合成：describe_config 含**两条** return —— 早退在前（源码序靠前）、真返回在后。"""
+
+
+def build_server():
+    @server.tool(name="zero.describe_config")
+    async def describe_config(session_id=None):
+        if session_id is not None and session_id not in SESSIONS:
+            if _STRICT:
+                return {"error": "unknown-session"}
+        return {"describe_config_version": DESCRIBE_CONFIG_VERSION, "session_id": session_id}
+'''
+
+
+class TestDescribeConfigScannerDiscrimination:
+    """describe_config 扫描器的判别力——用**合成源码**实证，不靠 D:\\Zero 当前长相。
+
+    这两格守的都是「今天恰好没事，明天对方一改就静默出错」那类失效：
+    ① 早退 return 的取法（`ast.walk` 是 BFS，遍历序 ≠ 源码序）；
+    ② 版本 bump 的 STRICT 转红分支（今天对方版本号恰在已核验集合内 ⇒ 该分支从未被走到）。
+    """
+
+    def test_last_return_is_by_source_order_not_walk_order(self) -> None:
+        """① 两条 return 时须取**源码序在后**那条（真返回），不是 BFS 遍历序的最后一个。
+
+        判别力实证：本条对旧实现（`for node in ast.walk(...)` 逐个覆盖 `found`）**会红**——
+        BFS 逐层展开，嵌在两层 `if` 里的早退 return 比函数体末尾的真返回更深、后被访问，
+        旧取法拿到的是 `{"error": ...}`。取错字典 = 拿一份错误的返回体形状去比对字段集。
+        """
+        tree = ast.parse(_SYNTHETIC_TWO_RETURN_DESCRIBE_SOURCE)
+        func = _zero_describe_config_func(tree)
+        assert func is not None, "合成源码里没找到 describe_config——样本坏了，下面的断言会退化"
+
+        ret = _zero_describe_config_return_dict(func)
+        assert ret is not None, "合成源码里没取到任何字典字面量 return——扫描器认不出正常形态"
+        keys, opaque = _dict_literal_keys(ret)
+        assert opaque is False, "样本两条 return 都是纯字面量键，判 opaque 说明键集提取器坏了"
+        assert keys == frozenset({"describe_config_version", "session_id"}), (
+            f"取到的是 {sorted(keys)} —— 期望函数体末尾那条**真返回**的键集。"
+            "取到 {'error'} 说明按遍历序而非源码序选中了嵌在 if 里的早退 return。"
+        )
+
+    def test_two_returns_are_really_distinguishable(self) -> None:
+        """①-正控：两条 return 的键集**确实不同**，且早退那条源码序在前。
+
+        没有这一格，上一条可能在「两条 return 恰好同形」时无论取哪条都绿 = 恒真式（pitfalls ⑥）。
+        """
+        tree = ast.parse(_SYNTHETIC_TWO_RETURN_DESCRIBE_SOURCE)
+        func = _zero_describe_config_func(tree)
+        assert func is not None
+        rets = [
+            node.value
+            for node in ast.walk(func)
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+        ]
+        assert len(rets) == 2, f"样本应含两条字典 return，实得 {len(rets)}"
+        by_line = sorted(rets, key=lambda node: node.lineno)
+        early_keys, _ = _dict_literal_keys(by_line[0])
+        final_keys, _ = _dict_literal_keys(by_line[1])
+        assert early_keys != final_keys, "两条 return 键集相同 ⇒ 上一条用例取哪条都绿，无判别力"
+        assert early_keys == frozenset({"error"})
+
+    def test_version_bump_warns_when_strict_is_off(self) -> None:
+        """② 日常模式：对方 bump 到本仓未核验的版本 → UserWarning（可见但不打断）。
+
+        **不依赖 D:\\Zero 当前版本号**：直接给函数喂一个合成版本号与合成已知集合。
+        今天对方版本恰为 2、恰在集合内 ⇒ 真跨仓用例根本走不到这条分支，只有这里能实证。
+        显式清掉 STRICT：断言的是日常模式行为，不能随外部 env 变脸。
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(STRICT_ENV, raising=False)
+            with pytest.warns(UserWarning, match="DESCRIBE_CONFIG_VERSION=99"):
+                _warn_describe_config_version_bump(99, frozenset({1, 2}))
+
+    def test_version_bump_fails_under_strict(self) -> None:
+        """②′ 同一入参在 `ZERO_LINK_E2E_STRICT=1` 下**转红**（联调/发版门要求当场表态）。
+
+        与上一条构成同一函数的双态实证——沿用 `_warn_unconsumed_zero_codes` 的成例；
+        没有这一对，「STRICT 下会红」就只是注释里的一句话。
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            with pytest.raises(pytest.fail.Exception, match="DESCRIBE_CONFIG_VERSION=99"):
+                _warn_describe_config_version_bump(99, frozenset({1, 2}))
+
+    def test_known_version_emits_no_warning(self) -> None:
+        """②-正控：版本**在**已核验集合内时不得发警告（否则「可见」退化成永远在响的噪音）。
+
+        与上面两条合起来才说明这条告警**有判别力**：不是「一调用就响」，而是只在真 bump 时响。
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _warn_describe_config_version_bump(2, frozenset({1, 2}))
+        assert caught == [], (
+            f"版本已在已核验集合内却发了警告：{[str(w.message) for w in caught]}。"
+            "无条件响 = 噪音 = 没人看，这条提醒就白设了。"
+        )
+
+    def test_known_version_does_not_fail_under_strict(self) -> None:
+        """②′-正控：STRICT 下版本已认识时不得判红（否则 STRICT 门永远过不去）。"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            _warn_describe_config_version_bump(2, frozenset({1, 2}))  # 不抛即通过

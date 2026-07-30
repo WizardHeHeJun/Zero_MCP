@@ -41,6 +41,7 @@ from src.agents.models.zero_affect import (
 )
 from src.mcp.zero.client import (
     ZERO_ERROR_CODE_UNKNOWN_SESSION,
+    ZeroConfigProbe,
     ZeroLinkCallError,
     ZeroLinkClient,
     ZeroLinkConnectionError,
@@ -743,3 +744,81 @@ class TestZeroClientResumeAcrossRestart:
             f"memory resume 后 {va_mem_resumed} 应 == 全新第 1 步 {va_fresh1}"
             f"（差 {_va_maxdiff(va_mem_resumed, va_fresh1):.2e}）：memory 后端不应跨重启恢复态"
         )
+
+
+@pytest.mark.zerorepo
+class TestDescribeConfigE2E:
+    """`zero.describe_config` 回读面接 D:\\Zero 真 server 的端到端（本仓 2026-07-30 接入）。
+
+    静态守卫（`test_zero_contract_crosscheck.py::TestDescribeConfigCrosscheck`）读的是**源码树**，
+    本类读的是**真跑起来的那个 server 进程**——两者覆盖面不相交：源码里字段集对得上，不代表
+    运行期真能解析（FastMCP 加壳、structured_output=False 的文本封装、JSON 形状都在这一层）。
+    缺 server / 非目标环境 → skip。
+    """
+
+    async def test_describe_config_against_real_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """部署端默认 + 会话级取值 + 未知 id 语义 + 两项自检 + 缓存。
+
+        一趟跑完，只起一次 server 子进程。
+        """
+        if not _ZERO_SERVER.is_file():
+            pytest.skip(f"D:\\Zero MCP server 不存在（{_ZERO_SERVER}），跳过回读面端到端")
+        _set_stdio_env(monkeypatch)
+
+        client = ZeroLinkClient()
+        try:
+            await client.__aenter__()
+        except ZeroLinkConnectionError as exc:
+            pytest.skip(f"连不上 Zero server（是否在 affective-expression 环境跑？）：{exc}")
+
+        try:
+            # 1. 部署端默认（不传 sid）——`open_session` **之前**就能问
+            default_cfg = await client.describe_config()
+            assert default_cfg.probe is ZeroConfigProbe.OK, (
+                f"真 server 上回读面竟不可用：{default_cfg.describe()}"
+            )
+            assert default_cfg.version is not None
+            assert default_cfg.resolved_for_session is False, "不传 sid 却回了 resolved=True"
+            # 字段集的**运行期**核验（静态守卫的活体对照）：少键即我方那一位读不到
+            assert default_cfg.missing_keys == (), (
+                f"真 server 返回体缺本仓期望的键 {list(default_cfg.missing_keys)}"
+            )
+
+            # 2. ① 错误码表运行期核对：本仓手抄镜像 vs 该部署登记的全表
+            diff = await client.check_error_codes()
+            assert diff.checked is True, f"码表核对未执行：{diff.reason}"
+            assert diff.in_sync is True, f"跨仓错误码表已漂移：{diff.reason}"
+
+            # 3. ② 发流前自检（部署端默认口径，尚未开会话）
+            report = await client.preflight_external_priors()
+            assert report.checked is True, f"发流前自检未执行：{report.reason}"
+            assert report.schema_mismatch is False, report.reason
+            assert report.zero_max_streams is not None and report.zero_precision_cap is not None
+
+            # 4. 未知 session_id → Zero 契约「视同不传」⇒ resolved_for_session=False，且**不缓存**
+            ghost = generate_session_id()
+            ghost_cfg = await client.describe_config(session_id=ghost)
+            assert ghost_cfg.probe is ZeroConfigProbe.OK
+            assert ghost_cfg.resolved_for_session is False, "未知 id 竟被解析成了某个真会话"
+            assert ghost not in client.describe_config_cache, (
+                "未知 id 的部署端默认被缓存到 sid 键下——会话真开出来后仍会服务这份旧答案"
+            )
+
+            # 5. 会话级取值：显式传 config，回读面须回**该会话真实生效**的值（Zero R11 修的那条：
+            #    从 session.config 取、不回显刚算的 cfg）
+            sid = await client.open_session(persona="e2e-describe", config=_RESUME_CONFIG)
+            session_cfg = await client.describe_config(session_id=sid)
+            assert session_cfg.resolved_for_session is True, "传了活跃会话 id 却没按会话解析"
+            assert session_cfg.fields["affect_readout"] == _RESUME_CONFIG["affect_readout"], (
+                f"会话级 affect_readout 回读不符：期望 {_RESUME_CONFIG['affect_readout']!r}，"
+                f"实得 {session_cfg.fields['affect_readout']!r}"
+            )
+
+            # 6. ⑤ 缓存：同一 sid 第二次调用不再发 RTT（同一对象），close 后失效
+            assert await client.describe_config(session_id=sid) is session_cfg
+            await client.close_session(sid)
+            assert sid not in client.describe_config_cache, "close_session 未失效会话级缓存"
+        finally:
+            await client.__aexit__(None, None, None)

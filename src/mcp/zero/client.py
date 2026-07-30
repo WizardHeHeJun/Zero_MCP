@@ -21,13 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import sys
 import types
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -41,7 +44,12 @@ from mcp.types import TextContent
 from pydantic import ValidationError
 
 from src.agents.models.zero_affect import AffectStimulus, ExpressionBundle, ModalityPrior
-from src.mcp.zero.external_priors import build_external_priors_override
+from src.mcp.zero.external_priors import (
+    EXTERNAL_PRIOR_SCHEMA_VERSION,
+    _resolve_max_streams,
+    _resolve_precision_cap,
+    build_external_priors_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +233,27 @@ class ZeroLinkDeployEnvError(ZeroLinkNonDegradableError):
     """
 
 
+class ZeroLinkSchemaIncompatibleError(ZeroLinkNonDegradableError):
+    """**所连部署**的 `external_prior_schema_version` 与本仓不一致 —— 跨语言契约不兼容。
+
+    由 `ZeroLinkClient.preflight_external_priors()` 在发流**之前**主动抛出（不是 Zero 回的错误
+    码；`tool` 字段记为 `zero.describe_config`，即读出该结论的那个回读面）。
+
+    🛑 **为什么这一条 raise、而错误码表漂移只 warn**（两者处置有意不同）：
+      · 版本不一致 ⇒ 我方按 v{本仓} 构造的 `external_priors` 三元组，对方可能按另一套形状
+        **解释成功**。被拒是响亮失败（`[zero:external-prior-invalid]` → CallerFault → 上抛），
+        **没被拒却被误解**才是灾难 —— 后者不可观测，且污染的是内核后验。不能用「试试看会不会
+        被拒」的方式发现它。
+      · 错误码表只影响**归责与重试语义**，且每一次错分类都伴随一条 warning 日志（可观测），
+        故 warn 足矣。
+
+    ⚠ 它是 `ZeroLinkNonDegradableError` 子类：既有 `except ZeroLinkCallError` 的调用点能接住，
+    而 `graceful_step` 的降级分支**不会**吞它（NonDegradable 一律上抛）。
+    ⚠ 判据仅在 `describe_config_version` 属**本仓认识的版本**时才升级为 raise；版本不认识时
+    我方对该键的读法本身就不可信，**在不可信的观测量上 raise 是错的** → 降级为 warn。
+    """
+
+
 # 码 → 异常类。未登记的新码（Zero 先行加码、本仓未跟）落到 `None` → 退回基类
 # `ZeroLinkCallError` + 一条 warning 日志，**不炸**（跨仓单边升级零回归）；
 # 表本身的漂移由 crosscheck 守卫判红。
@@ -293,6 +322,24 @@ LOG_MARKER_PROBE_UNDECIDABLE = "[zl:interrupt-probe-undecidable]"
 LOG_MARKER_INTERRUPTED_ON_OPEN = "[zl:interrupted-at-open]"
 """`open_session` 返回体直接带非空 `interrupted_at`（**任何**调用路径，含无守卫的常规 resume）。"""
 
+LOG_MARKER_DESCRIBE_NOT_REGISTERED = "[zl:describe-config-not-registered]"
+"""所连部署**未注册** `zero.describe_config`（老部署）——经 `list_tools` **确证**，非猜测。"""
+
+LOG_MARKER_DESCRIBE_CALL_FAILED = "[zl:describe-config-call-failed]"
+"""`zero.describe_config` 调用失败，但工具**在册**（或连能力面都问不到）——不确定，不缓存。"""
+
+LOG_MARKER_DESCRIBE_VERSION_UNKNOWN = "[zl:describe-config-version-unknown]"
+"""`describe_config_version` 不在本仓认识的集合里 —— 降级为「只报告不强制」，不炸。"""
+
+LOG_MARKER_DESCRIBE_FIELDS_DRIFT = "[zl:describe-config-fields-drift]"
+"""返回体键集与本仓期望不符（少键 / 多键）—— 字段级判读按缺席处置，不炸。"""
+
+LOG_MARKER_ERROR_CODE_TABLE_DRIFT = "[zl:error-code-table-drift]"
+"""运行期错误码表与本仓手抄镜像不一致（对方多 / 本仓多）—— warn，绝不 raise。"""
+
+LOG_MARKER_EXTERNAL_PRIOR_PREFLIGHT = "[zl:external-prior-preflight]"
+"""发流前自检发现与所连部署的阈值/契约版本不一致（处置见各字段，schema 版本另抛异常）。"""
+
 
 class ZeroInterruptProbe(StrEnum):
     """`open_session` 返回体里 `interrupted_at` 这一位的**判读四态**。
@@ -329,14 +376,20 @@ class ZeroOpenSessionInfo:
                         return 路径都带），老部署根本不发 ⇒ ``resumed is None`` ⇔
                         「对方不是会发中断观测量的那一代」，此时缺 `interrupted_at`
                         是正常态、不是信号。零回归判定就挂在这一位上。
-                        ⏳ **这一位是临时判据**：它靠「新 Zero 无条件回 `resumed`」这条
-                        **间接推断**（对方的实现细节，非契约），所以本仓才要向 Zero 索要
-                        「承诺 `resumed` 不被条件化」。Zero `daecce1` 已落
-                        `zero.describe_config(session_id?)`，带 `describe_config_version`
-                        （增删任何键都 bump）+ `error_codes` 全量表 —— 那才是**代际判别的
-                        正解**（直接问对方「你是哪一代」，不再从返回体形状反推）。本轮**有意
-                        不接**（论证见 `graceful_step` docstring 末「为何仍用 `resumed` 判别」）；
-                        接上后本行与下方 ABSENT 分支的零回归条件都应改挂 describe_config。
+                        ✅ **2026-07-30 订正（`describe_config` 已接入，但这一位仍然不撤）**：
+                        上一版在此处写「这是临时判据，接上 `describe_config` 后应改挂
+                        `describe_config_version`」——**该结论经核验不成立，已撤回**。
+                        `resumed` 在此承担的是**两件事**，回读面只覆盖其中一件：
+                          (a) **代际**（对方是不是会发中断观测量的那一代）—— `describe_config`
+                              确实覆盖，且更直接（`available` 这一位甚至与版本号取值无关）；
+                          (b) **本次 open 到底是不是 resume** —— 回读面**结构上给不出**：它是
+                              部署级/会话级的**配置**面，回答不了「你刚才那一次调用走的是新建
+                              还是续会话」。而下方 ABSENT 分支正是靠 (b) 排除掉「未探测·新建
+                              会话」这一义（缺席四义里的第①义）。
+                        ⇒ 拿版本号替换 `resumed` 会**丢掉 (b)**，把已排除的第①义放回不可判集合，
+                        判别力不升反降。故 `resumed` 保留；向 Zero 索要的「承诺 `resumed` 不被
+                        条件化」那条契约请求**同样不撤**，只是理由从「我方拿它当代际位」改成
+                        「我方拿它判本次 open 的 resume 语义」（代际那半的依据可以撤）。
         interrupted_at: 待执行节点名；仅 ``interrupt_probe is INTERRUPTED`` 时非空。
                         ``ABSENT``/``MALFORMED`` → ``None``，``CLEAN`` → ``()``。
                         ⚠ **不要**只看这一个字段做判定：``None`` 同时覆盖「对方没说」与
@@ -404,6 +457,492 @@ def _parse_open_session_interrupted_at(
         value,
     )
     return ZeroInterruptProbe.MALFORMED, None
+
+
+# ── zero.describe_config：**运行期**回读所连部署真正生效的门控（Zero main `75e8a36` 上线）──
+#
+# 为什么必须接（本仓 2026-07-29 向 Zero 提、对方落地）：此前我方**无手段确认**所连部署到底开了
+# 哪些门 —— open/step/close 三个工具都不回显配置，而 HTTP 传输下两进程**不共享 env**，
+# 「两仓同名 env 对齐」这条机制在结构上就不成立，跨仓 env 对照表只能当文档、不能当校验。
+#
+# 🛑 **它属「能力探测 / 归责语义」，不属「安全守卫」**（`ZeroLinkLockTimeoutError` docstring 立的
+#    分界）：安全面（M8 自点燃上界 / M9 physio μv 契约）一律**单边**兜住、不依赖对方状态；
+#    本回读面依赖对方，故**必须标注版本**、且不可用时必须优雅回退。任何一条基于它的判定，
+#    在「对方没这个工具」时都只能降级、不能变成硬失败。
+_DESCRIBE_CONFIG_TOOL = "zero.describe_config"
+_DESCRIBE_CONFIG_KEY_VERSION = "describe_config_version"
+_DESCRIBE_CONFIG_KEY_RESOLVED = "resolved_for_session"
+_DESCRIBE_CONFIG_KEY_ERROR_CODES = "error_codes"
+_DESCRIBE_CONFIG_KEY_PRECISION_CAP = "external_prior_precision_cap"
+_DESCRIBE_CONFIG_KEY_MAX_STREAMS = "max_external_streams"
+_DESCRIBE_CONFIG_KEY_SCHEMA_VERSION = "external_prior_schema_version"
+
+DESCRIBE_CONFIG_EXPECTED_KEYS: frozenset[str] = frozenset(
+    {
+        _DESCRIBE_CONFIG_KEY_VERSION,
+        "session_id",
+        _DESCRIBE_CONFIG_KEY_RESOLVED,
+        "workspace_enabled",
+        "gate_fusion",
+        "exclude_physio_fusion",
+        "precision_commensurable",
+        "ignition_beta",
+        "coping_potential_enabled",
+        "text_coping_enabled",
+        "fear_domain_enabled",
+        "canonical_physiology",
+        "facs_extended",
+        _DESCRIBE_CONFIG_KEY_PRECISION_CAP,
+        _DESCRIBE_CONFIG_KEY_MAX_STREAMS,
+        _DESCRIBE_CONFIG_KEY_SCHEMA_VERSION,
+        "governance_gated_flags",
+        _DESCRIBE_CONFIG_KEY_ERROR_CODES,
+        "sample_sigma_cap",
+        "affect_readout",
+        "weights_version",
+    }
+)
+"""本仓**独立持有**的期望键集（21 键，现场核自 Zero `src/mcp_server/server.py::describe_config`）。
+
+不是「对方回什么就认什么」：跨仓漂移由 `tests/mcp/test_zero_contract_crosscheck.py::
+TestDescribeConfigCrosscheck` 静态判红，运行期不符只降级+warn（见 `ZeroDeployConfig.describe`）。
+"""
+
+KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2})
+"""本仓**已逐键核验过**的 `describe_config_version`。不在此集合 ⇒ 只报告不强制（见下）。
+
+现场核验（2026-07-30，只读 D:\\Zero；两版逐键比对经 AST 取 `describe_config` 的 return 字面量）：
+- **v1** = Zero `origin/main` @ `75e8a36`：上表 21 键（`DESCRIBE_CONFIG_VERSION = 1`）。
+- **v2** = Zero **未合并**的工作树分支 `fix/stage60-purge-correctness` @ `667e923`
+  （`DESCRIBE_CONFIG_VERSION = 2`；其父提交 `218771a` 上仍是 1，bump 就发生在 `667e923`）：
+  `describe_config` 返回体与 v1 **逐键相同**（21 键，连顺序都一样）；bump 的真实动因**不在
+  describe_config 自身**，而在 `zero.open_session` ——该提交把「`interrupted_at` 缺席」拆成显式
+  四态 `interrupt_probe`（not_probed / clean / interrupted / probe_failed），属新契约故 1→2；
+  对方同时把该常量的措辞从「字段集版本」改成「**契约**版本」，并把 bump 纪律扩到
+  ①增删键 ②某键值域变化 ③某键语义变化。⇒ v1/v2 对**我方读的这 21 键**等价，故同列为「认识」。
+  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v2），
+  不是 main（v1）。两版都得认，否则今天的 live 调用会全程降级。
+
+🛑 **这条「认识」有保质期**（写明是为了将来能查出它何时失准）：v2 此刻只活在对方一条未合并
+分支上，其语义**尚未被 main 固化**。若对方在合入前**重写 v2 的内容**（同一个数字 2 换一套
+含义），我方这里的「已核验 = 等价」就直接失准，而运行期看不出来——版本号一样，读法照旧，
+结论悄悄变错。两道守卫是缓冲、不是保险：**字段集守卫**（`TestDescribeConfigCrosscheck::
+test_field_set_matches_client_expectation`，硬红）在增删键时当场红；**版本守卫**
+（同类 `test_version_is_known_to_client`，日常 warn + STRICT 判红）在版本号再次 bump 时逼人
+现场核。二者都盖不住「版本号不变而某键**语义**变了」——那一格只能靠对方遵守自己写下的
+bump 纪律 ③，故若发现对方改了 v2 的内容却没再 bump，应视为跨仓契约事故上报，而非本地绕过。
+
+🛑 **不认识的版本一律降级、不炸**，因为按对方 v2 起的 bump 纪律，「某键**语义**变了」也会
+bump —— 那正是「同名同类型但含义变了、消费方看不出来」的一类，我方**照旧解析会得出错误结论**。
+故：不认识 ⇒ ① 仍解析、仍报告（信息不丢）；② 但任何「强制」动作降级为 warn
+（`preflight_external_priors` 的 raise 是唯一的强制动作，见其 `strict` 参数）；③ 打一条
+`LOG_MARKER_DESCRIBE_VERSION_UNKNOWN`。
+
+⚠ **例外：代际判别不受版本约束**。「返回体里有没有 `describe_config_version` 这个键」这件事
+本身与它的取值无关 ⇒ `ZeroDeployConfig.available` 对任意整数版本都成立，这是本回读面上唯一
+**版本无关**的判据。
+"""
+
+
+class ZeroConfigProbe(StrEnum):
+    """`describe_config()` 这一次探测的**结局**（四态，缺一就分不清「没有」与「没问到」）。
+
+    Attributes:
+        OK:             调通且返回体是 JSON object。
+        NOT_REGISTERED: 对方**未注册**该工具（老部署）——经 `list_tools` 确证，**不是**从错误
+                        文案猜的（文案是脆弱锚点，pitfalls ⑦）。这一态**可负缓存**：工具不在册
+                        与 session_id 无关，短路后续所有探测，避免每次自检都白付 2 个 RTT。
+        CALL_FAILED:    调用失败，但工具**在册**、或连 `list_tools` 都问不到 ⇒ **不确定**。
+                        与 NOT_REGISTERED 分开的理由：把一次网络抖动缓存成「老部署」，会让本
+                        连接的剩余生命期里所有自检永久降级，且**看不出降级是错的**。本态**不缓存**。
+        MALFORMED:      调通了但返回体不是合法 JSON object（跨仓契约漂移）。同样不缓存。
+    """
+
+    OK = "ok"
+    NOT_REGISTERED = "not-registered"
+    CALL_FAILED = "call-failed"
+    MALFORMED = "malformed"
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroDeployConfig:
+    """`zero.describe_config` 的一次判读结果（不可用时也是一个合法值，**不是 None/异常**）。
+
+    Attributes:
+        probe:                本次探测结局（见 `ZeroConfigProbe`）。
+        detail:               人读原因串（`probe is OK` 时为 ""）——判据返回**原因**而非 bool，
+                              便于测试逐格断言「红在正确的原因上」。
+        version:              `describe_config_version`；缺键/形状非 int → ``None``。
+        resolved_for_session: 对方是否按**该会话真实生效**的值回答（未知 sid 视同不传 ⇒ False）。
+        fields:               原始返回体只读视图（`probe is OK` 之外恒为空）。
+    """
+
+    probe: ZeroConfigProbe
+    detail: str = ""
+    version: int | None = None
+    resolved_for_session: bool = False
+    fields: Mapping[str, Any] = types.MappingProxyType({})
+
+    @property
+    def available(self) -> bool:
+        """对方**有**这个回读面且本次调通 —— 唯一版本无关的判据（代际判别即用这一位）。"""
+        return self.probe is ZeroConfigProbe.OK
+
+    @property
+    def version_known(self) -> bool:
+        """版本在 `KNOWN_DESCRIBE_CONFIG_VERSIONS` 内（``None`` 不在任何集合内，自然为 False）。"""
+        return self.version in KNOWN_DESCRIBE_CONFIG_VERSIONS
+
+    @property
+    def enforceable(self) -> bool:
+        """可用**且**版本认识 ⇒ 允许把不一致升级成硬失败；否则一律只报告。"""
+        return self.available and self.version_known
+
+    @property
+    def missing_keys(self) -> tuple[str, ...]:
+        """本仓期望有、对方没回的键（排序稳定，便于断言）。"""
+        return tuple(sorted(DESCRIBE_CONFIG_EXPECTED_KEYS - set(self.fields)))
+
+    @property
+    def unexpected_keys(self) -> tuple[str, ...]:
+        """对方回了、本仓期望里没有的键 —— 通常是**正常演进**（新增能力），不是错误。"""
+        return tuple(sorted(set(self.fields) - DESCRIBE_CONFIG_EXPECTED_KEYS))
+
+    def describe(self) -> str:
+        """一行人读判读串（供日志与测试断言；**不要**用它做程序判定，判定读属性）。"""
+        if not self.available:
+            return f"describe_config 不可用（{self.probe.value}）：{self.detail}"
+        bits = [
+            f"version={self.version}",
+            "版本已核验" if self.version_known else "⚠ 版本不认识（只报告不强制）",
+            f"resolved_for_session={self.resolved_for_session}",
+        ]
+        if self.missing_keys:
+            bits.append(f"⚠ 缺键={list(self.missing_keys)}")
+        if self.unexpected_keys:
+            bits.append(f"新增键={list(self.unexpected_keys)}")
+        return "；".join(bits)
+
+
+_DESCRIBE_CONFIG_NOT_PROBED = ZeroDeployConfig(
+    probe=ZeroConfigProbe.CALL_FAILED,
+    detail="尚未探测（本对象由调用方直接构造，用于纯判读函数的单测）",
+)
+
+
+def _read_int_field(fields: Mapping[str, Any], key: str) -> int | None:
+    """取 int 字段；缺键/形状不符 → ``None``（**不猜**）。
+
+    ⚠ 显式排除 ``bool``：``isinstance(True, int)`` 为真，不排除会把 `gate_fusion` 这类布尔门
+    误读成 0/1 的数值旋钮 —— 正是 Zero 要求「按字段名显式取值、不得用类型过滤器」要避开的坑。
+    """
+    value = fields.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _read_float_field(fields: Mapping[str, Any], key: str) -> float | None:
+    """取 float 字段（int 亦收，JSON 里 `1` 与 `1.0` 同形）；缺键/形状不符/非有限 → ``None``。"""
+    value = fields.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _read_str_tuple_field(fields: Mapping[str, Any], key: str) -> tuple[str, ...] | None:
+    """取 `list[str]` 字段；缺键或**任一**元素非 str → ``None``（整条丢弃，不逐元素过滤）。
+
+    与 `_parse_open_session_interrupted_at` 同口径：混入非 str 说明契约已漂移，此时
+    「部分读到」比「读不到」更危险 —— 会让调用方以为自己拿到了完整集合。
+    """
+    value = fields.get(key)
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        return None
+    return tuple(value)
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroErrorCodeDiff:
+    """本仓 `ZERO_ERROR_CODES` 手抄镜像 vs **所连部署**运行期回的 `error_codes` 全表。
+
+    ⚠ **覆盖面要如实说**：对方回的是它**登记**的码表（`sorted(ZERO_ERROR_CODES)`），
+    **不是**「它会产出哪些码」。所以本比对能发现「登记面漂移」，发现不了 m8 那类
+    「把某个失效模式重切到另一个已登记码」——那一格运行期原理上不可见（我方看得见码、
+    看不见产出点语义），只能靠 `test_zero_contract_crosscheck.py` 的源码级守卫，
+    且已定性为**要向 Zero 索取的契约**而非我方能单边补的守卫。
+
+    Attributes:
+        checked:     是否真比对了（回读面不可用 / 缺 `error_codes` 键 → False）。
+        reason:      未比对的原因；`checked` 为真时是判读结论串。
+        zero_only:   对方有、本仓无。
+        client_only: 本仓有、对方无。
+    """
+
+    checked: bool
+    reason: str
+    zero_only: tuple[str, ...] = ()
+    client_only: tuple[str, ...] = ()
+
+    @property
+    def in_sync(self) -> bool:
+        """两侧登记面完全一致（未比对时为 False —— 「没比」不等于「一致」）。"""
+        return self.checked and not self.zero_only and not self.client_only
+
+    @property
+    def rename_suspected(self) -> bool:
+        """两侧同时非空 ⇒ 很可能是**改名**（一删一增），而不是各自独立地增/删。
+
+        运行期只拿得到码**值**、拿不到符号名，故「值不同」这一情形只能以此联合信号呈现。
+        """
+        return bool(self.zero_only) and bool(self.client_only)
+
+
+def diff_error_codes(
+    cfg: ZeroDeployConfig,
+    *,
+    client_codes: Iterable[str] = ZERO_ERROR_CODES,
+) -> ZeroErrorCodeDiff:
+    """比对错误码表（**纯函数**，无 I/O、永不抛 —— 可脱离连接逐格单测）。
+
+    🛑 **三种不一致的处置有意不同**（都不 raise，但严重度与文案不同）：
+
+    · **对方多（`zero_only`）= 正常演进**。我方 `_CODE_TO_EXCEPTION` 查不到即退回基类
+      `ZeroLinkCallError` + 一条 warning，跨仓单边升级零回归。⚠ 但**不能就此宣称无害**：
+      若对方是把某个既有失效模式**切分**到新码（如 payload-invalid 的一支切成 stim-invalid），
+      我方就不是「多一条没归类的新错误」，而是**既有归类被掏空**——CallerFault（不可降级、
+      上抛）退化成基类（可降级）→ 被 `graceful_step` 吞成每轮静默 None。运行期分不出这两种
+      情形（见 `ZeroErrorCodeDiff` 的覆盖面说明），故文案必须点名让人去查。
+    · **本仓多（`client_only`）= 我方拿着过期认知**，比上一种重：我方表里那条**永远不会命中**，
+      而对方那个失效模式现在换了别的码回来 ⇒ 落未登记码 → 回基类；若原码属**不可降级族**，
+      归责就从「上抛」退化成「静默降级」。
+    · **两侧同时非空 = 疑似改名**（`rename_suspected`），优先按改名查，别当成一增一删两件事。
+
+    🛑 **为什么全部只 warn 不 raise**（本条不是安全守卫）：
+      ① 一个**只读**的能力探测面不该有权炸掉整条业务通路；
+      ② 后果本身可观测 —— 每一次落到未登记码都会打一条 warning，不存在「静默」；
+      ③ 我方无法区分「对方真删了这个码」与「这个部署只是版本旧」，在不可区分的观测上
+         硬失败会把跨仓单边升级变成互相锁死。
+      要硬拦的是**源码级**漂移，那已由 `TestZeroErrorCodeCrosscheck`（含 STRICT 转 fail）负责。
+
+    ⚠ 版本不认识时**仍然比对**：本函数的最强动作就是 warn，而「不比对」等于主动丢掉唯一信号；
+    结论串里会带上版本存疑的标注，由调用方 `ZeroLinkClient.check_error_codes` 打进日志。
+    """
+    expected = frozenset(client_codes)
+    if not cfg.available:
+        return ZeroErrorCodeDiff(checked=False, reason=cfg.describe())
+    zero_codes = _read_str_tuple_field(cfg.fields, _DESCRIBE_CONFIG_KEY_ERROR_CODES)
+    if zero_codes is None:
+        return ZeroErrorCodeDiff(
+            checked=False,
+            reason=(
+                f"未比对：返回体缺 {_DESCRIBE_CONFIG_KEY_ERROR_CODES} 键或形状非 list[str]"
+                f"（实得 {type(cfg.fields.get(_DESCRIBE_CONFIG_KEY_ERROR_CODES)).__name__}）"
+            ),
+        )
+    zero_set = frozenset(zero_codes)
+    zero_only = tuple(sorted(zero_set - expected))
+    client_only = tuple(sorted(expected - zero_set))
+    if not zero_only and not client_only:
+        reason = f"两侧登记面一致（{len(zero_set)} 个码）"
+    else:
+        parts = [f"错误码表不一致（对方 {len(zero_set)} 个 / 本仓 {len(expected)} 个）"]
+        if zero_only and client_only:
+            parts.append("两侧同时非空 ⇒ **疑似改名**，请优先按改名核，别当成一增一删")
+        if zero_only:
+            parts.append(
+                f"对方多={list(zero_only)}（正常演进；但若是把既有失效模式**切分**到新码，"
+                f"我方既有归类会被掏空 → 不可降级族退化成静默降级，请核对方产出点）"
+            )
+        if client_only:
+            parts.append(
+                f"本仓多={list(client_only)}（**本仓拿着过期认知**：这几条永不命中，"
+                f"对方那个失效模式若换码回来会落未登记码 → 归责降级，请同步 "
+                f"client._CODE_TO_EXCEPTION 与跨仓守卫）"
+            )
+        reason = "；".join(parts)
+    if not cfg.version_known:
+        reason = f"{reason}；⚠ describe_config_version={cfg.version} 本仓不认识，结论仅供参考"
+    return ZeroErrorCodeDiff(
+        checked=True,
+        reason=reason,
+        zero_only=zero_only,
+        client_only=client_only,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroExternalPriorPreflight:
+    """发流**前**自检：本仓 external_priors 契约/阈值 vs **所连部署**真正生效的值。
+
+    🛑 **与既有 M5 静态守卫不重复**（覆盖面不相交，别当成重复造轮子）：
+      · `test_zero_contract_crosscheck.py::TestExternalPriorSchemaVersion` /
+        `TestExternalPriorValidationDefaults` 读的是**本机 `D:\\Zero` 源码树**的常量与
+        `AffectState` 字段默认 —— 它答的是「我们两个仓的代码对不对得上」。
+      · 本类读的是**真正连上的那个部署**在**运行期**的生效值 —— 它答的是「我现在要发流的
+        这个 server，此刻的门是什么」。二者在 HTTP 远端、或本机 env 覆盖了默认值时**必然分叉**
+        （env 一改，源码常量纹丝不动），而分叉时权威的是运行期这一份。
+
+    Attributes:
+        checked:               是否真做了比对。
+        reason:               人读结论串（未比对时是原因）。
+        zero_*/client_*:      两侧的 schema 版本 / 精度上界 / 流数上界（对方侧不可读 → ``None``；
+                              `client_*` 为 ``None`` 表示**本机 env 坏了没读出来**，见
+                              `local_env_error`——不是「本机没有默认值」）。
+        rejection:            传了 `priors` 且按**对方阈值**重跑本仓 M3/M6/M7/M8/M9 校验被拒时，
+                              这里是拒绝原因；空串 = 不会被拒（或没传 priors）。
+        local_env_error:      **本机**阈值 env（`ZERO_EXTERNAL_PRIOR_PRECISION_CAP` /
+                              `ZERO_MAX_EXTERNAL_STREAMS`）解析失败的原因；
+                              ``None`` = 本机 env 正常。
+        version_known:        `describe_config_version` 是否属本仓已核验版本。
+
+    🛑 `rejection` 与 `local_env_error` **必须分列两格**（2026-07-30 审查订正，原实现混用
+    `rejection` 一格）：前者是「**对方**会拒这批 priors」，后者是「**我方**部署的 env 写坏了」。
+    混用的直接后果是 —— 本机 env 一坏，**一条 priors 都没传**时 `would_be_rejected` 也变 True，
+    与本文档串「空串 = 不会被拒（或没传 priors）」自相矛盾；调用方据此放弃发流，等于本机的
+    配置笔误把自己关在门外。两者对调用方的处置也不同：前者改 priors、后者改本机 env。
+    """
+
+    checked: bool
+    reason: str
+    zero_schema_version: int | None = None
+    client_schema_version: int = EXTERNAL_PRIOR_SCHEMA_VERSION
+    zero_precision_cap: float | None = None
+    client_precision_cap: float | None = None
+    zero_max_streams: int | None = None
+    client_max_streams: int | None = None
+    rejection: str = ""
+    local_env_error: str | None = None
+    version_known: bool = False
+
+    @property
+    def schema_mismatch(self) -> bool:
+        """对方 schema 版本可读**且**与本仓不等 —— 契约不兼容（唯一会被升级成 raise 的一格）。
+
+        对方不可读（``None``）时为 False：「读不到」不是「不一致」，在读不到的位上硬失败
+        等于把老部署一律判死。
+        """
+        return (
+            self.zero_schema_version is not None
+            and self.zero_schema_version != self.client_schema_version
+        )
+
+    @property
+    def limits_differ(self) -> bool:
+        """精度上界 / 流数上界与本仓本地默认不同（**不是错误**，只是我方该按对方的来）。"""
+        cap_differs = (
+            self.zero_precision_cap is not None
+            and self.client_precision_cap is not None
+            and self.zero_precision_cap != self.client_precision_cap
+        )
+        max_differs = (
+            self.zero_max_streams is not None
+            and self.client_max_streams is not None
+            and self.zero_max_streams != self.client_max_streams
+        )
+        return cap_differs or max_differs
+
+    @property
+    def would_be_rejected(self) -> bool:
+        """这批 priors 按对方阈值**必被拒** —— 提前知道，省一次 step 往返与一次内核 ToolError。
+
+        只读 `rejection` 一格：它**只**由「拿对方阈值干跑一遍本仓校验」置位，与本机 env 是否
+        坏掉无关（后者进 `local_env_error`，理由见类 docstring）。
+        """
+        return bool(self.rejection)
+
+
+def check_external_prior_limits(
+    cfg: ZeroDeployConfig,
+    priors: list[ModalityPrior] | None = None,
+) -> ZeroExternalPriorPreflight:
+    """按回读面判读 external_priors 契约与阈值（**纯函数**，无 I/O、永不抛）。
+
+    `priors` 非空时，用**对方的**阈值重跑一遍本仓 `build_external_priors_override`
+    ——不重写一套校验逻辑（重写必然与 M3/M6/M7/M8/M9 的执行序和合并语义漂移），
+    直接拿本仓那份唯一真相跑一次干跑，被拒即把它的 ValueError 文案原样带出来。
+
+    「对方会不会拒这批 priors」（`rejection`）与「本机阈值 env 写坏了」（`local_env_error`）
+    是**两件互不依赖的事**，各占一格、各自独立判定，理由见 `ZeroExternalPriorPreflight`。
+    """
+    if not cfg.available:
+        return ZeroExternalPriorPreflight(checked=False, reason=cfg.describe())
+    # 本机阈值 env 只服务**一件事**：把 client_cap/client_max 摆出来与对方值对比展示。
+    # 它坏掉不进 `rejection`（那格只表示「对方会拒这批 priors」），单列 local_env_error。
+    # 也不在这里抛：自检面的职责是如实报告，真正发流时 build_* 会照抛不误。
+    local_env_error: str | None = None
+    try:
+        client_cap: float | None = _resolve_precision_cap(None)
+        client_max: int | None = _resolve_max_streams(None)
+    except ValueError as exc:
+        # 两个 env 共用这一次解析 ⇒ 任一坏掉，两侧对比都标记为不可得（`None`）。
+        # 这是**如实标注**而非伪造：此时我方本地默认到底是多少，本身就已不可信。
+        client_cap = None
+        client_max = None
+        local_env_error = f"本机 env 不合法，无法与对方阈值比对：{exc}"
+    zero_schema = _read_int_field(cfg.fields, _DESCRIBE_CONFIG_KEY_SCHEMA_VERSION)
+    zero_cap = _read_float_field(cfg.fields, _DESCRIBE_CONFIG_KEY_PRECISION_CAP)
+    zero_max = _read_int_field(cfg.fields, _DESCRIBE_CONFIG_KEY_MAX_STREAMS)
+
+    # ⚠ 这条干跑**刻意不受 local_env_error 阻断**：它显式传 zero_cap/zero_max，而
+    # `_resolve_precision_cap`/`_resolve_max_streams` 在拿到显式值时直接返回、根本不读 env
+    # （见 external_priors 两函数首行）⇒ 本机 env 坏不坏与这条判读无关。若在此短路，
+    # 一个本机配置笔误就会把「对方会不会拒」这条真信号一并丢掉，恰是最需要它的时候。
+    rejection_reason = ""
+    if priors and zero_cap is not None and zero_max is not None:
+        try:
+            build_external_priors_override(priors, max_streams=zero_max, precision_cap=zero_cap)
+        except ValueError as exc:
+            rejection_reason = str(exc)
+
+    report = ZeroExternalPriorPreflight(
+        checked=True,
+        reason="",
+        zero_schema_version=zero_schema,
+        client_schema_version=EXTERNAL_PRIOR_SCHEMA_VERSION,
+        zero_precision_cap=zero_cap,
+        client_precision_cap=client_cap,
+        zero_max_streams=zero_max,
+        client_max_streams=client_max,
+        rejection=rejection_reason,
+        local_env_error=local_env_error,
+        version_known=cfg.version_known,
+    )
+    parts: list[str] = []
+    if report.schema_mismatch:
+        parts.append(
+            f"🛑 external_prior_schema_version 不一致：对方={zero_schema}、"
+            f"本仓={EXTERNAL_PRIOR_SCHEMA_VERSION} —— **契约不兼容**，"
+            f"我方构造的三元组可能被对方按另一套形状解释成功（被拒是响亮失败，"
+            f"没被拒却被误解才是灾难）"
+        )
+    if zero_schema is None:
+        parts.append(f"对方 {_DESCRIBE_CONFIG_KEY_SCHEMA_VERSION} 不可读（缺键/形状不符）")
+    if report.limits_differ:
+        parts.append(
+            f"阈值与本机默认不同：precision_cap 对方={zero_cap}/本仓={client_cap}、"
+            f"max_streams 对方={zero_max}/本仓={client_max}（不是错误，但发流须按对方的来）"
+        )
+    if report.would_be_rejected:
+        parts.append(f"这批 priors 按对方阈值**会被拒**：{rejection_reason}")
+    if local_env_error is not None:
+        parts.append(
+            f"⚠ {local_env_error} ⇒ 只给得出对方侧数值，本机默认这一侧不可读"
+            f"（**与上面这批 priors 会不会被拒无关**：那条只按对方阈值判。"
+            f"发流时若同样走 env（未显式传 cap/max），build_external_priors_override "
+            f"会因同一个 env 照抛不误，请先修 env）"
+        )
+    if not parts:
+        parts.append(
+            f"自检通过（schema v{zero_schema}、precision_cap={zero_cap}、max_streams={zero_max}）"
+        )
+    if not cfg.version_known:
+        parts.append(
+            f"⚠ describe_config_version={cfg.version} 本仓不认识 ⇒ 上述读法本身不可信，"
+            f"schema 不一致**降级为告警不上抛**"
+        )
+    return dataclasses.replace(report, reason="；".join(parts))
 
 
 def _is_enabled() -> bool:
@@ -595,10 +1134,17 @@ class ZeroLinkClient:
         `last_open_session` 是**只读观测量**（最近一次 `open_session` 收到的完整返回体，
         含 `resumed` / `interrupted_at`），供调用方读；它**不**参与内部判定——`graceful_step`
         用 `_open_session_info` 的**返回值**判定，故多会话并发下不会互相串味。
+
+        `describe_config_cache` / `describe_config_absent` 是 `describe_config()` 的实例级缓存，
+        生命周期 = **一次连接**（`__aexit__` 清空）。它**按 session_id 分键**，故与
+        `last_open_session` 那种「单个共享可变字段」不同，多会话并发下不会串味；失效边界与
+        「为什么敢缓存」的完整论证见 `describe_config()` docstring。
         """
         self.exit_stack: contextlib.AsyncExitStack | None = None
         self.session: ClientSession | None = None
         self.last_open_session: ZeroOpenSessionInfo | None = None
+        self.describe_config_cache: dict[str | None, ZeroDeployConfig] = {}
+        self.describe_config_absent: ZeroDeployConfig | None = None
 
     # ── context manager ───────────────────────────────────────────────────────
 
@@ -701,6 +1247,11 @@ class ZeroLinkClient:
         exc_tb: types.TracebackType | None,
     ) -> None:
         self.session = None
+        # 🛑 回读面缓存的作用域 = **一次连接**：下一次 `async with` 很可能是另一个 server 进程
+        # （stdio 每次重起子进程；HTTP 也可能已重启换了 env），沿用旧缓存 = 拿上一个部署的门控
+        # 回答这一个部署的问题。清空的代价只是重付一次 RTT。
+        self.describe_config_cache.clear()
+        self.describe_config_absent = None
         if self.exit_stack is not None:
             await self.exit_stack.__aexit__(exc_type, exc_val, exc_tb)
             self.exit_stack = None
@@ -787,6 +1338,12 @@ class ZeroLinkClient:
             interrupt_probe=probe,
         )
         self.last_open_session = info
+        # 🛑 回读面缓存失效点之一：开/resume 都会让 Zero **重建**该会话的 config。
+        # 尤其 resume —— SessionConfig 不进 checkpoint，未再供 config 时会**回落到 env 默认**
+        # （我方 R11 提过的那条），此时同一个 sid 的会话级门控与上一轮可以完全不同。
+        # 请求 id 与返回 id 都丢（不传 sid 时 Zero 新铸 uuid4，丢它是无害的 no-op）。
+        self._forget_describe_config(session_id)
+        self._forget_describe_config(returned_id)
         if info.resumed is not None:
             logger.info(
                 "zero.open_session: session=%s resumed=%s",
@@ -918,6 +1475,8 @@ class ZeroLinkClient:
             ZeroLinkConnectionError: 未在 async with 内调用。
         """
         await self._call_tool("zero.close_session", {"session_id": session_id})
+        # 会话没了 ⇒ 会话级回读面缓存失效（同 id 再开会是**新**会话、新 config）。
+        self._forget_describe_config(session_id)
 
     async def purge_session(self, session_id: str) -> bool:
         """删除 Zero 侧该会话的**全部持久运行态**（按 thread_id 清 checkpoint）。⚠ **不可逆**。
@@ -954,7 +1513,290 @@ class ZeroLinkClient:
                 f"响应格式非预期：期望 JSON object，实得 {type(data).__name__}",
             )
         purged = data.get("purged")
+        # purge 内部先跑一遍 close（Zero 侧 `registry.close`）⇒ 该 sid 的会话级门控已不存在，
+        # 缓存必须失效；下一次同 id 重开会以**当时的** env 默认重建 config（R11 那条回落）。
+        self._forget_describe_config(session_id)
         return purged if isinstance(purged, bool) else False
+
+    # ── 只读回读面：zero.describe_config ──────────────────────────────────────
+
+    def _forget_describe_config(self, session_id: str | None) -> None:
+        """丢弃某个 session_id 的回读面缓存（不动部署端默认那一条，也不动负缓存）。
+
+        ⚠ **只丢会话级那一条**：部署端默认（键 ``None``）由 server 进程的 env 决定，不因某个
+        会话开/关/purge 而变；负缓存（`describe_config_absent`）是「对方根本没这个工具」，
+        更与会话无关。把它们一起清掉只会白付 RTT。
+        """
+        self.describe_config_cache.pop(session_id, None)
+
+    async def _tool_registered(self, tool_name: str) -> bool | None:
+        """问 MCP 协议自己的能力面：这个工具**在不在册**。``None`` = 连能力面都问不到。
+
+        🛑 **为什么不从错误文案判**：FastMCP 未注册工具回的是 `Unknown tool: <name>` 这类
+        人读文案，按它做判定是脆弱锚点（pitfalls ⑦：对方一次措辞修订就静默失效，且失效方向是
+        「误判成老部署 → 永久降级」）。`list_tools` 是协议**定义**的能力面，稳定得多。
+
+        任何异常都吞成 ``None``（而非 False）：问不到 ≠ 不在册。返回 False 是**下定论**，
+        它会触发负缓存、短路本连接剩余生命期里的所有探测，故只在真拿到工具清单时才敢给。
+        """
+        session = self._require_session()
+        try:
+            result = await session.list_tools()
+        except Exception as exc:  # noqa: BLE001 - 能力探测降级路径，问不到即返回「不确定」
+            logger.warning(
+                "list_tools 失败（%s: %s）——无法确认 %s 是否在册，按「不确定」处置。",
+                type(exc).__name__,
+                exc,
+                tool_name,
+            )
+            return None
+        tools = getattr(result, "tools", None)
+        if not isinstance(tools, list):
+            logger.warning("list_tools 返回体形状非预期（%r）——按「不确定」处置。", type(tools))
+            return None
+        return any(getattr(tool, "name", None) == tool_name for tool in tools)
+
+    async def _describe_config_after_failure(self, exc: Exception) -> ZeroDeployConfig:
+        """`describe_config` 调用失败后的**归因**：老部署没这工具，还是这一次没调通。"""
+        registered = await self._tool_registered(_DESCRIBE_CONFIG_TOOL)
+        if registered is False:
+            cfg = ZeroDeployConfig(
+                probe=ZeroConfigProbe.NOT_REGISTERED,
+                detail=(
+                    f"{_DESCRIBE_CONFIG_TOOL} 不在对方工具清单里（list_tools 确证），"
+                    f"判为**老部署**：调用错误={type(exc).__name__}: {exc}"
+                ),
+            )
+            self.describe_config_absent = cfg
+            logger.warning(
+                "%s 所连 Zero 未注册 %s（老部署）——依赖该回读面的能力全部降级："
+                "错误码表运行期核对、发流前自检均不执行（各自返回 checked=False），"
+                "行为回落到接入本工具之前（撞了 ExternalPriorError 才知道）。",
+                LOG_MARKER_DESCRIBE_NOT_REGISTERED,
+                _DESCRIBE_CONFIG_TOOL,
+            )
+            return cfg
+        logger.warning(
+            "%s %s 调用失败（%s: %s），但工具在册=%s ⇒ **不下「老部署」的定论、不缓存**，"
+            "下次调用会重新探测。",
+            LOG_MARKER_DESCRIBE_CALL_FAILED,
+            _DESCRIBE_CONFIG_TOOL,
+            type(exc).__name__,
+            exc,
+            registered,
+        )
+        return ZeroDeployConfig(
+            probe=ZeroConfigProbe.CALL_FAILED,
+            detail=(
+                f"调用失败但工具在册={registered}（None=连 list_tools 都问不到）："
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    async def describe_config(
+        self,
+        session_id: str | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> ZeroDeployConfig:
+        """回读**所连部署**真正生效的门控（Zero `zero.describe_config`）。
+
+        **永不因对方缺这工具而抛。**
+
+        不传 `session_id` → **部署端默认**（env + caps + versions），供在 `open_session`
+        **之前**决定要不要发某类流；传 → **该会话真实生效**的值（未知 id 视同不传，此时
+        `resolved_for_session=False`）。
+
+        ── **何时调**（本方法刻意不自动调用）──────────────────────────────────────
+        懒加载、由调用方在需要时显式调。**绝不挂进 `step()`**：那是每帧一次的热路径，为一份
+        「会话活跃期不会变」的配置每帧付一个 RTT 是纯浪费。也不挂进 `__aenter__`：连接建立
+        不该为一个**可选**的只读面多付一次往返，更不该让连接的失败模式受它牵连。
+        典型调用点：进程起来后一次（部署端默认）+ 每次 `open_session` 之后一次（会话级）。
+
+        ── **缓存与失效边界**（这是本方法最需要论证的地方）────────────────────────
+        实例级缓存，**按 session_id 分键**，生命周期 = 一次连接（`__aexit__` 清空，理由见那里）。
+        · **键 ``None``（部署端默认）敢缓存**：它由 server 进程的 env 决定，env 要变必须重启进程，
+          而 stdio 下进程重启 = 我方连接断，HTTP 下 MCP 会话失效 —— 两条路都会走到 `__aexit__`
+          或重连。
+        · **会话级（键 = sid）敢缓存，但只在 `resolved_for_session is True` 时**：
+          Zero 明言活跃会话的门控**构造时固定**（其 describe_config 从 `session.config` 取而非
+          现算），故活跃期内不可变。
+          🛑 而 `resolved_for_session is False` 意味着**对方不认识这个 id、回的是部署端默认**
+          —— 把它缓存到 sid 键下是**主动制造一颗定时炸弹**：等会话真的开出来，同一个 sid 的
+          正确答案已经变了，我方却还在服务那份「默认值伪装成会话值」的旧答案。故不缓存。
+        · **失效点（三处，覆盖本 client 能观测到的全部状态变更）**：`_open_session_info`
+          （开/resume 都会重建 config —— ⚠ **跨 resume 会回落 env 默认**，这正是我方 R11 提过的
+          「SessionConfig 不进 checkpoint」，是会话级缓存唯一真正的过期成因）、`close_session`、
+          `purge_session`。
+        · **残留缺口，如实写**：另一个进程/实例用**同一个 sid** 重开出不同 config 时，本实例的
+          缓存不会失效（我方看不见对方的动作）。后果止于「自检结论过期」，不影响任何安全判定
+          （安全面 M8/M9 单边兜住、不依赖本回读面）。需要绝对新鲜时传 `force_refresh=True`。
+          ⚠ 跨进程共用一个 sid 本身已违反「session_id = 运行态访问凭据」的信任模型。
+
+        ── **老部署（没注册这个工具）**────────────────────────────────────────────
+        返回 `probe=NOT_REGISTERED` 的 `ZeroDeployConfig`，**不抛**。归因走 `list_tools`
+        协议能力面而非错误文案（理由见 `_tool_registered`）。该结论**负缓存**并短路后续所有
+        探测（工具不在册与 sid 无关），避免每次自检白付 2 个 RTT。
+        调用方怎么知道降级了：`cfg.available is False`，且 `diff_error_codes` /
+        `check_external_prior_limits` 都会返回 `checked=False` + 原因串（**不是**「检查通过」）。
+        调用失败但工具在册 → `probe=CALL_FAILED`，**不缓存**（不确定的事不下定论）。
+
+        ── **`describe_config_version` 演进**──────────────────────────────────────
+        认识的版本正常用；不认识 → **降级但不炸**：仍解析、仍报告，但唯一的强制动作
+        （`preflight_external_priors` 的 raise）降级为 warn，并打一条
+        `LOG_MARKER_DESCRIBE_VERSION_UNKNOWN`。理由见 `KNOWN_DESCRIBE_CONFIG_VERSIONS`
+        （对方的 bump 纪律覆盖「某键**语义**变了」，那是照旧解析会得出错误结论的一类）。
+
+        Args:
+            session_id:    None → 部署端默认；非 None → 该会话真实生效的值。
+            force_refresh: 跳过并清掉本键缓存与负缓存，强制重新探测。
+
+        Returns:
+            `ZeroDeployConfig`（不可用时也是合法值，读 `.probe` / `.available` 判定）。
+
+        Raises:
+            ZeroLinkConnectionError: 未在 async with 内调用（编程错误，照旧透传）。
+        """
+        if force_refresh:
+            self._forget_describe_config(session_id)
+            self.describe_config_absent = None
+        elif self.describe_config_absent is not None:
+            return self.describe_config_absent
+        else:
+            cached = self.describe_config_cache.get(session_id)
+            if cached is not None:
+                return cached
+
+        args: dict[str, Any] = {} if session_id is None else {"session_id": session_id}
+        try:
+            text = await self._call_tool(_DESCRIBE_CONFIG_TOOL, args)
+        except (ZeroLinkCallError, McpError) as exc:
+            # ⚠ 连 `ZeroLinkNonDegradableError` 子类也在这里被判读成「探测失败」而非上抛：
+            # 一个**只读的可选**探测面不该有权炸掉调用方；同一个部署问题会在真正的
+            # open/step 路径上原样抛出（那里才是它该被看见的地方）。
+            return await self._describe_config_after_failure(exc)
+
+        try:
+            data: Any = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return self._describe_config_malformed(f"响应非合法 JSON：{exc}")
+        if not isinstance(data, dict):
+            return self._describe_config_malformed(
+                f"响应不是 JSON object，实得 {type(data).__name__}"
+            )
+
+        cfg = ZeroDeployConfig(
+            probe=ZeroConfigProbe.OK,
+            version=_read_int_field(data, _DESCRIBE_CONFIG_KEY_VERSION),
+            # `is True` 而非 truthy：只认真正的 bool，与 `_parse_open_session_resumed` 同口径。
+            resolved_for_session=data.get(_DESCRIBE_CONFIG_KEY_RESOLVED) is True,
+            fields=types.MappingProxyType(dict(data)),
+        )
+        self._log_describe_config_shape(cfg)
+        if session_id is None or cfg.resolved_for_session:
+            self.describe_config_cache[session_id] = cfg
+        else:
+            logger.debug(
+                "describe_config(session_id=%r) 回了 resolved_for_session=False（对方不认识该 id，"
+                "回的是部署端默认）——**不缓存**，否则会话真开出来后仍在服务这份旧答案。",
+                session_id,
+            )
+        return cfg
+
+    def _describe_config_malformed(self, detail: str) -> ZeroDeployConfig:
+        """返回体畸形：记 warning、判 MALFORMED、**不缓存**（畸形不是稳定事实）。"""
+        logger.warning("%s %s：%s", LOG_MARKER_DESCRIBE_FIELDS_DRIFT, _DESCRIBE_CONFIG_TOOL, detail)
+        return ZeroDeployConfig(probe=ZeroConfigProbe.MALFORMED, detail=detail)
+
+    def _log_describe_config_shape(self, cfg: ZeroDeployConfig) -> None:
+        """版本/键集的形状告警（每条缓存只会打一次，因为命中缓存的调用根本不到这里）。"""
+        if not cfg.version_known:
+            logger.warning(
+                "%s describe_config_version=%r 不在本仓已核验集合 %s —— 依赖本回读面的判定"
+                "**降级为只报告不强制**（schema 版本不一致由 raise 降为 warn）。"
+                "请现场核对方 describe_config 返回体后再把新版本号收进 "
+                "KNOWN_DESCRIBE_CONFIG_VERSIONS。",
+                LOG_MARKER_DESCRIBE_VERSION_UNKNOWN,
+                cfg.version,
+                sorted(KNOWN_DESCRIBE_CONFIG_VERSIONS),
+            )
+        if cfg.missing_keys or cfg.unexpected_keys:
+            logger.warning(
+                "%s describe_config 键集与本仓期望不符：缺键=%s、新增键=%s。"
+                "缺键按「该位不可读」处置（不猜默认值）；新增键是对方正常演进，本仓忽略。",
+                LOG_MARKER_DESCRIBE_FIELDS_DRIFT,
+                list(cfg.missing_keys),
+                list(cfg.unexpected_keys),
+            )
+
+    async def check_error_codes(self, *, session_id: str | None = None) -> ZeroErrorCodeDiff:
+        """① **运行期**核对本仓 `ZERO_ERROR_CODES` 手抄镜像 vs 所连部署的 `error_codes` 全表。
+
+        这条替代了本仓原本要向 Zero 索要的「码字符集自校验」（该请求已在跨仓件里撤回）——
+        对方现在直接回全表，比让对方替我方校验更直接、且看的是**真正连上的那个部署**。
+
+        处置一律 **warn 不 raise**，三种不一致的严重度与文案不同，逐条论证见 `diff_error_codes`。
+        回读面不可用 → `checked=False` + 原因串（**不是**「一致」）。
+        """
+        cfg = await self.describe_config(session_id=session_id)
+        diff = diff_error_codes(cfg)
+        if not diff.checked:
+            logger.info("错误码表运行期核对未执行：%s", diff.reason)
+        elif diff.in_sync:
+            logger.debug("错误码表运行期核对：%s", diff.reason)
+        else:
+            logger.warning("%s %s", LOG_MARKER_ERROR_CODE_TABLE_DRIFT, diff.reason)
+        return diff
+
+    async def preflight_external_priors(
+        self,
+        priors: list[ModalityPrior] | None = None,
+        *,
+        session_id: str | None = None,
+        strict: bool = True,
+    ) -> ZeroExternalPriorPreflight:
+        """② **发流前**自检：契约版本 + 精度/流数上界 vs 所连部署的真实生效值。
+
+        没有这条时我方只能「撞了 `ExternalPriorError` 才知道」；有了回读面就能在发流之前发现。
+        与既有 M5 静态守卫**覆盖面不相交**（源码树 vs 真实部署），论证见
+        `ZeroExternalPriorPreflight` 类 docstring。
+
+        Args:
+            priors:     可选。给了就用**对方的**阈值把本仓 `build_external_priors_override`
+                        干跑一遍，提前拿到确切的拒绝原因。
+            session_id: None → 按部署端默认自检（`open_session` 之前就能做）。
+            strict:     schema 版本不一致时是否上抛。默认 True。
+
+        Returns:
+            `ZeroExternalPriorPreflight`（阈值不同 / 这批 priors 会被拒 / 本机阈值 env 坏了
+            → 一律只报告 + WARNING，不抛）。⚠ `would_be_rejected` **只**回答「对方会不会拒
+            这批 priors」；本机 env 坏掉走 `local_env_error`，不会把「没传 priors」染成会被拒。
+
+        Raises:
+            ZeroLinkSchemaIncompatibleError: `strict` 且回读面**版本可信**且
+                `external_prior_schema_version` 与本仓不一致。⚠ 版本不认识时**不抛**——
+                在不可信的观测量上 raise 是错的，降级为 warn。
+        """
+        cfg = await self.describe_config(session_id=session_id)
+        report = check_external_prior_limits(cfg, priors)
+        if not report.checked:
+            logger.info("发流前自检未执行：%s", report.reason)
+            return report
+        if report.schema_mismatch and strict and cfg.version_known:
+            logger.error("%s %s", LOG_MARKER_EXTERNAL_PRIOR_PREFLIGHT, report.reason)
+            raise ZeroLinkSchemaIncompatibleError(_DESCRIBE_CONFIG_TOOL, report.reason)
+        if (
+            report.schema_mismatch
+            or report.limits_differ
+            or report.would_be_rejected
+            or report.local_env_error is not None
+        ):
+            # `local_env_error` 单列后仍须留在告警面：它此前混在 `rejection` 里，是能见的；
+            # 拆格若不补这一项，本机 env 写坏就从 WARNING 掉进 DEBUG（发流时才炸，且不知为何）。
+            logger.warning("%s %s", LOG_MARKER_EXTERNAL_PRIOR_PREFLIGHT, report.reason)
+        else:
+            logger.debug("发流前自检：%s", report.reason)
+        return report
 
     async def _purge_after_interrupted(self, session_id: str) -> bool:
         """`graceful_step` 拒绝续跑后的**可选**善后：清掉该会话运行态。best-effort。
@@ -1088,17 +1930,26 @@ class ZeroLinkClient:
              refuse_if_interrupted=True)`）而非在降级路径里偷偷改语义 —— 那是另一次改动。
         缺口由 `test_normal_resume_path_has_no_interrupt_guard` 特征化钉住。
 
-        🕒 **为何本轮仍用 `resumed` 做新老部署判别位**（临时性，如实标注）：判别本该问
-        `zero.describe_config`（Zero `daecce1` 已落，带 `describe_config_version` +
-        `error_codes` 全量表），而不是从 `resumed` 键在不在**反推**代际。本轮不接的理由：
-          ① 它要在自愈分支里插一次**额外 round-trip**，而这条路径正是对端刚出过问题的时刻；
-          ② 老部署没注册该工具 ⇒ 调用即 isError，得再写一层「工具不存在=老部署」的回退，
-             判别链反而更长；
-          ③ 本轮判定所需的位（`resumed` / `interrupted_at`）**就在已拿到的 open_session
-             返回体里**，零额外调用。
-        ⇒ 接上 `describe_config` 后，本方法与 `ZeroOpenSessionInfo.resumed` 上的代际判别应
-        一并改挂 `describe_config_version`，届时可撤回向 Zero 索要的「承诺 `resumed`
-        不被条件化」那条契约请求。
+        ✅ **`resumed` 判别位：`describe_config` 已接入，仍然不撤**（2026-07-30 复核，撤回旧计划）。
+        上一版在此写「接上 `describe_config` 后本方法与 `ZeroOpenSessionInfo.resumed` 上的代际
+        判别应一并改挂 `describe_config_version`」——**核验后判定该计划错误**：
+          · 下方 ABSENT 分支的条件 `info.resumed is True` 同时干两件事：**(a) 代际**（老部署
+            不发 `resumed` ⇒ 不进分支 ⇒ 零回归）与 **(b) 本次 open 是不是 resume**（排除缺席
+            四义里的第①义「未探测·新建会话」）。
+          · `describe_config` 只能覆盖 (a)：它是**配置**回读面，答不了「你刚才那一次调用走的
+            是新建还是续会话」——(b) 是**每次调用**的事实，不是部署/会话的属性。
+          ⇒ 改挂版本号 = 用一个覆盖不全的判据换掉覆盖全的那个，第①义会被放回不可判集合，
+            这条 WARNING 会在**每一次健康的新建会话**上误发。**判别力不升反降，故不改。**
+        另外三条原始理由今天依然成立、且都指向同一个结论：
+          ① 在自愈分支里插一次**额外 round-trip**，而这条路径正是对端刚出过问题的时刻；
+          ② 老部署没注册该工具 ⇒ 得再写一层「工具不存在=老部署」的回退，判别链更长
+             （该回退现已实现于 `describe_config`，但它的 RTT 成本没消失）；
+          ③ 判定所需的位（`resumed`/`interrupted_at`）**就在已拿到的 open_session 返回体里**，
+             零额外调用。
+        ⇒ 向 Zero 索要的「承诺 `resumed` 不被条件化」**不撤回**，但**理由要换**：不再是
+        「我方拿它当代际位」（这半确已被 `describe_config_version` 顶替），而是
+        「我方拿它判**本次 open** 的 resume 语义」。`describe_config()` 作为**独立**能力面提供，
+        不接进本方法的热路径。
 
         Args:
             session_id:    Zero 会话 ID（None 时立即返回 None）。
@@ -1258,9 +2109,10 @@ class ZeroLinkClient:
                     # 零回归：本分支挂在 `resumed is True` 上。`resumed` 是新老部署的判别位
                     # （新 Zero 无条件回，老部署根本不发）⇒ 老部署走 `resumed is None`，
                     # 不进本分支、不打这条 WARNING，行为与换代前逐字一致。
-                    # ⏳ 该判别位是**间接推断**（靠对方实现细节，非契约）。Zero `daecce1` 已落
-                    # `zero.describe_config`（带 `describe_config_version`）——那才是代际判别的
-                    # 正解；本轮有意不接，论证见本方法 docstring 末段，接上后本行条件应改挂它。
+                    # ✅ 2026-07-30：`describe_config` 已接入（见 `ZeroLinkClient` 同名方法），
+                    # 但**本行条件不改挂它**——`resumed is True` 在这里同时排除了缺席四义的第①义
+                    # （未探测·新建会话），而回读面答不了「本次 open 是不是 resume」。改挂 = 丢掉
+                    # 该排除、在每次健康新建会话上误发本 WARNING。论证见本方法 docstring。
                     logger.warning(
                         "%s graceful_step: session=%s resume 重开回了 resumed=True 但**未带** %r"
                         "——该键缺席有四义（未探测·新建 / 未探测·活跃幂等重开 / 探测失败 / "
