@@ -270,21 +270,49 @@ _CODE_TO_EXCEPTION: dict[str, type[ZeroLinkCallError]] = {
 
 
 # ── zero.open_session 响应形状（Zero 2026-07-29 换代：返回体「只增不改」）───────────
-# Zero `zero.open_session` 现返回 `{session_id, resumed}`；**且仅当** resume 时探测到上一轮被
-# 中途取消，才另带 `{interrupted_at: [待执行节点名]}`（Zero server.py 的
-# `out = {"session_id": sid, "resumed": resuming}` + 条件分支 `out["interrupted_at"] = …`）。
+# Zero `zero.open_session` 现返回 `{session_id, resumed}`；resume 且探测到上一轮被中途取消时
+# 另带 `{interrupted_at: [待执行节点名]}`。
 #
-# 🛑 **缺键即回落**（对现网 Zero 零回归·硬约束）：老部署只回 `{session_id}`，两个新键都读不到
+# 🛑 **缺键即回落**（对现网 Zero 零回归·硬约束）：老部署只回 `{session_id}`，新键都读不到
 # 时行为必须与换代前逐字相同——`open_session` 照常返回 session_id，不抛、不打额外日志。
 # 这也是 Zero 侧「返回体只增不改」承诺的消费侧对价，守卫见
 # `tests/mcp/test_zero_client.py::test_open_session_without_new_keys_is_zero_regression`。
 #
-# 形状防御：两个键都按「读不到就当没有」处理（记一条 warning 后回落 None），**任何形状异常都
+# 形状防御：每个键都按「读不到就当没有」处理（记一条 warning 后回落），**任何形状异常都
 # 不得让 open_session 炸** —— 会话生命周期不能因为一条观测量的类型不对就打不开。
 #
-# 🛑 `interrupted_at` **缺席有四义**（Zero `daecce1` 现场核验，2026-07-29 20:0x）——不得一律
-#    当成「未中断，可安全续跑」。Zero `open_session` 里**四条**路径都会让该键缺席
-#    （上一版标题写「三义」而正文枚举四条，本轮订正；计数词随认知修订而漂移，
+# ══ 中断态判读走**双轨**（2026-07-30 起）══════════════════════════════════════════
+# 同一件事（上一轮是否被中途取消）现在有**两条**来源，取哪条取决于所连部署的代际：
+#
+#   · **新轨（权威·优先）**：返回体带一个**恒存在**的 `interrupt_probe` 键，取值是 Zero 显式
+#     声明的四态 `not_probed / clean / interrupted / probe_failed`（见下方 token 表）。
+#     ⇒ **该键在就一律以它为判据**，不再看 `interrupted_at` 是否缺席。这是我方当初向对方
+#     索要的东西：其中 `probe_failed` 那一格（对方探测**自己抛了**）此前在返回体上与
+#     「探测干净」完全同形，正是最危险的一格。
+#   · **老轨（仅老部署·保留不删）**：没有 `interrupt_probe` 键时，只能从 `interrupted_at`
+#     这个键**在不在**去反推 —— 那条推断链就是下面的「缺席四义」。它**只对老部署成立**，
+#     新部署上已被显式态取代（不要再把它当无条件事实读）。
+#
+# 🛑 **版本依赖必须标注**（`ZeroLinkLockTimeoutError` docstring 立的分界：安全守卫一律不依赖
+#    对方状态，**能力探测 / 归责语义**可以依赖但须标注版本）。本面属**后者**：
+#      · `interrupt_probe` 上线于 Zero **`667e923`**（其**未合并**工作树分支
+#        `fix/stage60-purge-correctness`；main @ `75e8a36` 上**还没有**这个键），同批把
+#        `DESCRIBE_CONFIG_VERSION` 1→2（见 `KNOWN_DESCRIBE_CONFIG_VERSIONS`）；
+#      · 我方 stdio 默认 `ZERO_SERVER_CWD=D:\Zero` ⇒ 今天真连的正是对方**工作树**（有该键），
+#        而任何 main 部署（或更早）都**不发**该键 ⇒ 老轨必须留着、且不得因此报异常；
+#      · 依赖的内容说清：`probe_failed` 是「**对方**探测抛了」这一事实的唯一来源 —— 那份可能
+#        半写的 checkpoint 只有 Zero 读得到，我方**无法独立验证**，故这一位只能靠对方给。
+#        安全面（M8 自点燃上界 / M9 physio μv 契约等出网守卫）不在此列、一律单边兜住。
+#      · ⚠ 对方 bump 纪律明写「② 某键的**值域/取值集合**变化（如 interrupt_probe 加一个新态）」
+#        也要 bump ⇒ **将来可能有第五态**。故我方不认识的取值必须有兜底（见 `UNRECOGNIZED`），
+#        跨仓取值集合的漂移由 `tests/mcp/test_zero_contract_crosscheck.py::
+#        TestInterruptProbeCrosscheck` 提醒（日常 warn + STRICT 判红）。
+#
+# 🛑 `interrupted_at` **缺席有四义**（Zero `daecce1` 现场核验，2026-07-29 20:0x）——**这段只对
+#    老部署（无 `interrupt_probe` 键）成立**，是老轨的判读依据，故保留不删；新部署上四义已被
+#    对方逐格显式化（映射见 `_ZERO_PROBE_TOKEN_TO_STATE` 的注释）。在老轨上不得把缺席一律
+#    当成「未中断，可安全续跑」——Zero `open_session` 里**四条**路径都会让该键缺席
+#    （上一版标题写「三义」而正文枚举四条，2026-07-29 订正；计数词随认知修订而漂移，
 #     故守卫**一律不得**锚在它上面，见下方 `LOG_MARKER_*`）：
 #      ① **未探测·新建会话**：`resuming` 为假时整段探测被跳过（返回体 `resumed: false`）；
 #      ② **未探测·活跃幂等重开**：`registry.get(sid) is not None` 分支**提前 return**
@@ -294,10 +322,11 @@ _CODE_TO_EXCEPTION: dict[str, type[ZeroLinkCallError]] = {
 #      ④ **探测成功且干净**：`nxt or None` 返回 None。
 #    ⚠ 其中 ③ 与我方要防的半截态是**故障相关**的：探测读的 (`graph.aget_state`) 正是那份
 #      可能半写的 checkpoint。把缺席一律读成「安全」= 止血在最该生效时静默失效。
-#    ⇒ 解析层必须把「键缺席」「键在但为空」「键在且非空」「键在但形状坏」四态**分开表达**
-#      （见 `ZeroInterruptProbe`），由消费点自己决定每一格怎么处置。
+#    ⇒ 老轨的解析层必须把「键缺席」「键在但为空」「键在且非空」「键在但形状坏」四态**分开
+#      表达**（见 `ZeroInterruptProbe`），由消费点自己决定每一格怎么处置。
 _OPEN_SESSION_KEY_RESUMED = "resumed"
 _OPEN_SESSION_KEY_INTERRUPTED_AT = "interrupted_at"
+_OPEN_SESSION_KEY_INTERRUPT_PROBE = "interrupt_probe"
 
 
 # ── 日志锚点（守卫的**稳定标识**）─────────────────────────────────────────────────
@@ -317,10 +346,32 @@ LOG_MARKER_PROBE_MALFORMED = "[zl:interrupt-probe-malformed]"
 """`interrupted_at` 形状非法（跨仓契约漂移）——照常续跑但必须有人看见。"""
 
 LOG_MARKER_PROBE_UNDECIDABLE = "[zl:interrupt-probe-undecidable]"
-"""`resumed=True` 但 `interrupted_at` 缺席——我方不可判，照常续跑 + 可区分告警。"""
+"""**老轨**：`resumed=True` 但 `interrupted_at` 缺席——缺席四义不可判，照常续跑 + 可区分告警。"""
 
 LOG_MARKER_INTERRUPTED_ON_OPEN = "[zl:interrupted-at-open]"
-"""`open_session` 返回体直接带非空 `interrupted_at`（**任何**调用路径，含无守卫的常规 resume）。"""
+"""`open_session` 判出 `INTERRUPTED`（**任何**调用路径，含无守卫的常规 resume）。"""
+
+# ── 新轨（Zero `667e923` 起的显式 `interrupt_probe`）专属锚点 ──────────────────────
+# 🛑 **open 面与决策面必须用不同 marker**：`graceful_step` 内部调 `_open_session_info`，两处日志
+#    落在**同一个** caplog 里 ⇒ 若共用一个 marker，一条「决策点确实拒绝了」的断言会被 open 面
+#    那条日志喂饱而恒真（pitfalls ⑥ 同类）。故 `*_ON_OPEN`（只报告）与 `*_REFUSED`（真拒绝）分列。
+LOG_MARKER_PROBE_FAILED_ON_OPEN = "[zl:interrupt-probe-failed-at-open]"
+"""对方显式回 `probe_failed`（它自己的探测抛了）——open 面只报告，不处置。"""
+
+LOG_MARKER_PROBE_FAILED_REFUSED = "[zl:interrupt-probe-failed-refused]"
+"""`probe_failed` → `graceful_step` 按**最坏情况**拒绝本帧（**不** purge，理由见分支注释）。"""
+
+LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN = "[zl:interrupt-probe-unrecognized-at-open]"
+"""对方回了一个我方**不认识**的态（第五态 / 值非 str）——open 面只报告，不处置。"""
+
+LOG_MARKER_PROBE_UNRECOGNIZED_REFUSED = "[zl:interrupt-probe-unrecognized-refused]"
+"""未知态 → `graceful_step` 按最坏情况拒绝本帧（**不** purge），并提示去核对方新增了什么态。"""
+
+LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE = "[zl:interrupt-probe-not-probed-undecidable]"
+"""**新轨**：对方显式回 `not_probed` 且 `resumed=True`（活跃幂等重开）——它没看，故仍不可判。"""
+
+LOG_MARKER_PROBE_STATE_MISMATCH = "[zl:interrupt-probe-state-mismatch]"
+"""`interrupt_probe` 与 `interrupted_at` 载荷**自相矛盾**（跨仓契约漂移）——按保守方向取态。"""
 
 LOG_MARKER_DESCRIBE_NOT_REGISTERED = "[zl:describe-config-not-registered]"
 """所连部署**未注册** `zero.describe_config`（老部署）——经 `list_tools` **确证**，非猜测。"""
@@ -342,26 +393,77 @@ LOG_MARKER_EXTERNAL_PRIOR_PREFLIGHT = "[zl:external-prior-preflight]"
 
 
 class ZeroInterruptProbe(StrEnum):
-    """`open_session` 返回体里 `interrupted_at` 这一位的**判读四态**。
+    """「上一轮是否被中途取消」的**我方判读**（双轨合流后共七态）。
 
-    一个 ``tuple | None`` 承担不了四件事：今天 `MALFORMED` 与 `ABSENT` 都塌缩成 ``None``，
-    消费点无从区分「对方没说」与「对方说了但契约漂移了」。本枚举把该位显式化。
+    🛑 **这是我方的判读，不是对方的线上令牌**：对方的四态字符串（`not_probed`/`clean`/
+    `interrupted`/`probe_failed`）经 `_ZERO_PROBE_TOKEN_TO_STATE` 映射进来，其余三态
+    （`ABSENT`/`MALFORMED`/`UNRECOGNIZED`）在对方那边**没有对应物**——它们描述的是
+    「对方没说」「对方说的读不懂」这类只有消费侧才有的处境。故请勿拿 `ZeroInterruptProbe(raw)`
+    直接构造：新增令牌时那样写会抛 ValueError，而正确行为是落到 `UNRECOGNIZED`。
+
+    为什么要一个枚举而不是 ``tuple | None``：`MALFORMED`/`ABSENT`/`CLEAN` 在节点名字段上会
+    **全部塌缩成 ``None``**，消费点无从区分「对方没说」「对方说了但契约漂移」「对方明确说干净」。
 
     Attributes:
-        ABSENT:      键缺席。**我方不可判**——见上方四义（未探测·新建 / 未探测·活跃幂等重开 /
-                     探测失败 / 探测成功且干净）。
-        CLEAN:       键在且为空序列 ⇒ 对方**明确**探测过且无待执行节点。Zero 今天
-                     `nxt or None` 不发空表，故该态在现网不出现；但契约未禁止发，
-                     而「对方明确说干净」比「对方没说」强得多，值得留一格。
-        INTERRUPTED: 键在且是非空 ``list[str]`` ⇒ **确定**半截：运行态停在 super-step
-                     边界，续跑从待执行节点继续而非重跑整轮（Zero 自己的契约表述）。
-        MALFORMED:   键在但形状非 ``list[str]`` ⇒ 跨语言契约已漂移，同样**不可判**。
+        ABSENT:       **老轨专属**：`interrupt_probe` 与 `interrupted_at` 两个键都缺席。
+                      **我方不可判**——见上方缺席四义（未探测·新建 / 未探测·活跃幂等重开 /
+                      探测失败 / 探测成功且干净）。⇒ 该态今天**等价于「所连部署是老代」**
+                      （新部署恒发 `interrupt_probe`），归因日志就靠它与下面几态分开。
+        CLEAN:        对方**明确**说探测过且无待执行节点。两轨都可产出：新轨 =
+                      `interrupt_probe == "clean"`；老轨 = `interrupted_at` 在且为空序列
+                      （Zero 今天 `nxt or None` 不发空表，故老轨这一格现网不出现，但契约
+                      未禁止发，而「明确说干净」比「没说」强得多，值得留一格）。
+        INTERRUPTED:  **确定**半截：运行态停在 super-step 边界，续跑从待执行节点继续而非重跑
+                      整轮（Zero 自己的契约表述）。新轨 = `interrupt_probe == "interrupted"`；
+                      老轨 = `interrupted_at` 是非空 ``list[str]``。
+        MALFORMED:    **老轨专属**：`interrupted_at` 在但形状非 ``list[str]``，且没有
+                      `interrupt_probe` 可依 ⇒ 跨语言契约已漂移，**不可判**。
+        NOT_PROBED:   **新轨**：对方明确说「压根没探测」（新建会话，或活跃幂等重开时提前
+                      return）。⚠ 这**不是**「干净」——它只是「对方没看」。配合 `resumed`
+                      才能定性：`resumed is False` ⇒ 新建，没有旧运行态可污染，真安全；
+                      `resumed is True` ⇒ 活跃幂等重开（缺席四义的第②义），**仍不可判**。
+        PROBE_FAILED: **新轨**：对方的探测**自己抛了**。🛑 **不可判，且必须按最坏情况处置、
+                      绝不可当 CLEAN** —— 探测读的正是那份可能半写的 checkpoint，故这一格与
+                      要防的半截态**故障相关**：越是真出事的时候越可能落到这里。
+                      这一格正是我方当初向对方索要显式化的目标（此前它与 CLEAN 在返回体上同形）。
+        UNRECOGNIZED: **新轨兜底**：`interrupt_probe` 在，但取值不是我方认识的四个令牌之一
+                      （对方新增了**第五态**），或其值根本不是 ``str``（形状漂移）。
+                      同样按最坏情况处置 + 告警，理由见 `_parse_open_session_interrupt_state`。
     """
 
     ABSENT = "absent"
     CLEAN = "clean"
     INTERRUPTED = "interrupted"
     MALFORMED = "malformed"
+    NOT_PROBED = "not-probed"
+    PROBE_FAILED = "probe-failed"
+    UNRECOGNIZED = "unrecognized"
+
+
+# Zero 的**线上令牌** → 我方判读态。逐格即「缺席四义」被对方显式化后的落点：
+#   "not_probed"   ← 四义之 ①（未探测·新建）与 ②（未探测·活跃幂等重开）**合并**成一个令牌
+#                    ⇒ 单看它仍分不开这两义，须配 `resumed`（①=False / ②=True）才能定性。
+#   "probe_failed" ← 四义之 ③（探测失败）。**本轮的主要收益**：从「与干净同形」变成可判可归因。
+#   "clean"        ← 四义之 ④（探测成功且干净）。
+#   "interrupted"  ← 原本就不靠缺席表达（该键在且非空），新轨只是把它也纳入同一位。
+# 🛑 令牌是**对方的**字面量，与本仓枚举值刻意不同形（下划线 vs 连字符）：混用会让人以为
+#    可以 `ZeroInterruptProbe(raw)` 直接转，而那条路在第五态上会抛异常而不是优雅降级。
+_ZERO_PROBE_TOKEN_TO_STATE: dict[str, ZeroInterruptProbe] = {
+    "not_probed": ZeroInterruptProbe.NOT_PROBED,
+    "clean": ZeroInterruptProbe.CLEAN,
+    "interrupted": ZeroInterruptProbe.INTERRUPTED,
+    "probe_failed": ZeroInterruptProbe.PROBE_FAILED,
+}
+
+KNOWN_ZERO_INTERRUPT_PROBE_VALUES: frozenset[str] = frozenset(_ZERO_PROBE_TOKEN_TO_STATE)
+"""本仓**认识**的 `interrupt_probe` 取值集合（现场核自 Zero `667e923` 的 `open_session`）。
+
+跨仓漂移守卫：`tests/mcp/test_zero_contract_crosscheck.py::TestInterruptProbeCrosscheck`
+把本集合与**对方源码里实际会赋给 `probe` / 写进返回体的字面量**逐值比对——对方按其 bump
+纪律 ② 加第五态时，该守卫日常 warn、STRICT 判红，逼人现场核一遍再登记。
+运行期遇到不在本集合里的取值 → `ZeroInterruptProbe.UNRECOGNIZED`（最坏情况处置 + 告警），
+**不炸**：跨仓单边升级不该让会话打不开。
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,17 +492,28 @@ class ZeroOpenSessionInfo:
                         判别力不升反降。故 `resumed` 保留；向 Zero 索要的「承诺 `resumed` 不被
                         条件化」那条契约请求**同样不撤**，只是理由从「我方拿它当代际位」改成
                         「我方拿它判本次 open 的 resume 语义」（代际那半的依据可以撤）。
-        interrupted_at: 待执行节点名；仅 ``interrupt_probe is INTERRUPTED`` 时非空。
-                        ``ABSENT``/``MALFORMED`` → ``None``，``CLEAN`` → ``()``。
-                        ⚠ **不要**只看这一个字段做判定：``None`` 同时覆盖「对方没说」与
-                        「形状坏」两义，判定请读 `interrupt_probe`。
-        interrupt_probe: 上一字段的四态判读（见 `ZeroInterruptProbe`）。
+        interrupted_at: 待执行节点名（**载荷**，不是判据）；仅 ``interrupt_probe is
+                        INTERRUPTED`` 时可能非空，其余态一律 ``None``/``()``。
+                        ⚠ **不要**只看这一个字段做判定：``None`` 同时覆盖「对方没说」「形状坏」
+                        「对方明确说干净」多义，判定一律读 `interrupt_probe`。
+                        ⚠ 新轨下 ``CLEAN`` 对应 ``None``（对方干净时压根不发该键），老轨下
+                        ``CLEAN`` 对应 ``()``（该键在且为空）——故**不可**拿 ``() vs None``
+                        反推轨道，要判轨道读 `interrupt_probe_raw`。
+        interrupt_probe: 中断态的**唯一判据**（七态，见 `ZeroInterruptProbe`）。
+        interrupt_probe_raw: 对方 `interrupt_probe` 键的**原始令牌**，用于**归因**（不参与判定）：
+                        · ``None`` ⇒ 该键缺席 = **老部署**（走缺席推断的老轨），**或** 该键在
+                          但值非 ``str``（形状漂移，此时 `interrupt_probe` 恒为 ``UNRECOGNIZED``
+                          ⇒ 两者仍可分：`UNRECOGNIZED` + raw ``None`` = 形状坏，
+                          非 ``UNRECOGNIZED`` + raw ``None`` = 老部署）；
+                        · 非 ``None`` ⇒ **新部署**（≥ Zero `667e923`）显式说的那个词，原样保留
+                          **包括我方不认识的第五态**——日志要能把它打出来给人看，故不做归一化。
     """
 
     session_id: str
     resumed: bool | None = None
     interrupted_at: tuple[str, ...] | None = None
     interrupt_probe: ZeroInterruptProbe = ZeroInterruptProbe.ABSENT
+    interrupt_probe_raw: str | None = None
 
 
 # ── 内部辅助 ───────────────────────────────────────────────────────────────────
@@ -429,9 +542,15 @@ def _parse_open_session_resumed(data: dict[str, Any]) -> bool | None:
 def _parse_open_session_interrupted_at(
     data: dict[str, Any],
 ) -> tuple[ZeroInterruptProbe, tuple[str, ...] | None]:
-    """从 open_session 响应体取 ``interrupted_at``，判读成**四态 + 节点名**。
+    """**老轨**：从 open_session 响应体取 ``interrupted_at``，判读成**四态 + 节点名**。
 
-    🛑 **「键缺席」与「键在但为空」必须分开**（本轮修的信息损失）：前者是「对方没说」
+    ⚠ **调用者注意**：本函数只看 `interrupted_at` 这一个键，其「缺席 ⇒ ABSENT ⇒ 四义不可判」
+    的结论**只在没有 `interrupt_probe` 键时（老部署）才是判据**。新部署上判据是显式态，
+    本函数退化为**只负责取节点名载荷**（返回的态被 `_parse_open_session_interrupt_state`
+    丢弃，只留形状告警与「非空即正证据」这一位）。入口一律走
+    `_parse_open_session_interrupt_state`，不要直接调本函数做判定。
+
+    🛑 **「键缺席」与「键在但为空」必须分开**（2026-07-29 修的信息损失）：前者是「对方没说」
     （四义，见模块上方注释），后者是「对方明确说探测过且干净」——两者的证据强度不同，
     塌缩成同一个 ``None`` 会让消费点无法对前者施加额外保守处置。
     Zero 今天 `nxt or None` 理论上不发空表，但**我方不能靠对方的实现细节吃饭**：
@@ -457,6 +576,107 @@ def _parse_open_session_interrupted_at(
         value,
     )
     return ZeroInterruptProbe.MALFORMED, None
+
+
+def _parse_open_session_interrupt_state(
+    data: dict[str, Any],
+) -> tuple[ZeroInterruptProbe, tuple[str, ...] | None, str | None]:
+    """中断态判读的**唯一入口**：新部署读显式 `interrupt_probe`，老部署回落缺席推断。
+
+    返回 ``(态, 节点名载荷, 原始令牌)``；原始令牌只用于**归因日志**，不参与判定
+    （语义见 `ZeroOpenSessionInfo.interrupt_probe_raw`）。
+
+    ── 双轨分派 ──
+    · `interrupt_probe` **键缺席** ⇒ 老部署，整段回落到 `_parse_open_session_interrupted_at`
+      的四态推断，且 raw 回 ``None``。🛑 **零回归靠这条**：老部署的返回体里没有这个键，
+      本函数于是逐字等价于改动前的实现（连告警都不多一条）。
+    · 键在 ⇒ 新部署，**以它为判据**；`interrupted_at` 降级为「节点名载荷 + 一位正证据」。
+
+    ── 不认识的取值一律 `UNRECOGNIZED`，并按最坏情况处置（**不**当 CLEAN）──
+    对方的 bump 纪律明写「某键的**值域/取值集合**变化（如 interrupt_probe 加一个新态）」也要
+    bump ⇒ **第五态是被明确预告的事**。此时三条路里只能选一条：
+      ① 当 CLEAN（乐观）—— 直接违反本字段存在的理由：新态很可能正是又一种「不可判/出事了」，
+         乐观解释会让止血在最该生效时静默失效，与我方当初索要显式化的动机完全相反；
+      ② 抛异常 —— 让对方单边加一个态就能让我方**会话打不开**，跨仓单边升级零回归的红线不许；
+      ③ **按最坏情况 + 告警**（本实现）—— 行为等同 `PROBE_FAILED`（不可判 ⇒ 拒绝本帧，
+         见 `graceful_step`），代价上界是「在可降级路径上丢一帧并留一条响亮日志」，
+         而收益是「对方任何新态都不会被我方**静默**误读成安全」。
+    ⚠ 代价如实写：若对方新增的是一个**良性**态（如「本部署按配置关掉了探测」），本实现会在
+    该部署上让自愈路径每帧丢一帧 —— 这是**有意选的方向**（宁可吵不可静默），且有两道提前
+    预警把它挡在真部署之前：跨仓取值集合守卫（STRICT 判红）与 `describe_config_version`
+    bump 守卫。收到告警就该现场核一遍再把新令牌登记进 `_ZERO_PROBE_TOKEN_TO_STATE`。
+
+    ── 自洽性：**正证据优先**（两侧都发但互相矛盾时）──
+    对方今天的实现里 ``probe == "interrupted"`` 与 ``interrupted_at`` 非空是**等价**的
+    （`interrupted is not None` 是同一个条件的两处使用），故下面两格今天都不该出现；但那是
+    **对方的实现细节**，我方不靠它吃饭：
+      · 载荷是**well-shaped 非空** list[str] 而态不是 `INTERRUPTED` ⇒ **取 INTERRUPTED**。
+        理由：非空待执行节点名是半截态的**正证据**，而令牌只是一句声明；两者冲突时按证据
+        取保守方向（若反过来信令牌，"clean" + 一串待执行节点 = 我方明知有节点仍放行）。
+      · 态是 `INTERRUPTED` 而载荷缺席/为空/形状坏 ⇒ **仍取 INTERRUPTED**（令牌是判据，
+        载荷只是细节），节点名按空表报，日志里说明拿不到节点名。
+    两格都打 `LOG_MARKER_PROBE_STATE_MISMATCH`（WARNING）：它是跨仓契约漂移的直接证据，
+    但不改变「保守」这一方向，故不在解析层升到 ERROR（真拒绝时决策点会另出 ERROR）。
+    """
+    # 载荷先解析（形状告警照旧从这里出），新轨只用它的「非空正证据」这一位。
+    payload_probe, nodes = _parse_open_session_interrupted_at(data)
+    if _OPEN_SESSION_KEY_INTERRUPT_PROBE not in data:
+        # 老轨：逐字回落到改动前的判读（老部署零回归）。
+        return payload_probe, nodes, None
+
+    raw = data[_OPEN_SESSION_KEY_INTERRUPT_PROBE]
+    if not isinstance(raw, str):
+        logger.warning(
+            "%s zero.open_session 返回的 %r 形状非预期（期望 str，实得 %s=%r）——判为契约漂移，"
+            "按**最坏情况**处置（等同 probe_failed），**不**等同于「未中断」。",
+            LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+            _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+            type(raw).__name__,
+            raw,
+        )
+        return ZeroInterruptProbe.UNRECOGNIZED, nodes, None
+
+    state = _ZERO_PROBE_TOKEN_TO_STATE.get(raw)
+    if state is None:
+        logger.warning(
+            "%s zero.open_session 返回的 %r=%r 不在本仓认识的取值集合 %s 里——对方很可能按其 "
+            "bump 纪律②新增了一个态。按**最坏情况**处置（等同 probe_failed，不可判 ⇒ 拒绝本帧），"
+            "**绝不**当 clean；请现场核对方 open_session 的新态语义，确认后登记进 client 的 "
+            "_ZERO_PROBE_TOKEN_TO_STATE。",
+            LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+            _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+            raw,
+            sorted(KNOWN_ZERO_INTERRUPT_PROBE_VALUES),
+        )
+        return ZeroInterruptProbe.UNRECOGNIZED, nodes, raw
+
+    # ── 自洽性核对（正证据优先，见 docstring）──
+    if (
+        payload_probe is ZeroInterruptProbe.INTERRUPTED
+        and state is not ZeroInterruptProbe.INTERRUPTED
+    ):
+        logger.warning(
+            "%s zero.open_session 自相矛盾：%r=%r（非 interrupted）却带**非空** %r=%r。"
+            "按**正证据**取 INTERRUPTED——非空待执行节点名是半截态的直接证据，令牌只是声明；"
+            "请核对方两处是否已不同源。",
+            LOG_MARKER_PROBE_STATE_MISMATCH,
+            _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+            raw,
+            _OPEN_SESSION_KEY_INTERRUPTED_AT,
+            list(nodes or ()),
+        )
+        return ZeroInterruptProbe.INTERRUPTED, nodes, raw
+    if state is ZeroInterruptProbe.INTERRUPTED and not nodes:
+        logger.warning(
+            "%s zero.open_session 自相矛盾：%r=%r 但 %r 缺席/为空/形状坏 ——**仍按 INTERRUPTED "
+            "处置**（令牌是判据），只是本帧拿不到待执行节点名，诊断信息少一份。",
+            LOG_MARKER_PROBE_STATE_MISMATCH,
+            _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+            raw,
+            _OPEN_SESSION_KEY_INTERRUPTED_AT,
+        )
+        return ZeroInterruptProbe.INTERRUPTED, nodes, raw
+    return state, nodes, raw
 
 
 # ── zero.describe_config：**运行期**回读所连部署真正生效的门控（Zero main `75e8a36` 上线）──
@@ -502,13 +722,35 @@ DESCRIBE_CONFIG_EXPECTED_KEYS: frozenset[str] = frozenset(
         "weights_version",
     }
 )
-"""本仓**独立持有**的期望键集（21 键，现场核自 Zero `src/mcp_server/server.py::describe_config`）。
+"""本仓**独立持有**的**必需**键集（21 键，v1 起就有，现场核自 Zero
+`src/mcp_server/server.py::describe_config`）。缺任一 ⇒ 我方那一位读不到，判读静默降级。
 
 不是「对方回什么就认什么」：跨仓漂移由 `tests/mcp/test_zero_contract_crosscheck.py::
 TestDescribeConfigCrosscheck` 静态判红，运行期不符只降级+warn（见 `ZeroDeployConfig.describe`）。
+
+⚠ 与 `DESCRIBE_CONFIG_OPTIONAL_KEYS` 的分工见后者 docstring——**不要把新版本才有的键加到这里**，
+那会让我方对旧部署误报缺键。
 """
 
-KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2})
+DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset({"transport", "stateless_http"})
+"""**已登记但按版本可缺**的键：对方 v3 起新增，v1/v2 部署上不存在。
+
+为什么需要这一层（2026-07-30 实测踩到）：字段集守卫的判据是「我方期望集与对方返回体**逐键相等**」，
+`extra`（对方有、我方未登记）判红是**有意**的——它提醒「我方漏读了对方的新能力」。
+但若把这类新键直接并进 `DESCRIBE_CONFIG_EXPECTED_KEYS`，对**旧部署**（21 键）就会反过来报缺 2 键
+⇒ 把「对方版本旧」误报成「契约漂移」。两个方向都要不误报，就必须分层：
+**必需键缺 ⇒ 真问题；可选键缺 ⇒ 只说明对方版本旧。**
+
+⚠ 分层**不削弱守卫**：对方若再加第 24 个键，它仍落进 `extra` 并判红（判别力已实证）。
+分层只承认「我方已知道这两个键存在」，**不等于已消费**——见下面「尚未消费」。
+
+**尚未消费（下一轮待办，与 `interrupt_probe` 同型的「信息扔掉」风险）**：
+- `transport` = 对方**实际起的**传输（不是我方以为的那个）⇒ 可用于校验我方配置与对方实况一致；
+- `stateless_http` ⇒ 若对方是 stateless，**每次请求独立、session 语义完全不同**，
+  我方的 resume / session 管理前提可能整体不成立。这条影响面比 `transport` 大得多，须专门评估。
+"""
+
+KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3})
 """本仓**已逐键核验过**的 `describe_config_version`。不在此集合 ⇒ 只报告不强制（见下）。
 
 现场核验（2026-07-30，只读 D:\\Zero；两版逐键比对经 AST 取 `describe_config` 的 return 字面量）：
@@ -520,8 +762,19 @@ KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2})
   四态 `interrupt_probe`（not_probed / clean / interrupted / probe_failed），属新契约故 1→2；
   对方同时把该常量的措辞从「字段集版本」改成「**契约**版本」，并把 bump 纪律扩到
   ①增删键 ②某键值域变化 ③某键语义变化。⇒ v1/v2 对**我方读的这 21 键**等价，故同列为「认识」。
-  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v2），
-  不是 main（v1）。两版都得认，否则今天的 live 调用会全程降级。
+- **v3** = 对方**未提交工作树**（`DESCRIBE_CONFIG_VERSION = 3`；其 HEAD `e9dc79c` 上是 2、
+  `origin/main` 上仍是 1 —— **同一时刻三态并存**）：返回体从 21 键增到 **23 键**，
+  新增 `transport`（对方实际起的传输）与 `stateless_http`，动因是把 `__main__.main` 与
+  `describe_config` 的传输解析**收敛到同一符号**（对方注释：「describe_config 报传输的全部价值
+  就在于回的值与真正起传输的那段代码同源」）。属**增删键** ⇒ 按其纪律 ① 必须 bump。
+  ⇒ v3 与 v1/v2 **不是逐键相同**，故那两键登记进 `DESCRIBE_CONFIG_OPTIONAL_KEYS` 而非必需集。
+
+  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v3），
+  不是 main（v1）。三版都得认，否则今天的 live 调用会全程降级。
+  ⚠ **这是同一个坑的第二次**：v2 与 v3 都是从对方**未提交工作树**读到的。我方每次「跟随」
+  都在把守卫从「提醒」变成「追认」。缓解不是不跟随（不跟随则 live 全程降级），而是
+  **把三态差异显式记在这里**——将来看到我方认识 {1,2,3} 而对方 main 只有 1 时，
+  能立刻知道中间两版从未被对方主干固化过。
 
 🛑 **这条「认识」有保质期**（写明是为了将来能查出它何时失准）：v2 此刻只活在对方一条未合并
 分支上，其语义**尚未被 main 固化**。若对方在合入前**重写 v2 的内容**（同一个数字 2 换一套
@@ -600,13 +853,30 @@ class ZeroDeployConfig:
 
     @property
     def missing_keys(self) -> tuple[str, ...]:
-        """本仓期望有、对方没回的键（排序稳定，便于断言）。"""
+        """**必需**键里对方没回的（排序稳定，便于断言）。
+
+        只算 `DESCRIBE_CONFIG_EXPECTED_KEYS`：`DESCRIBE_CONFIG_OPTIONAL_KEYS`（对方 v3 起才有）
+        缺席**不算缺**——那只说明对方版本旧，把它算进来会让我方对旧部署误报契约漂移。
+        """
         return tuple(sorted(DESCRIBE_CONFIG_EXPECTED_KEYS - set(self.fields)))
 
     @property
+    def absent_optional_keys(self) -> tuple[str, ...]:
+        """已登记的**可选**键里对方没回的 —— 只表示「对方版本旧」，**不是**问题。
+
+        与 `missing_keys` 刻意分开：混在一起就无法区分「契约漂移」与「对方还没升到那一版」。
+        """
+        return tuple(sorted(DESCRIBE_CONFIG_OPTIONAL_KEYS - set(self.fields)))
+
+    @property
     def unexpected_keys(self) -> tuple[str, ...]:
-        """对方回了、本仓期望里没有的键 —— 通常是**正常演进**（新增能力），不是错误。"""
-        return tuple(sorted(set(self.fields) - DESCRIBE_CONFIG_EXPECTED_KEYS))
+        """对方回了、本仓**两个集合都没登记**的键 —— 通常是**正常演进**（新增能力），不是错误。
+
+        ⚠ 已登记的可选键**不算** unexpected：否则连了 v3 部署就会每次都报「多了两键」。
+        真正落进这里的是我方**尚不知道**的键 ⇒ 提示我方漏读了对方的新能力。
+        """
+        known = DESCRIBE_CONFIG_EXPECTED_KEYS | DESCRIBE_CONFIG_OPTIONAL_KEYS
+        return tuple(sorted(set(self.fields) - known))
 
     def describe(self) -> str:
         """一行人读判读串（供日志与测试断言；**不要**用它做程序判定，判定读属性）。"""
@@ -1328,14 +1598,16 @@ class ZeroLinkClient:
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ZeroLinkCallError("zero.open_session", f"响应格式非预期：{exc}") from exc
 
-        # 🛑 新键解析在 session_id 之后、且**只用 .get/in**：缺键 → 两者皆 None，行为逐字回落
-        # 到换代前（现网老 Zero 零回归）。形状异常只 warning 不抛（见两个 _parse_* 的 docstring）。
-        probe, nodes = _parse_open_session_interrupted_at(data)
+        # 🛑 新键解析在 session_id 之后、且**只用 .get/in**：缺键 → 一律回落，行为逐字等于
+        # 换代前（现网老 Zero 零回归）。形状异常只 warning 不抛（见各 _parse_* 的 docstring）。
+        # 中断态走**双轨唯一入口**：新部署读显式 `interrupt_probe`，老部署回落缺席推断。
+        probe, nodes, probe_raw = _parse_open_session_interrupt_state(data)
         info = ZeroOpenSessionInfo(
             session_id=returned_id,
             resumed=_parse_open_session_resumed(data),
             interrupted_at=nodes,
             interrupt_probe=probe,
+            interrupt_probe_raw=probe_raw,
         )
         self.last_open_session = info
         # 🛑 回读面缓存失效点之一：开/resume 都会让 Zero **重建**该会话的 config。
@@ -1350,32 +1622,63 @@ class ZeroLinkClient:
                 returned_id,
                 info.resumed,
             )
-        if info.interrupted_at:
-            # WARNING 而非 INFO：非空 interrupted_at ⇒ 该会话运行态**停在 super-step 边界**
+        # ⚠ 尾句**按调用方分支出**：`downstream_guard=False`（公开 `open_session()`，
+        # 即常规 resume 路径）之后确无守卫——step 照常发、bundle 照常回、连一条 ERROR 都不会有，
+        # 缺口由 `test_normal_resume_path_has_no_interrupt_guard` 特征化钉住；
+        # `downstream_guard=True`（`graceful_step` 自愈分支）之后紧跟拒绝续跑的 ERROR、
+        # 可能还有 purge，此时**不得**再说「无守卫」「须自行决定调 purge_session」
+        # ——那会劝调用方去做刚刚已经做完的事（2026-07-29 终审判为 blocking 的原话）。
+        # 🛑 本层**只报告、不处置**（处置权在调用方，见 `graceful_step` docstring 的论证）：
+        # 三条 WARNING 各自锚一个 `*_ON_OPEN` marker，与决策层的 `*_REFUSED` **刻意不同名**
+        # ——两层日志落在同一个 caplog 里，同名会让「决策层真拒绝了」的断言被本层喂成恒真。
+        tail = (
+            "后续由调用方拦截（紧随其后的 ERROR 给出处置）。"
+            if downstream_guard
+            else (
+                "⚠ 常规 resume 路径**无守卫**：除本条外不会再有任何日志或拦截，"
+                "调用方须自行决定轮换 session_id 或调 purge_session。"
+            )
+        )
+        if info.interrupt_probe is ZeroInterruptProbe.INTERRUPTED:
+            # WARNING 而非 INFO：确定半截 ⇒ 该会话运行态**停在 super-step 边界**
             # （上一轮被中途取消，已跑完节点的写入已落盘且 sqlite 后端跨重启保留）。
             # 续跑会从待执行节点继续、而非重跑整轮 —— 这是「拿到的下一帧不可全信」的信号。
-            #
-            # ⚠ 尾句**按调用方分支出**：`downstream_guard=False`（公开 `open_session()`，
-            # 即常规 resume 路径）之后确无守卫——step 照常发、bundle 照常回、连一条 ERROR 都不会有
-            # （Zero 的 `zero.step` 亦不做任何中断检查，daecce1 核验），缺口由
-            # `test_normal_resume_path_has_no_interrupt_guard` 特征化钉住；
-            # `downstream_guard=True`（`graceful_step` 自愈分支）之后紧跟拒绝续跑的 ERROR、
-            # 可能还有 purge，此时**不得**再说「无守卫」「须自行决定调 purge_session」
-            # ——那会劝调用方去做刚刚已经做完的事（2026-07-29 终审判为 blocking 的原话）。
-            tail = (
-                "后续由调用方拦截（紧随其后的 ERROR 给出处置）。"
-                if downstream_guard
-                else (
-                    "⚠ 常规 resume 路径**无守卫**：除本条外不会再有任何日志或拦截，"
-                    "调用方须自行决定轮换 session_id 或调 purge_session。"
-                )
-            )
+            # ⚠ 判据从「`interrupted_at` 非空」换成「态是 INTERRUPTED」（2026-07-30 双轨化）：
+            # 新轨下令牌是判据、节点名只是载荷，可能出现「令牌说 interrupted 但载荷缺席」
+            # （自洽性告警已在解析层发过）——那一格也必须落这条日志，否则最该响的时候没声。
             logger.warning(
                 "%s zero.open_session: session=%s 上一轮被中途取消，运行态停在 super-step 边界，"
                 "待执行节点=%s；在其上续跑 = 新刺激叠加到半截运行态。%s",
                 LOG_MARKER_INTERRUPTED_ON_OPEN,
                 returned_id,
-                list(info.interrupted_at),
+                list(info.interrupted_at or ()),
+                tail,
+            )
+        elif info.interrupt_probe is ZeroInterruptProbe.PROBE_FAILED:
+            # 🛑 对方**显式**说它自己的探测抛了（Zero `667e923` 起才有这一位）。
+            # 这一格与半截态**故障相关**：探测读的正是那份可能半写的 checkpoint。
+            # 归因写清「是对方探测失败」，而不是「我方读不到」——后者是老部署的样子，
+            # 两者行为可能相同（都不可判）但归因完全不同，日志必须能分开。
+            logger.warning(
+                "%s zero.open_session: session=%s 对方回 %r=%r：**它自己的中断探测抛了**，"
+                "本次**无法判定**上一轮是否被中途取消。⚠ 探测读的正是那份可能半写的 "
+                "checkpoint ⇒ 该格与半截态故障相关，**不得视同干净**。%s",
+                LOG_MARKER_PROBE_FAILED_ON_OPEN,
+                returned_id,
+                _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+                info.interrupt_probe_raw,
+                tail,
+            )
+        elif info.interrupt_probe is ZeroInterruptProbe.UNRECOGNIZED:
+            # 第五态 / 值形状坏：解析层已发过一条带原始取值的告警（含已知集合），此处只补
+            # 「这一帧后续怎么处置」的上下文，不重复取值细节。
+            logger.warning(
+                "%s zero.open_session: session=%s 对方的 %r 取值我方**不认识**（raw=%r），"
+                "按最坏情况处置、不当干净。%s",
+                LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+                returned_id,
+                _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+                info.interrupt_probe_raw,
                 tail,
             )
         return info
@@ -1882,20 +2185,36 @@ class ZeroLinkClient:
         错误同样上抛**）。⚠ SessionConfig 不进 checkpoint，未供 `resume_config` 则 resume 会话走
         Zero env 默认门控（非原会话 config）；须续原门控时调用方应传原 config。
 
-        🛑 **半截运行态本帧不续跑**（2026-07-29）：若重开的返回体带非空 `interrupted_at`
+        🛑 **半截运行态本帧不续跑**（2026-07-29）：若重开的返回体判出 `INTERRUPTED`
         （上一轮被中途取消，运行态停在 super-step 边界），**不重试 step**，而是 **ERROR 级日志
         （带待执行节点名）+ 降级 None**。
+
+        🛑 **不可判且与故障相关的两格同样拒绝**（2026-07-30，接对方显式 `interrupt_probe`）：
+        `PROBE_FAILED`（对方自述「我的探测抛了」）与 `UNRECOGNIZED`（对方回了我方不认识的第五态
+        或该键形状坏）**一律按最坏情况拒绝本帧 + ERROR，但不 purge**。
+        为什么这与下面「不可判就照常续跑」的老口径不矛盾：老口径的成本论证建立在「探测干净与
+        探测失败在返回体上同形」之上，拒绝其一等于拒绝**全部**健康 resume；新部署把两者拆开后
+        该前提消失 —— 健康 resume 回 `clean` 走续跑，拒绝只落在对方真出事的那几帧。
+        不 purge 的理由见分支注释（判据是「不可判」而非「确定半截」，不可逆动作不赌未知状态）。
 
         ⚠ **本机制的真实收益，如实表述**（上一版在此处过度宣称，2026-07-29 跨仓复核订正）：
         它买到的是「把一次**静默**续跑换成一条**响亮的 ERROR** + 本帧拒绝」，**不是**「避免污染」。
         污染并未被避免，只被推迟一帧 —— 因果链（Zero `daecce1` 现场核验）：
-          · 止血判定只能在**重开之后**做（`interrupted_at` 来自 `open_session` 返回体），
+          · 止血判定只能在**重开之后**做（中断态来自 `open_session` 返回体），
             而重开这一步已经让该会话在 Zero registry 里**变活跃**；
           · 下一帧 `graceful_step` 因此不再报 unknown-session ⇒ 走正常 `step` 路径，
-            而 Zero 的 `zero.step` **完全不做中断检查** ⇒ 照样在带 pending `next` 的线程上续跑；
+            照样在带 pending `next` 的线程上续跑；
           · 且 Zero 的 `interrupted_at()` 只在「resume 且**不活跃**」时探测（活跃分支提前
-            return），⇒ 这条 ERROR 对同一 session **一生只出现一次**，此后污染不可观测。
+            return），⇒ **我方**能看到的这条 ERROR 对同一 session **一生只出现一次**。
         ⇒ 「有界一次性 vs 无界累积不可逆」的旧论证在实际控制流下**不成立**，已撤回。
+        ✅ **2026-07-30 事实订正（上一版把「不可观测」写过头了）**：旧措辞说「Zero 的 `zero.step`
+        **完全不做**中断检查 ⇒ 此后污染不可观测」——前半句在 `daecce1` 那代为真，但对方已在
+        `667e923` 给 `zero.step` 加了**每轮事后检查**（跑完看一眼 `next`，非空即一条 WARNING；
+        只记日志、**不改返回体、不拒绝本帧**，探测失败只吞进 debug）。⇒ 准确表述是：
+        污染在**新部署的 Zero 侧每帧可观测**（其日志），在**我方侧仍不可观测**（返回体没这一位，
+        client 拿不到）。差别不只是措辞：跨仓排障时该去对方日志按 sid 对齐，而非断定「没人看得见」。
+        ⇒ 若将来要让我方也每帧可见，正确做法是向对方索要「把这一位放进 step 返回体」，
+        不是我方在 client 侧记账（那条的取舍见下）。
         本帧拒绝要真正变成止血，须调用方**拿这条 ERROR 去做事**（轮换 session_id，或开
         `purge_on_interrupted`）；否则它只是一条更早、更响的告警。特征化守卫见
         `tests/mcp/test_zero_client.py::test_next_frame_after_interrupted_refusal_runs_normal_step`。
@@ -1909,11 +2228,21 @@ class ZeroLinkClient:
         只能靠 purge 成功反推，而 purge 是破坏性动作、默认关。⇒ 不是无解，是**权衡后不做**；
         真要做时上述特征化用例会变红，那是预期的。
 
-        缺 `interrupted_at` 键（老部署）→ 行为与本次改动前逐字一致（零回归）。
-        新 Zero 上「`resumed` 为真但 `interrupted_at` 缺席」这一格我方**不可判**（缺席四义：
-        未探测·新建 / 未探测·活跃幂等重开 / 探测失败 / 探测成功且干净；其中第一义与
-        `resumed=True` 互斥，故本格实际面对后三义）——处置是**照常续跑 + 一条可区分的
-        WARNING**，理由见分支内注释（保守拒绝会误伤 100% 的健康 resume，等于废掉整个自愈能力）。
+        **老部署零回归 + 双轨归因**（2026-07-30 订正，此前这段写成了无条件成立的推断链）：
+        · 连**老部署**（返回体无 `interrupt_probe` 键，≤ Zero main `75e8a36`）时，判读整段回落
+          到「`interrupted_at` 缺席推断」老轨，行为与接显式态之前**逐字一致**（零回归）；
+          其中「`resumed` 为真但 `interrupted_at` 缺席」这一格我方**不可判**（缺席四义：
+          未探测·新建 / 未探测·活跃幂等重开 / 探测失败 / 探测成功且干净；第一义与 `resumed=True`
+          互斥，故实际面对后三义）——处置是**照常续跑 + 一条可区分的 WARNING**，理由见分支内
+          注释（在那一代上保守拒绝会误伤 100% 的健康 resume，等于废掉整个自愈能力）。
+        · 连**新部署**（≥ Zero `667e923`）时判据是对方的显式令牌，上述四义**逐义**落到
+          `NOT_PROBED`(①②) / `PROBE_FAILED`(③) / `CLEAN`(④)，不再靠缺席反推。
+          ⇒ 剩下的不可判只有两格：`NOT_PROBED`+`resumed=True`（②活跃幂等重开，对方明确没看，
+          **续跑**+告警，因为它不是故障相关的）与 `PROBE_FAILED`（③，故障相关，**拒绝**）。
+        · **两者行为可能相同但归因必须分得开**：老部署不可判 → `LOG_MARKER_PROBE_UNDECIDABLE`；
+          新部署对方探测失败 → `LOG_MARKER_PROBE_FAILED_{ON_OPEN,REFUSED}`。
+          代际判别位是「有没有 `interrupt_probe` 键」（`ZeroOpenSessionInfo.interrupt_probe_raw`
+          与「态是否为老轨专属的 ABSENT/MALFORMED」两处都能读出来），**不是** `resumed`。
 
         🕳 **常规 resume 路径无守卫**（2026-07-29 复审揭出，如实披露）：上面这一整套探测/
         拒绝/purge **只挂在 unknown-session 自愈分支上**。调用方若自己 `open_session(
@@ -1957,7 +2286,13 @@ class ZeroLinkClient:
             priors:        可选多模态先验列表。
             resume_config: unknown-session resume 重开时**再供的会话 config**（应与原 open_session
                            一致）；None → resume 会话走 Zero env 默认门控。
-            purge_on_interrupted: 检出半截运行态时，是否额外调 `zero.purge_session` 清掉它。
+            purge_on_interrupted: 检出**确定**半截运行态（`INTERRUPTED`）时，是否额外调
+                           `zero.purge_session` 清掉它。
+                           🛑 **只覆盖 `INTERRUPTED` 这一格**（2026-07-30 明确）：`PROBE_FAILED`
+                           / `UNRECOGNIZED` 那两格即便本参数为 True 也**不 purge** —— 参数名
+                           承诺的是「检出半截就清」，而那两格是「读不出来」；把它悄悄扩张成
+                           「不可判也清」，等于让调用方在不知情的情况下对一个可能完全健康的
+                           会话执行不可逆删除。要那种语义须另开一个显式参数。
                            **默认 False**，理由（这是破坏性动作，默认值须论证）：
                            ① 不可逆且**过度杀伤** —— Zero 的 purge 删该 thread 的全部
                               checkpoint 历史（含干净祖先），而真正需要的是「回滚一格」，
@@ -2006,34 +2341,52 @@ class ZeroLinkClient:
                     config=resume_config,
                     downstream_guard=True,
                 )
-                # ── `interrupted_at` 四态决策表（每一格的处置都单独论证）──────────────
-                # INTERRUPTED  确定半截    → 本帧拒绝 + ERROR（+ 可选 purge）
-                # MALFORMED    契约漂移    → 照常续跑 + ERROR（不可判，但必须有人看见）
-                # ABSENT       四义不可判  → 照常续跑；resumed 为真时补一条可区分 WARNING
-                # CLEAN        明确干净    → 照常续跑，不打日志
+                # ── 中断态决策表（**双轨七态**，每一格的处置都单独论证）─────────────
+                # 判据一律是 `info.interrupt_probe`（新部署=对方显式态，老部署=缺席推断）：
+                #   INTERRUPTED   确定半截      → 本帧拒绝 + ERROR（+ 可选 purge）
+                #   PROBE_FAILED  对方探测抛了  → 本帧拒绝 + ERROR，**不** purge   〔新轨〕
+                #   UNRECOGNIZED  第五态/值坏   → 本帧拒绝 + ERROR，**不** purge   〔新轨〕
+                #   MALFORMED     载荷形状坏    → 照常续跑 + ERROR（不可判，但必须有人看见）
+                #   NOT_PROBED    对方没探测    → 照常续跑；resumed 为真时补 WARNING 〔新轨〕
+                #   ABSENT        缺席四义      → 照常续跑；resumed 为真时补 WARNING 〔老轨〕
+                #   CLEAN         明确干净      → 照常续跑，不打日志
+                #
+                # 🛑 **「拒绝」这一档为何现在敢用在不可判的格上**（本轮的核心判断）：
+                # 上一版对不可判一律选「续跑 + 告警」，理由是「保守拒绝会误伤 100% 的健康
+                # resume」——那条论证**只在老轨上成立**：老部署里「探测干净」与「探测失败」
+                # 在返回体上同形，拒绝其中一个就等于拒绝全部健康 resume。
+                # 新轨把这两者拆开了（clean vs probe_failed）⇒ 拒绝 `probe_failed` **不再
+                # 误伤任何健康 resume**（健康的那条回 clean，走续跑）。代价换算彻底反转：
+                # 收益（对方唯一一次「我探测不了」的自述被当真）不变，成本从 100% 误伤降到
+                # 「只在对方真出事那几帧丢一帧」。⇒ 这正是我方当初索要显式四态的目的，
+                # 拿到了就必须用上；继续按老口径「不可判 ⇒ 续跑」等于把要来的信息扔掉。
                 if info.interrupt_probe is ZeroInterruptProbe.INTERRUPTED:
-                    # 🛑 重开的返回体带非空 interrupted_at ⇒ 上一轮被中途取消、运行态停在
-                    # super-step 边界（已跑完节点的写入已落盘，sqlite 后端跨重启保留）。
+                    # 🛑 判出确定半截 ⇒ 上一轮被中途取消、运行态停在 super-step 边界
+                    # （已跑完节点的写入已落盘，sqlite 后端跨重启保留）。
                     #
                     # ⚠ **本帧拒绝买到的是什么，如实写**（2026-07-29 跨仓复核撤回上一版论证）：
                     # 买到的是「一次**静默**续跑 → 一条**响亮的 ERROR** + 本帧拒绝」。
                     # **没有**买到「避免污染」——污染只被推迟一帧：
                     #   (a) 止血判定只能在**重开之后**做，而重开已让该会话在 Zero registry
                     #       变活跃 ⇒ 下一帧不再报 unknown-session ⇒ 走正常 step 路径，
-                    #       而 Zero 的 `zero.step` **不做任何中断检查**（现场核验 daecce1）
-                    #       ⇒ 照样在带 pending `next` 的线程上续跑；
+                    #       照样在带 pending `next` 的线程上续跑；
                     #   (b) Zero 的 `interrupted_at()` 只在「resume 且不活跃」时探测
-                    #       （活跃分支提前 return）⇒ 这条 ERROR 对同一 session 一生只出现
-                    #       一次，之后污染彻底不可观测。
+                    #       （活跃分支提前 return）⇒ **我方**能看到的这条 ERROR 对同一 session
+                    #       一生只出现一次。
                     # ⇒ 旧注释里「有界一次性 vs 无界累积不可逆」的对称性论证**不成立**，已删。
+                    # ✅ 2026-07-30 订正：旧注释在 (a) 里断言「Zero 的 `zero.step` 不做任何中断
+                    # 检查（daecce1）」并据此说「之后污染彻底不可观测」——对方已在 `667e923` 给
+                    # `zero.step` 加了每轮事后检查（非空 `next` → 一条 WARNING，不改返回体、
+                    # 不拒帧）⇒ 新部署上污染在**对方日志里每帧可见**，只是**我方**读不到
+                    # （那一位没进 step 返回体）。「不可观测」须限定为「我方侧」，排障要去对方日志。
                     # 残留缺口有特征化守卫钉住：
                     # `test_next_frame_after_interrupted_refusal_runs_normal_step`。
                     #
                     # 那为什么仍然不重试？两条**站得住**的理由：
                     #   ① 本帧重试必然产出一个混合值并当作正常返回值交出去（Zero 自己的契约：
                     #      「续跑会从此处继续而非重跑整轮」）；拒绝则至少这一帧不发错值。
-                    #   ② 这条 ERROR 是该污染**唯一一次**可观测的机会，它必须存在且醒目 ——
-                    #      而只要还重试，日志就会被一个「成功返回」的表象冲淡。
+                    #   ② 这条 ERROR 是该污染在**我方侧**唯一一次可观测的机会，必须存在且醒目
+                    #      —— 而只要还重试，日志就会被一个「成功返回」的表象冲淡。
                     # 真正的止血只有两条，都在调用方手里：轮换 session_id，或开
                     # `purge_on_interrupted`（破坏性，默认关，理由见本方法 docstring）。
                     #
@@ -2074,10 +2427,65 @@ class ZeroLinkClient:
                             nodes,
                         )
                     return None
+                if info.interrupt_probe is ZeroInterruptProbe.PROBE_FAILED:
+                    # 🛑 **本任务的核心格**：对方显式说「我的探测抛了」（Zero `667e923` 起）。
+                    # 处置 = **按最坏情况**：本帧拒绝 + ERROR，**绝不当 clean**。
+                    #
+                    # 为什么必须最坏而不是「续跑 + 告警」：这一格与要防的半截态是**故障相关**
+                    # 的 —— 探测读的正是那份可能半写的 checkpoint ⇒ 越是真出事的时候越可能
+                    # 落到这里。把它当干净 = 止血在最该生效的那一帧静默失效，且此前正因为
+                    # 它与 clean 同形而**完全不可见**，这才是我方向对方索要显式化的那一格。
+                    #
+                    # 🛑 **拒绝但不 purge**（与 INTERRUPTED 的关键差别，`purge_on_interrupted`
+                    # 开着也不 purge）：purge 删该 thread **全部** checkpoint 历史、不可逆，
+                    # 而这里的判据是「**不可判**」，不是「确定半截」。一次探测抛异常完全可能
+                    # 出在一个运行态干净的会话上（如后端瞬时报错），据此删掉它的全部历史
+                    # 是拿不可逆动作赌一个我方明知读不出来的状态。调用方 opt-in 的语义是
+                    # 「检出半截就清」（参数名即 `purge_on_interrupted`），把它悄悄扩张成
+                    # 「读不出来也清」是偷改语义 ⇒ 本分支永不 purge，且日志明说这一点。
+                    logger.error(
+                        "%s graceful_step: session=%s resume 重开后对方回 %r=%r"
+                        "——**它自己的中断探测抛了**，我方无法判定上一轮是否被中途取消。"
+                        "按最坏情况本帧拒绝续跑并降级 None（**不**当干净）。"
+                        "⚠ 未执行 purge：判据是「不可判」而非「确定半截」，据此删该会话全部"
+                        "运行态历史是不可逆的过度杀伤；purge_on_interrupted 只管确定半截那一格。"
+                        "⚠ 与 INTERRUPTED 同理，这**不是**避免了污染：会话已被重开，"
+                        "**下一帧**将走正常 step 路径。要真正止血请轮换 session_id，"
+                        "或在 Zero 侧同时刻的「中断探测失败」日志上定位根因。",
+                        LOG_MARKER_PROBE_FAILED_REFUSED,
+                        session_id,
+                        _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+                        info.interrupt_probe_raw,
+                    )
+                    return None
+                if info.interrupt_probe is ZeroInterruptProbe.UNRECOGNIZED:
+                    # 未知第五态（或该键的值非 str）：对方的 bump 纪律②明说取值集合会变。
+                    # 处置同 `PROBE_FAILED`——**最坏情况 + 拒绝 + 不 purge**，理由见
+                    # `_parse_open_session_interrupt_state` docstring 的三选一论证：
+                    # 乐观当 clean 违反本字段存在的理由，抛异常违反跨仓单边升级零回归，
+                    # 故取「宁可吵不可静默」。marker 与 PROBE_FAILED 分开：两者都拒绝本帧，
+                    # 但归因不同（「对方探测失败」vs「对方说了我方读不懂」），运维要分得开。
+                    logger.error(
+                        "%s graceful_step: session=%s resume 重开后对方回 %r=%r，"
+                        "**不在**本仓认识的取值集合 %s 里——本帧按最坏情况拒绝续跑并降级 None"
+                        "（**不**当干净），未执行 purge（判据是不可判）。"
+                        "请现场核对方 open_session 新态的语义并登记进 client 的"
+                        " _ZERO_PROBE_TOKEN_TO_STATE；跨仓取值集合守卫（STRICT 判红）本应"
+                        "在部署前就提醒到这一步。",
+                        LOG_MARKER_PROBE_UNRECOGNIZED_REFUSED,
+                        session_id,
+                        _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+                        info.interrupt_probe_raw,
+                        sorted(KNOWN_ZERO_INTERRUPT_PROBE_VALUES),
+                    )
+                    return None
                 if info.interrupt_probe is ZeroInterruptProbe.MALFORMED:
-                    # 契约漂移：对方发了这个键但形状不对。**不可判**，故不拒绝（拒绝会因对方
-                    # 一个类型笔误就永久废掉自愈通路）；但必须 ERROR ——它是跨语言契约破裂的
-                    # 直接证据，比任何一帧的数据都重要。
+                    # **老轨专属**：没有 `interrupt_probe` 可依，而 `interrupted_at` 形状不对。
+                    # **不可判**，故不拒绝（拒绝会因对方一个类型笔误就永久废掉自愈通路）；
+                    # 但必须 ERROR ——它是跨语言契约破裂的直接证据，比任何一帧的数据都重要。
+                    # ⚠ 与上面两格的差别：那两格里对方**说了**「我不可判 / 我有新态」，是可
+                    # 采信的自述；这里对方什么都没自述，只是一个我方读不懂的载荷，且新轨一旦
+                    # 上线该格就不再出现（有令牌兜着）⇒ 维持既有的「续跑 + ERROR」不变，零回归。
                     logger.error(
                         "%s graceful_step: session=%s resume 重开的返回体里 %r 形状非法"
                         "（跨仓契约漂移）——本帧**无法判定**是否半截，按续跑处置；"
@@ -2086,8 +2494,41 @@ class ZeroLinkClient:
                         session_id,
                         _OPEN_SESSION_KEY_INTERRUPTED_AT,
                     )
+                elif info.interrupt_probe is ZeroInterruptProbe.NOT_PROBED and info.resumed is True:
+                    # 〔新轨〕对方**明确**说「压根没探测」，且 `resumed=True`
+                    # ⇒ 落到的是缺席四义里的**第②义：活跃幂等重开**（Zero 的
+                    # `registry.get(sid) is not None` 分支提前 return，走不到探测）。
+                    #
+                    # 🛑 这一格**仍然不可判**，但不可判的**原因变了**：不再是「四义同形分不清」，
+                    # 而是「已确知对方没看」。⇒ 归因从「三义之一」收窄成**唯一一义**，这是本轮
+                    # 拿到的判别力增益：日志可以直接说「它没探测，因为会话还活跃」。
+                    # ⚠ 为什么活跃重开也不安全：会话仍在 registry 里**不等于**运行态干净——
+                    # 上一轮的 step 若被取消，session 对象仍留在 registry、pending `next` 也
+                    # 仍在，只是这条路径压根不去看。故不能当 clean。
+                    #
+                    # 处置 = **照常续跑 + 一条可区分 WARNING**，**不**拒绝。与 `PROBE_FAILED`
+                    # 的取舍差别（同为不可判、处置不同，必须论证）：
+                    #   · 本格**不是**故障相关的：它是「对方按设计跳过探测」，触发条件是并发/
+                    #     幂等重开这类正常控制流，与 checkpoint 是否半写**无关**；
+                    #     `probe_failed` 则是探测**读那份 checkpoint 时炸了**，与半截态同因。
+                    #   · 本格在自愈路径上还意味着一件事：我方刚收到 unknown-session、重开却
+                    #     发现它活跃 ⇒ 另有一方正在用同一个 session_id。此时拒绝本帧既拦不住
+                    #     那一方，又把并发场景下的正常业务打成丢帧。
+                    # ⇒ 保守只用在故障相关的格上，正常控制流的不可判仍走「续跑 + 可区分告警」。
+                    logger.warning(
+                        "%s graceful_step: session=%s resume 重开后对方回 %r=%r 且 resumed=True"
+                        "——**活跃幂等重开**（会话仍在对方 registry 里、提前 return，压根没探测），"
+                        "故仍**无法判定**上一轮是否被中途取消，本帧按续跑处置。"
+                        "⚠ 会话活跃≠运行态干净：上一轮 step 若被取消，pending 节点仍在，"
+                        "只是这条路径不去看它。另有一方正在用同一 session_id 的可能请一并排查。",
+                        LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE,
+                        session_id,
+                        _OPEN_SESSION_KEY_INTERRUPT_PROBE,
+                        info.interrupt_probe_raw,
+                    )
                 elif info.interrupt_probe is ZeroInterruptProbe.ABSENT and info.resumed is True:
-                    # 🛑 「resumed 为真但 interrupted_at 缺席」——**我方不可判**的一格。
+                    # 🛑 **老轨专属**（新部署恒发 `interrupt_probe` ⇒ 不会落到 ABSENT）：
+                    # 「resumed 为真但 interrupted_at 缺席」——**我方不可判**的一格。
                     # 缺席四义（Zero daecce1 现场核验，见模块头注释）：①未探测·新建会话
                     # （`resuming` 假）②未探测·活跃幂等重开（`registry.get(sid)` 非空 → 提前
                     # return）③探测抛异常被宽 except 吞掉 ④探测成功且干净。
@@ -2105,7 +2546,12 @@ class ZeroLinkClient:
                     #     "误放行" 与已知残留缺口同源，没有引入新的失败模式。
                     #   · WARNING 必须**可区分**（自己的文案 + resumed=True 标记），使运维能与
                     #     Zero 侧的 `zero.open_session 中断探测失败` ERROR 做跨仓时间对齐 ——
-                    #     今天这是区分 ② 与 ③ 的**唯一**手段。
+                    #     在**老部署上**这是区分 ② 与 ③ 的**唯一**手段。
+                    # ✅ 2026-07-30 事实更新：上面这套论证的前提（②③④ 在返回体上同形）**只在
+                    # 老部署成立**。新部署（Zero `667e923`+）把三者拆成了显式令牌 ⇒ ③ 走
+                    # `PROBE_FAILED`（已改为**拒绝**，因为拆开后拒绝不再误伤健康 resume）、
+                    # ② 走 `NOT_PROBED`+resumed、④ 走 `CLEAN`。本分支因此**只服务老部署**，
+                    # 内容保留不动（老部署仍在跑，它对那一代仍然逐字正确）。
                     # 零回归：本分支挂在 `resumed is True` 上。`resumed` 是新老部署的判别位
                     # （新 Zero 无条件回，老部署根本不发）⇒ 老部署走 `resumed is None`，
                     # 不进本分支、不打这条 WARNING，行为与换代前逐字一致。
@@ -2115,14 +2561,18 @@ class ZeroLinkClient:
                     # 该排除、在每次健康新建会话上误发本 WARNING。论证见本方法 docstring。
                     logger.warning(
                         "%s graceful_step: session=%s resume 重开回了 resumed=True 但**未带** %r"
-                        "——该键缺席有四义（未探测·新建 / 未探测·活跃幂等重开 / 探测失败 / "
+                        "，也没有 %r（**老部署**：该代 Zero 不发显式中断态）"
+                        "——此时该键缺席有四义（未探测·新建 / 未探测·活跃幂等重开 / 探测失败 / "
                         "探测干净），其中首义与 resumed=True 互斥、余下三者在返回体上同形，"
                         "我方无法判定"
                         "上一轮是否被中途取消，本帧按续跑处置。若 Zero 侧同时刻有"
-                        "「中断探测失败」记录，则本帧很可能续跑在半截运行态上。",
+                        "「中断探测失败」记录，则本帧很可能续跑在半截运行态上。"
+                        "⚠ 归因提示：这条是**老部署不可判**，与新部署的 probe_failed"
+                        "（对方自述探测失败 → 本帧会被拒绝）是不同的事，勿混读。",
                         LOG_MARKER_PROBE_UNDECIDABLE,
                         session_id,
                         _OPEN_SESSION_KEY_INTERRUPTED_AT,
+                        _OPEN_SESSION_KEY_INTERRUPT_PROBE,
                     )
                 return await self.step(session_id, stimulus, priors)
             except ZeroLinkNonDegradableError:

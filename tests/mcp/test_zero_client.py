@@ -39,8 +39,14 @@ from src.mcp.zero.client import (
     LOG_MARKER_INTERRUPTED_ON_OPEN,
     LOG_MARKER_INTERRUPTED_REFUSED,
     LOG_MARKER_INTERRUPTED_REFUSED_PURGING,
+    LOG_MARKER_PROBE_FAILED_ON_OPEN,
+    LOG_MARKER_PROBE_FAILED_REFUSED,
     LOG_MARKER_PROBE_MALFORMED,
+    LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE,
+    LOG_MARKER_PROBE_STATE_MISMATCH,
     LOG_MARKER_PROBE_UNDECIDABLE,
+    LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+    LOG_MARKER_PROBE_UNRECOGNIZED_REFUSED,
     ZERO_ERROR_CODE_CONFIG_INVALID,
     ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
     ZERO_ERROR_CODE_PAYLOAD_INVALID,
@@ -1584,8 +1590,11 @@ async def test_next_frame_after_interrupted_refusal_runs_normal_step(
 
     钉住的跨仓事实（Zero `daecce1` 现场核验，2026-07-29）：
       (a) 止血判定只能在**重开之后**做，而重开已让该会话在 Zero registry 变活跃
-          ⇒ 下一帧不再报 unknown-session ⇒ 走正常 `zero.step` 路径，
-          而 Zero 的 `step` **完全不做中断检查**；
+          ⇒ 下一帧不再报 unknown-session ⇒ 走正常 `zero.step` 路径。
+          ⚠ 口径订正（Zero `667e923`）：其 `step` 现有**每轮事后中断检查**，但**只记 WARNING、
+          不改返回体、不拒帧** ⇒ 对**我方侧**仍不可观测（返回值与健康帧逐位同形），
+          本用例记录的现象不变；排障时可按 sid 去对方日志对齐。
+          旧表述「Zero 的 step 完全不做中断检查」已被该提交推翻，勿再引用；
       (b) Zero 的 `interrupted_at()` 只在「resume 且**不活跃**」时探测（活跃分支提前 return）
           ⇒ 这条 ERROR 对同一 session **一生只出现一次**。
     本用例记录的正是「第二帧长得和一个健康帧一模一样」这件事：无重开、无探测、无日志、
@@ -1648,8 +1657,11 @@ async def test_normal_resume_path_has_no_interrupt_guard(
       · 两次调用全部照常返回 `ExpressionBundle`；
       · 全程**一条 ERROR 都没有**；
       · 唯一信号是 `open_session` 里那条 WARNING（`LOG_MARKER_INTERRUPTED_ON_OPEN`）。
-    Zero 侧同样无兜底：`zero.step` 不做任何中断检查（`daecce1` 现场核验，全函数 grep
-    `interrupt|next|aget_state` 零命中）。
+    ⚠ Zero 侧的兜底口径已变（`667e923`）：其 `zero.step` 现有**每轮事后中断检查**，
+    但**只记 WARNING、不改返回体、不拒帧** ⇒ 上面三条实测结论**逐条仍成立**
+    （我方这侧看到的仍是「正常返回、无 ERROR、只有 open 那条 WARNING」）。
+    早先「`zero.step` 不做任何中断检查（`daecce1` 全函数 grep 零命中）」的表述已过期，勿再引用
+    ——现在的准确说法是「**我方侧**不可观测，对方侧每帧有一条 WARNING」。
 
     本轮**有意不在正常路径加拦截**（论证见 client `graceful_step` docstring「常规 resume 路径」
     段：处置权在调用方、误伤面比自愈路径大得多、正确形态是给一个显式 API 而非在降级路径里
@@ -1941,3 +1953,538 @@ async def test_purge_session_malformed_response_becomes_call_error(
     _set_tool_return(mock_session, json.dumps([1, 2]))  # 合法 JSON 但不是 object
     with pytest.raises(ZeroLinkCallError):
         await client.purge_session("sid-1")
+
+
+# ---------------------------------------------------------------------------
+# Task（2026-07-30）：接 Zero 的**显式** `interrupt_probe` 四态
+#
+# 对方在 `667e923` 把「`interrupted_at` 缺席」拆成一个**恒存在**的 `interrupt_probe`：
+#   not_probed / clean / interrupted / probe_failed
+# 其中 `probe_failed`（对方探测**自己抛了**）正是本仓当初索要显式化的那一格 —— 此前它与
+# 「探测干净」在返回体上完全同形，我方把它当安全 ⇒ 止血在最该生效时静默失效。
+#
+# 本段守卫的四条主线（与验收一一对应）：
+#   ① 四态各自的处置分支都有用例，摘掉任一格的处置对应用例即红；
+#   ② 老部署（无该键）回退 + **正控**证明新部署确实走了新分支（否则「不炸」是恒真的）；
+#   ③ 未知第五态按最坏情况处置；
+#   ④ 🛑 `probe_failed` **绝不能**被当 clean —— 专门的对照变异格。
+#
+# 🛑 **夹具不得只造一态**（pitfalls 新增条）：既有夹具（`_INTERRUPTED_OPEN_PAYLOAD` 等）一律
+#    不带 `interrupt_probe` 键，若沿用它们，本段测的全是老轨、四态里另外几格一个都碰不到。
+#    故下面每一态都用 `_probe_payload()` **显式构造**，且刻意让「载荷」与「令牌」可独立设置。
+# ---------------------------------------------------------------------------
+
+
+def _probe_payload(
+    token: object,
+    *,
+    resumed: bool | None = True,
+    nodes: object | None = None,
+    with_nodes: bool = False,
+    session_id: str = "sid-1",
+) -> str:
+    """构造**新部署**形态的 open_session 返回体（恒带 `interrupt_probe`）。
+
+    `with_nodes=True` 时才写 `interrupted_at` 键（`nodes` 即其值）——Zero 只在
+    `interrupted` 那一态发它，故「令牌 vs 载荷」必须能分别设置，否则自洽性那两格测不到。
+    """
+    payload: dict[str, object] = {"session_id": session_id, "interrupt_probe": token}
+    if resumed is not None:
+        payload["resumed"] = resumed
+    if with_nodes:
+        payload["interrupted_at"] = nodes
+    return json.dumps(payload)
+
+
+def _legacy_payload(*, resumed: bool | None = True, session_id: str = "sid-1") -> str:
+    """构造**老部署**形态的返回体：**没有** `interrupt_probe` 键（走缺席推断老轨）。"""
+    payload: dict[str, object] = {"session_id": session_id}
+    if resumed is not None:
+        payload["resumed"] = resumed
+    return json.dumps(payload)
+
+
+def _self_heal_calls(mock_session: AsyncMock) -> list[str]:
+    """本次 graceful_step 实际发出的工具名序列（自愈路径的调用序列即行为判据）。"""
+    return [c.args[0] for c in mock_session.call_tool.call_args_list]
+
+
+async def _run_self_heal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    open_payload: str,
+    *,
+    purge_on_interrupted: bool = False,
+) -> tuple[ExpressionBundle | None, AsyncMock, ZeroLinkClient]:
+    """跑一次 unknown-session 自愈：step 报未知 → 重开（给定返回体）→ 视判读决定是否重试。
+
+    第三个返回体**故意备着**：实现若在该态下仍续跑，它会被消费掉 ⇒ 调用序列断言当场变红。
+    也回 client 本体，供断言判读结果（`last_open_session`）而**不必**另造一遍流程。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(open_payload),
+        _make_call_result(_make_expression_json()),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        result = await client.graceful_step(
+            "sid-1",
+            AffectStimulus(valence=0.1, arousal=0.2),
+            purge_on_interrupted=purge_on_interrupted,
+        )
+    return result, mock_session, client
+
+
+# ── ① 解析层：四态逐格映射 + 原始令牌保留 ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("not_probed", ZeroInterruptProbe.NOT_PROBED),
+        ("clean", ZeroInterruptProbe.CLEAN),
+        ("probe_failed", ZeroInterruptProbe.PROBE_FAILED),
+        ("interrupted", ZeroInterruptProbe.INTERRUPTED),  # 令牌即判据，载荷缺席也算
+    ],
+)
+async def test_explicit_probe_token_maps_to_state(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    expected: ZeroInterruptProbe,
+) -> None:
+    """🛑 对方的四个令牌**逐格**映射到我方四个态，且原始令牌原样留在 `interrupt_probe_raw`。
+
+    删掉 `_ZERO_PROBE_TOKEN_TO_STATE` 里任一条目 → 该行落到 `UNRECOGNIZED`，本条即红。
+    把判读改回「只看 `interrupted_at` 缺席」→ 四行全部塌缩成 `ABSENT`，四行齐红。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _probe_payload(token))
+
+    await client.open_session(session_id="sid-1")
+
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is expected
+    assert info.interrupt_probe_raw == token, "原始令牌须原样保留（归因日志要打出来给人看）"
+
+
+async def test_probe_failed_is_not_collapsed_into_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """🛑🛑 **本任务的核心判别式**：`probe_failed` 与 `clean` 在解析层必须判成**不同**的态。
+
+    这一格就是我方向对方索要显式化的目标：改动前两者在返回体上同形（都不带 `interrupted_at`）
+    ⇒ 我方只能把「探测失败」读成「可安全续跑」。若谁把 `"probe_failed"` 映到
+    `ZeroInterruptProbe.CLEAN`（或让它落回 ABSENT 再按老口径续跑），本条当场红。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    states: dict[str, ZeroInterruptProbe] = {}
+    for token in ("clean", "probe_failed"):
+        _set_tool_return(mock_session, _probe_payload(token))
+        await client.open_session(session_id="sid-1")
+        assert client.last_open_session is not None
+        states[token] = client.last_open_session.interrupt_probe
+
+    assert states["probe_failed"] is not states["clean"], (
+        f"probe_failed 与 clean 判成了同一个态（{states!r}）—— 那正是本轮要消灭的信息损失"
+    )
+    assert states["probe_failed"] is ZeroInterruptProbe.PROBE_FAILED
+    assert states["clean"] is ZeroInterruptProbe.CLEAN
+
+
+async def test_all_seven_states_are_reachable_and_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """判别性总闸：双轨七态**两两不同**，且每一态都有真实可达的返回体。
+
+    夹具遮路的守卫（pitfalls 新增条）：若某态没有任何返回体能造出来，它的处置分支就永远
+    不会被走到 —— 本条把「七态都可达」做成可执行断言，任意两格塌缩即红。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    cases: dict[ZeroInterruptProbe, str] = {
+        # 新轨四态
+        ZeroInterruptProbe.NOT_PROBED: _probe_payload("not_probed"),
+        ZeroInterruptProbe.CLEAN: _probe_payload("clean"),
+        ZeroInterruptProbe.PROBE_FAILED: _probe_payload("probe_failed"),
+        ZeroInterruptProbe.INTERRUPTED: _probe_payload("interrupted"),
+        ZeroInterruptProbe.UNRECOGNIZED: _probe_payload("probe_skipped_by_config"),
+        # 老轨专属两态
+        ZeroInterruptProbe.ABSENT: _legacy_payload(),
+        ZeroInterruptProbe.MALFORMED: json.dumps(
+            {"session_id": "sid-1", "resumed": True, "interrupted_at": 7}
+        ),
+    }
+    seen: dict[ZeroInterruptProbe, ZeroInterruptProbe] = {}
+    for expected, payload in cases.items():
+        _set_tool_return(mock_session, payload)
+        await client.open_session(session_id="sid-1")
+        assert client.last_open_session is not None
+        seen[expected] = client.last_open_session.interrupt_probe
+
+    assert seen == {k: k for k in cases}, f"逐格映射错位：{seen!r}"
+    assert len(set(seen.values())) == 7, f"七态必须两两可分，实得 {sorted(set(seen.values()))}"
+
+
+# ── ③ 未知第五态 / 值形状坏 → UNRECOGNIZED（最坏情况 + 告警）───────────────────
+
+
+async def test_unknown_fifth_state_becomes_unrecognized_with_raw_kept(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """对方按其 bump 纪律②新增第五态 → `UNRECOGNIZED` + 告警**点名该取值**，且**不炸**。
+
+    三个断言各钉一面：不炸（open_session 照常返回 sid）、判成 UNRECOGNIZED（不当 clean）、
+    原始令牌进日志（否则运维看不出对方新增了什么，只能去猜）。
+    把未知取值兜到 `CLEAN`/`ABSENT` 即红；改成抛异常 → 第一个断言红（会话打不开）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _probe_payload("probe_skipped_by_config"))
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        sid = await client.open_session(session_id="sid-1")
+
+    assert sid == "sid-1"
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is ZeroInterruptProbe.UNRECOGNIZED
+    assert info.interrupt_probe_raw == "probe_skipped_by_config"
+    warns = _warning_msgs(caplog)
+    assert any("probe_skipped_by_config" in m for m in warns), (
+        f"未知取值必须被点名打出来，实得 {caplog.records!r}"
+    )
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN, logging.WARNING)) >= 1
+
+
+@pytest.mark.parametrize("bad", [7, None, True, {"state": "clean"}, ["clean"]])
+async def test_malformed_probe_value_is_worst_case_not_clean(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bad: object
+) -> None:
+    """`interrupt_probe` 的值**非 str** → `UNRECOGNIZED`（最坏情况），**绝不**当 clean、不炸。
+
+    `True` 那一格特意留着：`isinstance(True, int)` 为真而不是 str，若实现用 `str(raw)` 兜底，
+    它会变成 `"True"` 再落 UNRECOGNIZED —— 结论虽同，但 raw 会被污染成一个对方从未发过的
+    字符串，故这里同时断言 `interrupt_probe_raw is None`（「值非 str」与「键缺席」由态区分）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _probe_payload(bad))
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        sid = await client.open_session(session_id="sid-1")
+
+    assert sid == "sid-1"  # 形状坏不得让会话打不开
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is ZeroInterruptProbe.UNRECOGNIZED
+    assert info.interrupt_probe_raw is None, "非 str 的取值不得被强转成字符串塞进 raw"
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN, logging.WARNING)) >= 1
+
+
+# ── 自洽性：正证据优先 ────────────────────────────────────────────────────────
+
+
+async def test_nonempty_nodes_override_non_interrupted_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """令牌说 `clean` 却带**非空**待执行节点 → 取 `INTERRUPTED`（正证据优先）+ 矛盾告警。
+
+    这一格今天对方不会发（其两处同源），但那是**对方的实现细节**。若反过来信令牌，我方就会
+    在「明知有待执行节点」的情况下放行 —— 方向错了。把覆盖逻辑删掉即红（态变回 CLEAN）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(
+        mock_session, _probe_payload("clean", with_nodes=True, nodes=["affect_update"])
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        await client.open_session(session_id="sid-1")
+
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is ZeroInterruptProbe.INTERRUPTED
+    assert info.interrupted_at == ("affect_update",)
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_STATE_MISMATCH, logging.WARNING)) == 1
+
+
+async def test_interrupted_token_without_nodes_stays_interrupted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """令牌说 `interrupted` 但载荷缺席 → **仍取 INTERRUPTED**（令牌是判据）+ 矛盾告警。
+
+    反向的一格：若实现把「态」挂在载荷非空上（`if info.interrupted_at:`），这一格会被
+    静默读成安全并照常续跑 —— 那正是「判据回退到载荷」的老病。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _probe_payload("interrupted"))
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        await client.open_session(session_id="sid-1")
+
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is ZeroInterruptProbe.INTERRUPTED
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_STATE_MISMATCH, logging.WARNING)) == 1
+    # open 面那条 INTERRUPTED 告警也必须照发（最该响的时候不能没声）
+    assert len(_marked_records(caplog, LOG_MARKER_INTERRUPTED_ON_OPEN, logging.WARNING)) == 1
+
+
+# ── ② 老部署回退 + **正控**（证明新部署真走了新分支）──────────────────────────
+
+
+async def test_legacy_deployment_without_probe_key_falls_back_to_old_track(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """老部署（无 `interrupt_probe`）→ 走缺席推断老轨，且**不打**任何新轨告警（零回归）。
+
+    ⚠ 单独看本条**近乎恒真**（老部署路径本来就什么都不做）——判别力来自它与下一条正控
+    构成的对照：同一个自愈流程，仅在返回体里**加上** `interrupt_probe: probe_failed`，
+    行为就必须从「续跑」翻转成「拒绝」。缺了正控，「老部署不炸」这句话谁写都能过。
+    """
+    result, mock_session, client = await _run_self_heal(monkeypatch, caplog, _legacy_payload())
+
+    assert isinstance(result, ExpressionBundle)  # 照常续跑（逐字等于改动前）
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session", "zero.step"]
+    info = client.last_open_session
+    assert info is not None
+    assert info.interrupt_probe is ZeroInterruptProbe.ABSENT, "老部署须落老轨的 ABSENT"
+    assert info.interrupt_probe_raw is None, "老部署不得凭空造出 raw 令牌"
+    # 老轨的「不可判」告警照旧（resumed=True + 缺席）
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_UNDECIDABLE, logging.WARNING)) == 1
+    # 新轨的四个 marker 一个都不该出现
+    for marker in (
+        LOG_MARKER_PROBE_FAILED_ON_OPEN,
+        LOG_MARKER_PROBE_FAILED_REFUSED,
+        LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+        LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE,
+    ):
+        assert not any(marker in m for m in _warning_msgs(caplog) + _error_msgs(caplog)), (
+            f"老部署不得触发新轨 marker {marker}"
+        )
+
+
+async def test_new_deployment_probe_failed_takes_the_new_branch(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """🛑 **上一条的正控**：同一自愈流程，返回体仅多一个 `interrupt_probe: probe_failed`
+    ⇒ 行为**翻转**为拒绝本帧，且归因 marker 与老部署那条**不同**。
+
+    这条同时兜住验收 ①（probe_failed 的处置分支）与 ④（不得当 clean）：
+    · 摘掉 client 里 `PROBE_FAILED` 那个 `if` 分支 → 走到续跑，调用序列出现第三次 step，本条红；
+    · 把 `"probe_failed"` 映射到 CLEAN → 同样续跑，本条红；
+    · 归因断言还钉住「老部署不可判」与「新部署探测失败」**日志分得开**（两个不同 marker）。
+    """
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("probe_failed")
+    )
+
+    assert result is None, "probe_failed 属不可判且故障相关 ⇒ 必须按最坏情况拒绝本帧"
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session"], (
+        "拒绝本帧 = 重开后不得再发 step（第三个备好的返回体不该被消费）"
+    )
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_FAILED_REFUSED, logging.ERROR)) == 1
+    # 归因分离：不得错打成「老部署不可判」
+    assert not any(LOG_MARKER_PROBE_UNDECIDABLE in m for m in _warning_msgs(caplog)), (
+        "新部署的探测失败不得复用老部署「不可判」的 marker —— 两者归因不同"
+    )
+
+
+async def test_probe_failed_and_clean_differ_in_behaviour(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """🛑🛑 验收④的对照变异格：`clean` 续跑、`probe_failed` 拒绝 —— **行为必须不同**。
+
+    只要有人把 probe_failed「当 clean」（映射合并、分支删除、条件写成 `is not INTERRUPTED`
+    就续跑…… 任一种），两侧的返回值与调用序列就会变得一样，本条当场红。
+    """
+    clean_result, clean_mock, _c1 = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("clean")
+    )
+    failed_result, failed_mock, _c2 = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("probe_failed")
+    )
+
+    assert isinstance(clean_result, ExpressionBundle), "明确干净 ⇒ 照常续跑"
+    assert failed_result is None, "探测失败 ⇒ 拒绝本帧"
+    assert _self_heal_calls(clean_mock) == ["zero.step", "zero.open_session", "zero.step"]
+    assert _self_heal_calls(failed_mock) == ["zero.step", "zero.open_session"]
+    assert _self_heal_calls(clean_mock) != _self_heal_calls(failed_mock), (
+        "两态的调用序列相同 ⇒ probe_failed 被当成了 clean，这正是本轮要消灭的那一格"
+    )
+
+
+# ── ① 逐格处置：graceful_step 决策表 ─────────────────────────────────────────
+
+
+async def test_unrecognized_state_refuses_frame(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """未知第五态在决策点同样**按最坏情况拒绝**，marker 与 probe_failed **分开**。
+
+    摘掉 `UNRECOGNIZED` 那个 `if` → 落到「续跑」（第三次 step 被消费），本条红。
+    marker 分开的理由：两者都拒帧，但归因不同（对方探测失败 vs 对方说了我方读不懂）。
+    """
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("probe_skipped_by_config")
+    )
+
+    assert result is None
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session"]
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_UNRECOGNIZED_REFUSED, logging.ERROR)) == 1
+    assert not any(LOG_MARKER_PROBE_FAILED_REFUSED in m for m in _error_msgs(caplog))
+
+
+async def test_not_probed_with_resumed_true_continues_with_own_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`not_probed` + `resumed=True`（活跃幂等重开）→ **照常续跑** + 自己的可区分 WARNING。
+
+    为什么不拒绝（与 probe_failed 的取舍差别，见 client 分支注释）：本格不是故障相关的，
+    它是对方按设计跳过探测（会话仍活跃），触发条件是并发/幂等重开这类正常控制流。
+    摘掉这条 WARNING → 「对方明确没探测」与「对方说干净」在观测上重新塌缩，本条红；
+    把它改成拒绝 → 第一个断言红（并发场景下的正常业务被打成丢帧）。
+    """
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("not_probed")
+    )
+
+    assert isinstance(result, ExpressionBundle)
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session", "zero.step"]
+    assert (
+        len(_marked_records(caplog, LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE, logging.WARNING)) == 1
+    )
+    # 归因分离：这不是老部署的「缺席不可判」
+    assert not any(LOG_MARKER_PROBE_UNDECIDABLE in m for m in _warning_msgs(caplog))
+    assert _error_msgs(caplog) == []
+
+
+async def test_not_probed_with_resumed_false_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`not_probed` + `resumed=False`（新铸会话）→ 续跑且**不打**告警（真安全，没有旧运行态）。
+
+    正控：没有这一格，上一条的 WARNING 可能是「只要 not_probed 就响」的无条件噪音。
+    把 WARNING 条件里的 `info.resumed is True` 删掉即红。
+    """
+    result, _mock, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("not_probed", resumed=False)
+    )
+
+    assert isinstance(result, ExpressionBundle)
+    assert not any(LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE in m for m in _warning_msgs(caplog)), (
+        f"新铸会话没有旧运行态可污染，不该告警，实得 {caplog.records!r}"
+    )
+
+
+async def test_clean_token_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`clean`（对方明确说干净）→ 续跑且不打任何不可判/拒绝日志（否则告警变噪音）。"""
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload("clean")
+    )
+
+    assert isinstance(result, ExpressionBundle)
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session", "zero.step"]
+    assert _error_msgs(caplog) == []
+    for marker in (
+        LOG_MARKER_PROBE_UNDECIDABLE,
+        LOG_MARKER_PROBE_NOT_PROBED_UNDECIDABLE,
+        LOG_MARKER_PROBE_UNRECOGNIZED_ON_OPEN,
+        LOG_MARKER_PROBE_FAILED_ON_OPEN,
+    ):
+        assert not any(marker in m for m in _warning_msgs(caplog)), f"clean 不该触发 {marker}"
+
+
+async def test_explicit_interrupted_token_refuses_frame(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """新轨 `interrupted` 令牌（**载荷也在**）→ 拒绝本帧，与老轨同一条处置。"""
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch,
+        caplog,
+        _probe_payload("interrupted", with_nodes=True, nodes=["affect_update"]),
+    )
+
+    assert result is None
+    assert _self_heal_calls(mock_session) == ["zero.step", "zero.open_session"]
+    assert len(_marked_records(caplog, LOG_MARKER_INTERRUPTED_REFUSED, logging.ERROR)) == 1
+    assert any("affect_update" in m for m in _error_msgs(caplog))
+
+
+# ── 破坏性动作的边界：不可判 ≠ 确定半截 ⇒ 不 purge ──────────────────────────
+
+
+@pytest.mark.parametrize("token", ["probe_failed", "probe_skipped_by_config"])
+async def test_undecidable_states_never_purge_even_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, token: str
+) -> None:
+    """🛑 `purge_on_interrupted=True` 也**不得** purge 不可判的两格（判据是「读不出来」）。
+
+    `purge_on_interrupted` 承诺的是「检出**半截**就清」；把它扩张成「不可判也清」= 让调用方
+    在不知情下对一个可能完全健康的会话执行不可逆删除（一次探测抛异常完全可能出在干净会话上）。
+    若谁把这两格并进 INTERRUPTED 分支，`zero.purge_session` 会出现在调用序列里，本条即红。
+    """
+    result, mock_session, _client = await _run_self_heal(
+        monkeypatch, caplog, _probe_payload(token), purge_on_interrupted=True
+    )
+
+    assert result is None  # 仍拒绝本帧
+    calls = _self_heal_calls(mock_session)
+    assert "zero.purge_session" not in calls, f"不可判的一格不得 purge，实得调用序列 {calls}"
+    assert calls == ["zero.step", "zero.open_session"]
+
+
+async def test_interrupted_still_purges_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """正控：**确定**半截那一格在 opt-in 下仍照旧 purge（上一条不能把 purge 能力整体废掉）。
+
+    没有这一格，「不可判不 purge」可能是「任何情况都不 purge」的退化实现（purge 通路全死）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    mock_session.call_tool.side_effect = [
+        _make_call_result(_ZERO_UNKNOWN_SESSION_TEXT, is_error=True),
+        _make_call_result(_probe_payload("interrupted", with_nodes=True, nodes=["render"])),
+        _make_call_result(json.dumps({"ok": True, "purged": True})),
+    ]
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        result = await client.graceful_step(
+            "sid-1",
+            AffectStimulus(valence=0.1, arousal=0.2),
+            purge_on_interrupted=True,
+        )
+
+    assert result is None
+    assert _self_heal_calls(mock_session) == [
+        "zero.step",
+        "zero.open_session",
+        "zero.purge_session",
+    ]
+    assert len(_marked_records(caplog, LOG_MARKER_INTERRUPTED_REFUSED_PURGING, logging.ERROR)) == 1
+
+
+# ── open 面（公开 open_session）的可观测性：probe_failed 不能只在自愈路径可见 ──
+
+
+async def test_public_open_session_surfaces_probe_failed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """公开 `open_session()` 拿到 `probe_failed` 也要留一条 WARNING（该路径无守卫）。
+
+    调用方若自己 resume 而不走 `graceful_step`，决策层那条 ERROR 压根不会发生 ⇒ 若 open 面
+    也不报，「对方探测失败」在这条路径上**完全不可观测**。
+    ⚠ marker 与决策层的 `*_REFUSED` **刻意不同名**：两者落在同一个 caplog 里，同名会让
+    「决策层真拒绝了」的断言被本条日志喂成恒真（pitfalls ⑥ 同类）。
+    """
+    client, mock_session = _build_client_with_session(monkeypatch)
+    _set_tool_return(mock_session, _probe_payload("probe_failed"))
+
+    with caplog.at_level(logging.DEBUG, logger="src.mcp.zero.client"):
+        sid = await client.open_session(session_id="sid-1")
+
+    assert sid == "sid-1"  # open 面只报告、不处置（处置权在调用方）
+    assert len(_marked_records(caplog, LOG_MARKER_PROBE_FAILED_ON_OPEN, logging.WARNING)) == 1
+    assert not any(LOG_MARKER_PROBE_FAILED_REFUSED in m for m in _error_msgs(caplog)), (
+        "open 面不得复用决策层的 marker，否则拒绝断言会被喂成恒真"
+    )

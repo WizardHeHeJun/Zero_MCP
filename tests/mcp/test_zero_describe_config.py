@@ -42,6 +42,7 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from src.agents.models.zero_affect import ModalityPrior
 from src.mcp.zero.client import (
     DESCRIBE_CONFIG_EXPECTED_KEYS,
+    DESCRIBE_CONFIG_OPTIONAL_KEYS,
     KNOWN_DESCRIBE_CONFIG_VERSIONS,
     LOG_MARKER_DESCRIBE_CALL_FAILED,
     LOG_MARKER_DESCRIBE_FIELDS_DRIFT,
@@ -798,6 +799,43 @@ async def test_missing_and_extra_keys_are_reported(
 
 
 def test_expected_key_set_is_21_keys() -> None:
-    """本仓期望键集的规模 pin —— 与 Zero 真实返回体的一致性由 zerorepo 跨仓守卫负责。"""
+    """本仓**必需**键集的规模 pin —— 与 Zero 真实返回体的一致性由 zerorepo 跨仓守卫负责。
+
+    可选键（对方 v3 起新增）**不计入**这个数：混进来就分不清「必需集被人改了」与
+    「对方又加了一个新版本键」，而两者的处置完全不同。
+    """
     assert len(DESCRIBE_CONFIG_EXPECTED_KEYS) == 21
     assert set(_payload()) == DESCRIBE_CONFIG_EXPECTED_KEYS
+    # 两个集合不得相交：同一个键既必需又可选是自相矛盾的登记，会让 missing/absent 双报。
+    assert not (DESCRIBE_CONFIG_EXPECTED_KEYS & DESCRIBE_CONFIG_OPTIONAL_KEYS)
+
+
+def test_optional_keys_are_absent_from_v1_payload_without_being_reported_missing() -> None:
+    """可选键缺席**不算缺**——这是分层的全部意义所在（v1/v2 部署只有 21 键）。
+
+    判别力：若把可选键并进必需集，本用例第二条断言立刻红（missing 会变成那两个键）。
+    """
+    cfg = _cfg_ok()  # v1 形态载荷，不含 transport / stateless_http
+    assert cfg.available is True
+    assert cfg.missing_keys == ()  # 必需键齐全 ⇒ 不报缺
+    assert cfg.absent_optional_keys == ("stateless_http", "transport")  # 但如实记账
+    assert cfg.unexpected_keys == ()  # 且不会反过来被当成「多了键」
+
+
+def test_v3_payload_reports_neither_missing_nor_unexpected() -> None:
+    """v3 形态（23 键）两个方向都不报 —— 对方正常演进不该触发任何告警。"""
+    cfg = _cfg_ok(transport="stdio", stateless_http=False)
+    assert cfg.missing_keys == ()
+    assert cfg.absent_optional_keys == ()
+    assert cfg.unexpected_keys == ()
+
+
+def test_genuinely_unknown_key_still_surfaces_as_unexpected() -> None:
+    """正控：分层**没有**削弱守卫——我方尚不知道的键仍落进 unexpected。
+
+    这一格是分层设计的兜底证明：若 `unexpected_keys` 被写成「减去所有见过的键」之类的宽判据，
+    对方加第 24 个键时我方就再也不会被提醒「漏读了新能力」。
+    """
+    cfg = _cfg_ok(transport="stdio", stateless_http=False, brand_new=1)
+    assert cfg.unexpected_keys == ("brand_new",)
+    assert cfg.missing_keys == ()

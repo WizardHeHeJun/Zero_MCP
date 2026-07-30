@@ -3787,8 +3787,11 @@ class TestDescribeConfigCrosscheck:
         )
 
     def test_field_set_matches_client_expectation(self) -> None:
-        """我方期望字段集 vs 对方真实返回体，逐键相等。"""
-        from src.mcp.zero.client import DESCRIBE_CONFIG_EXPECTED_KEYS
+        """我方期望字段集 vs 对方真实返回体：**必需**键须全在、未登记的新键须为空。"""
+        from src.mcp.zero.client import (
+            DESCRIBE_CONFIG_EXPECTED_KEYS,
+            DESCRIBE_CONFIG_OPTIONAL_KEYS,
+        )
 
         func = self._func_or_skip()
         ret = _zero_describe_config_return_dict(func)
@@ -3801,14 +3804,30 @@ class TestDescribeConfigCrosscheck:
             "Zero describe_config 返回体含非字面量键（`**spread` 或计算式），键集不可信 —— "
             "拿半份键集比对会报出一堆假缺键，故此处直接判红要求人工核。"
         )
+        # 分层比对（2026-07-30 起）：**必需**键缺 ⇒ 真漂移；**已登记的可选**键缺 ⇒ 只是对方版本旧。
+        # 不分层的话两个方向必有一个误报：合进必需集则旧部署（21 键）被报缺 2 键，
+        # 不登记则 v3 部署（23 键）每次都被报「多 2 键」。
         missing = sorted(DESCRIBE_CONFIG_EXPECTED_KEYS - zero_keys)
-        extra = sorted(zero_keys - DESCRIBE_CONFIG_EXPECTED_KEYS)
+        extra = sorted(zero_keys - (DESCRIBE_CONFIG_EXPECTED_KEYS | DESCRIBE_CONFIG_OPTIONAL_KEYS))
         assert not missing and not extra, (
-            f"describe_config 字段集漂移：本仓期望但对方没有={missing}；"
-            f"对方有但本仓未登记={extra}。"
+            f"describe_config 字段集漂移：本仓**必需**但对方没有={missing}；"
+            f"对方有但本仓**两个集合都未登记**={extra}。"
             "前者 ⇒ 我方那一位读不到（判读静默降级）；后者 ⇒ 我方漏读了对方的新能力。"
-            "两者在运行期都只 warn，故此处硬红。请同步 client.DESCRIBE_CONFIG_EXPECTED_KEYS。"
+            "两者在运行期都只 warn，故此处硬红。"
+            "请同步 client.DESCRIBE_CONFIG_EXPECTED_KEYS（我方要消费的）"
+            "或 DESCRIBE_CONFIG_OPTIONAL_KEYS（已知存在、按版本可缺的）。"
         )
+        # 可选键在对方**当前**形态上缺席不判红，但要留痕——否则「对方回退了那个提交」
+        # 与「我方登记错了一个不存在的键」在这条守卫上同形、都静默。
+        absent_optional = sorted(DESCRIBE_CONFIG_OPTIONAL_KEYS - zero_keys)
+        if absent_optional:
+            warnings.warn(
+                f"已登记的可选键在对方当前源码上缺席：{absent_optional}"
+                "（正常情形=对方版本低于引入它的那一版；异常情形=我方登记了从未存在的键，"
+                "或对方回退了引入它的提交）。不判红，但请确认属前者。",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def test_version_is_known_to_client(self) -> None:
         """版本 bump 提醒：日常 warn、STRICT 判红（分层理由见本节顶部注释）。"""
@@ -3958,3 +3977,266 @@ class TestDescribeConfigScannerDiscrimination:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(STRICT_ENV, "1")
             _warn_describe_config_version_bump(2, frozenset({1, 2}))  # 不抛即通过
+
+
+# ---------------------------------------------------------------------------
+# `zero.open_session` 的 `interrupt_probe` **取值集合**跨仓守卫（2026-07-30）
+#
+# 为什么必须有：我方 client 现在**按取值分支处置**（`clean` 续跑 / `probe_failed` 拒绝 / …），
+# 而对方在其 bump 纪律里明写「② 某键的**值域/取值集合**变化（如 interrupt_probe 加一个新态）」
+# 也要 bump ⇒ **第五态是被预告的事**。运行期遇到未知取值我方走 `UNRECOGNIZED`（最坏情况处置 +
+# 告警，不炸），但那是**兜底**、不是「知道了」：兜底会让新态在每一帧都被当成故障处理。
+# 本守卫的职责是让这件事在**部署之前**就被人看到：日常 warn、STRICT 判红（与版本 bump 同规格）。
+#
+# 🛑 **不硬编码对方的局部变量名**（pitfalls ⑦ 脆弱锚点）：取值散在
+# `probe = "not_probed"` / `probe = "interrupted" if … else "clean"` 这类赋值里，若守卫写死
+# 变量名 `probe`，对方一次无害改名就会让守卫**只看到早退分支那一个字面量** → 报三个假缺失。
+# 故改为**自描述**：先从返回体字典里 `"interrupt_probe"` 那一项**学到**它引用的变量名，
+# 再去收集赋给该名字的字面量。判别力由下方合成源码（故意把变量改名为 `verdict`）实证。
+# ---------------------------------------------------------------------------
+
+_ZERO_OPEN_SESSION_FUNC = "open_session"
+_ZERO_INTERRUPT_PROBE_KEY = "interrupt_probe"
+
+
+def _zero_open_session_func(tree: ast.Module) -> _FuncDef | None:
+    """找 `open_session` 函数定义（嵌在 `build_server` 内部，不在顶层）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, _FUNC_DEF_NODES) and node.name == _ZERO_OPEN_SESSION_FUNC:
+            return node
+    return None
+
+
+def _interrupt_probe_literals(func: _FuncDef) -> tuple[frozenset[str], frozenset[str]]:
+    """取该函数里 `interrupt_probe` **可能的全部字面量取值**。
+
+    返回 ``(取值集合, 学到的载体变量名集合)``——后者只为诊断/判别力断言用（空集 ⇒ 对方是
+    直接写字面量而非经变量，那也是合法形态）。
+
+    两条来源并集：
+      ① 返回体字典里 ``"interrupt_probe": "字面量"``（对方早退分支就是这个形态）；
+      ② 返回体字典里 ``"interrupt_probe": <某变量>`` ⇒ 记下该变量名，再收集函数内**赋给它**
+         的一切 str 字面量（`ast.walk` 进右值，故 `A if c else B` 这类条件表达式两支都收到）。
+    """
+    carriers: set[str] = set()
+    values: set[str] = set()
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
+            if not (
+                isinstance(key_node, ast.Constant) and key_node.value == _ZERO_INTERRUPT_PROBE_KEY
+            ):
+                continue
+            if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+                values.add(value_node.value)
+            elif isinstance(value_node, ast.Name):
+                carriers.add(value_node.id)
+    for node in ast.walk(func):
+        # `ast.walk` 回的是 AST，先收窄到赋值语句再交给 `_module_assign_targets`（它签名收 stmt）。
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        names, rhs = _module_assign_targets(node)
+        if rhs is None or not carriers.intersection(names):
+            continue
+        for sub in ast.walk(rhs):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                values.add(sub.value)
+    return frozenset(values), frozenset(carriers)
+
+
+def _warn_interrupt_probe_value_drift(zero_values: frozenset[str], known: frozenset[str]) -> None:
+    """对方的 `interrupt_probe` 取值集合与本仓认识的集合不一致 → 日常告警，STRICT 判红。
+
+    为什么不无条件硬红：对方新增一个态是其**正常演进**，且我方运行期**已有兜底**
+    （未知取值 → `UNRECOGNIZED` → 按最坏情况处置 + 告警，不炸），故日常不必打断本地开发。
+    为什么 STRICT 必须红：那条兜底会把新态**每一帧**都当故障处理（在自愈路径上直接丢帧），
+    联调/发版前必须有人现场核过新态语义、再把它登记进 `client._ZERO_PROBE_TOKEN_TO_STATE`。
+
+    「两集合相等 ⇒ 静默」这一判断**放在本函数内**（与 `_warn_describe_config_version_bump`
+    同构）：放到调用点就只能在测试里照抄一遍那个 `if`，等于验测试自己写的分支（pitfalls ⑥）。
+    """
+    from tests.mcp.conftest import zerorepo_strict_enabled
+
+    if zero_values == known:
+        return
+    unknown = sorted(zero_values - known)
+    stale = sorted(known - zero_values)
+    message = (
+        f"Zero `{_ZERO_INTERRUPT_PROBE_KEY}` 取值集合与本仓不一致："
+        f"对方有而本仓**不认识**={unknown}；本仓认识而对方**已不产出**={stale}。"
+        f"（对方={sorted(zero_values)}，本仓={sorted(known)}）"
+        "前者 ⇒ 我方运行期把它判成 UNRECOGNIZED 并**按最坏情况拒绝本帧**（自愈路径每帧丢帧），"
+        "后者 ⇒ 本仓映射表有死条目、语义可能已被对方重写。"
+        "请现场核对方 open_session 的新态语义，再同步 client._ZERO_PROBE_TOKEN_TO_STATE。"
+    )
+    if zerorepo_strict_enabled():
+        pytest.fail(
+            f"[{STRICT_ENV}] {message}\n"
+            "（STRICT 是联调/发版门：跨仓**值域**的单边变化要求当场表态，不接受挂账告警。）"
+        )
+    warnings.warn(message, stacklevel=2)
+
+
+@pytest.mark.zerorepo
+class TestInterruptProbeCrosscheck:
+    """`zero.open_session` 的显式中断态：键在位 + 取值集合与本仓一致。
+
+    D:\\Zero 或 server.py 不在位 → skip；**在位但对不上 → warn（STRICT 判红）**。
+    """
+
+    def _func_or_skip(self) -> _FuncDef:
+        tree = _zero_server_tree_or_skip()
+        func = _zero_open_session_func(tree)
+        if func is None:
+            pytest.skip(
+                f"Zero server.py 里没有 `{_ZERO_OPEN_SESSION_FUNC}` 函数（{_ZERO_SERVER_PY}）"
+            )
+        return func
+
+    def _values_or_skip(self) -> frozenset[str]:
+        """取对方的取值集合；对方尚未上线显式态 → skip（**不判红**）。
+
+        老部署是合法形态、client 对它有零回归的老轨路径，故此处不是缺陷。
+        但 STRICT 下 skip 会被 conftest 转成 fail —— 那正是联调门要的：跨仓对齐时必须确认
+        对方真的上线了显式态，否则「我方已接四态」这句话在所连部署上是空的。
+        """
+        func = self._func_or_skip()
+        values, _carriers = _interrupt_probe_literals(func)
+        if not values:
+            pytest.skip(
+                f"Zero `{_ZERO_OPEN_SESSION_FUNC}` 里找不到 {_ZERO_INTERRUPT_PROBE_KEY} 的字面量"
+                f"取值（{_ZERO_SERVER_PY}）——该部署尚未上线显式中断态，本仓走老轨回退，非缺陷"
+            )
+        return values
+
+    def test_interrupt_probe_key_present(self) -> None:
+        """键在位且取值可静态取到 —— 不在位说明所连部署仍是**老代**，我方走老轨回退。"""
+        values = self._values_or_skip()
+        assert values, "上面已 skip，此处仅为类型收窄"
+
+    def test_value_set_matches_client_mapping(self) -> None:
+        """取值集合 vs 本仓映射表，逐值比对（日常 warn、STRICT 判红）。"""
+        from src.mcp.zero.client import KNOWN_ZERO_INTERRUPT_PROBE_VALUES
+
+        values = self._values_or_skip()
+        # 「相等就静默」由被调函数自己判（理由见其 docstring），此处无条件调用。
+        _warn_interrupt_probe_value_drift(values, KNOWN_ZERO_INTERRUPT_PROBE_VALUES)
+
+    def test_probe_failed_token_is_present_upstream(self) -> None:
+        """🛑 **硬红**：`probe_failed` 这个令牌必须真在对方源码里。
+
+        它与其余三态不同级：我方 client 对它的处置是**拒绝本帧**（`PROBE_FAILED` →
+        `LOG_MARKER_PROBE_FAILED_REFUSED`），且这一格正是本仓当初向对方索要显式化的目标
+        ——「探测失败」此前与「探测干净」在返回体上同形，是止血最容易静默失效的一格。
+        若它在对方侧消失（改名/被合并回 clean），我方那条拒绝分支就变成**永不触发的死码**，
+        而运行期完全看不出来（照旧全绿）。故这一格不接受 warn 挂账。
+        """
+        from src.mcp.zero.client import _ZERO_PROBE_TOKEN_TO_STATE, ZeroInterruptProbe
+
+        values = self._values_or_skip()
+        failed_tokens = {
+            token
+            for token, state in _ZERO_PROBE_TOKEN_TO_STATE.items()
+            if state is ZeroInterruptProbe.PROBE_FAILED
+        }
+        assert failed_tokens, "本仓映射表里没有任何令牌映到 PROBE_FAILED —— 处置分支成了死码"
+        assert failed_tokens <= values, (
+            f"本仓认为对方会回 {sorted(failed_tokens)} 表示「探测失败」，但对方源码的取值集合是 "
+            f"{sorted(values)} —— 该令牌若已改名/取消，我方「按最坏情况拒绝本帧」的分支即成"
+            "死码，且运行期看不出来（未知取值会走 UNRECOGNIZED，同样拒绝，但归因错了）。"
+        )
+
+
+# 扫描器的**合成源码**判别力样本：不依赖 D:\Zero，故常驻可跑。
+# 刻意与今天对方的写法**不同**（载体变量名叫 `verdict` 而非 `probe`，且多一个态），
+# 用来证明取值提取器不是靠「今天恰好叫 probe」这个偶然事实工作的。
+_SYNTHETIC_OPEN_SESSION_SOURCE = '''
+"""合成：open_session 早退 return 直写字面量 + 主 return 经变量（变量名故意不叫 probe）。"""
+
+
+def build_server():
+    @server.tool(name="zero.open_session")
+    async def open_session(session_id=None):
+        if session_id is not None:
+            if await registry.get(session_id) is not None:
+                return {"session_id": session_id, "interrupt_probe": "not_probed"}
+        verdict = "not_probed"
+        if resuming:
+            try:
+                interrupted = await session.interrupted_at()
+            except Exception:
+                verdict = "probe_failed"
+            else:
+                verdict = "interrupted" if interrupted is not None else "clean"
+            if some_new_condition:
+                verdict = "probe_skipped_by_config"
+        return {"session_id": sid, "resumed": resuming, "interrupt_probe": verdict}
+'''
+
+_FOUR_TOKENS = frozenset({"not_probed", "clean", "interrupted", "probe_failed"})
+
+
+class TestInterruptProbeScannerDiscrimination:
+    """取值提取器 + 漂移告警的判别力——用**合成源码**实证，不靠 D:\\Zero 当前长相。"""
+
+    def test_literals_collected_across_assignments_and_early_return(self) -> None:
+        """五个态全须收到：早退的字面量 + 变量赋值（含条件表达式两支）+ 后续覆盖赋值。
+
+        判别力：把提取器写成「只看返回体字典的字面量」→ 只得到 `not_probed`，本条红；
+        写成「硬编码变量名 probe」→ 合成源码里叫 `verdict`，同样只得到 `not_probed`，本条红。
+        """
+        tree = ast.parse(_SYNTHETIC_OPEN_SESSION_SOURCE)
+        func = _zero_open_session_func(tree)
+        assert func is not None, "合成源码里没找到 open_session——样本坏了，下面的断言会退化"
+
+        values, carriers = _interrupt_probe_literals(func)
+        assert carriers == frozenset({"verdict"}), (
+            f"应从返回体里**学到**载体变量名，实得 {sorted(carriers)} —— "
+            "空集说明没走「经变量」那条路，提取器会漏掉全部赋值形态的取值。"
+        )
+        assert values == _FOUR_TOKENS | {"probe_skipped_by_config"}, (
+            f"取值集合不全，实得 {sorted(values)}"
+        )
+
+    def test_fifth_state_warns_when_strict_is_off(self) -> None:
+        """对方多一个我方不认识的态 → UserWarning（可见但不打断），且文案点名该态。"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(STRICT_ENV, raising=False)
+            with pytest.warns(UserWarning, match="probe_skipped_by_config"):
+                _warn_interrupt_probe_value_drift(
+                    _FOUR_TOKENS | {"probe_skipped_by_config"}, _FOUR_TOKENS
+                )
+
+    def test_fifth_state_fails_under_strict(self) -> None:
+        """同一入参在 `ZERO_LINK_E2E_STRICT=1` 下**转红**（联调门要求当场表态）。"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            with pytest.raises(pytest.fail.Exception, match="probe_skipped_by_config"):
+                _warn_interrupt_probe_value_drift(
+                    _FOUR_TOKENS | {"probe_skipped_by_config"}, _FOUR_TOKENS
+                )
+
+    def test_token_removed_upstream_also_reported(self) -> None:
+        """反方向也要报：对方**不再产出**某个本仓认识的令牌（映射表出现死条目）。
+
+        没有这一格，告警就只覆盖「多一个」而漏掉「少一个」——而「少」正是
+        `probe_failed` 被对方悄悄合并回 clean 那类最危险的变化。
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(STRICT_ENV, raising=False)
+            with pytest.warns(UserWarning, match="probe_failed"):
+                _warn_interrupt_probe_value_drift(_FOUR_TOKENS - {"probe_failed"}, _FOUR_TOKENS)
+
+    def test_equal_sets_emit_no_warning(self) -> None:
+        """正控：两集合相等时不得发警告（无条件响 = 噪音 = 没人看）。"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _warn_interrupt_probe_value_drift(_FOUR_TOKENS, _FOUR_TOKENS)
+        assert caught == [], f"集合一致却发了警告：{[str(w.message) for w in caught]}"
+
+    def test_equal_sets_do_not_fail_under_strict(self) -> None:
+        """正控′：STRICT 下集合一致时不得判红（否则 STRICT 门永远过不去）。"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(STRICT_ENV, "1")
+            _warn_interrupt_probe_value_drift(_FOUR_TOKENS, _FOUR_TOKENS)  # 不抛即通过
