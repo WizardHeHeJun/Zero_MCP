@@ -29,7 +29,6 @@ PhysiologyMapper 映射后，将渲染指令追加到 self.frames（供检视 / 
 
 from __future__ import annotations
 
-import logging
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -38,9 +37,6 @@ from src.agents.models.zero_affect import ExpressionBundle, ExpressionHead
 from src.mcp.zero.expression_sink import FacsMapper, HeadPolicy, PhysiologyMapper, ProsodyMapper
 from src.mcp.zero.mappers.physiology import PhysiologyParams
 from src.mcp.zero.mappers.prosody import ProsodyParams
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # RenderFrame

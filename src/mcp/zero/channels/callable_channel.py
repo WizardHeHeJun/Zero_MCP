@@ -15,12 +15,9 @@ CallablePerceptionChannel 让「async 函数 → ModalityPrior|None」的感知�
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 
 from src.agents.models.zero_affect import ModalityPrior
-
-logger = logging.getLogger(__name__)
 
 
 class CallablePerceptionChannel:
