@@ -102,73 +102,122 @@ CROSSFADE_S: float = 0.15
 # 包络形态常量（AD-3）[工程假设，待 Hiyori_A 标定]
 # ---------------------------------------------------------------------------
 
-ATTACK_FRACTION: float = 0.25
-"""hold 型包络 attack 段占总时长比例（余弦缓入）[工程假设]。"""
+ATTACK_FRACTION: float = 0.18
+"""hold 型包络 attack 段占总时长比例（余弦缓入）[2026-07-31 Hiyori_A 标定：0.25→0.18，
+用户裁定「可以更主动」——更快的起势]。"""
 
 RELEASE_FRACTION: float = 0.35
 """hold 型包络 release 段占总时长比例（余弦缓出，末端收敛到 0）[工程假设]。"""
 
 # ---------------------------------------------------------------------------
 # 幅度系数（AD-5）——角度参数乘 (max-min)/2 定标，[0,1] 参数直乘 intensity。
-# 全部 [工程假设，待 Hiyori_A 标定]。
+# [2026-07-31 Hiyori_A 实机标定]：标定证据 = 逐词峰值像素差（窗口 600x950，
+# ambient 关，静息噪声底 2.0）+ Live2D 输出参数读回（全词单调、0.5→1.0 精确 ×2，
+# 引擎无误）+ 用户裁定「整体太淡、只有歪头(30+/35)清晰可见、要更主动」。
+# 标定策略：以 head_tilt 的视觉能量为基准上调其余词；俯仰/偏航在该皮上像素响应
+# 弱于侧倾（roll 带动整头+头发），故 nod/shake 上调最多；眉/嘴推近量程天花板
+# （brow@1.0 原已达 ±1 量程的 ~0.79）。未标注「标定」的仍为 [工程假设]。
 # ---------------------------------------------------------------------------
 
-NOD_SCALE: float = 0.35
-"""nod：FaceAngleY 峰值 = intensity × 本系数 × 半量程（低头方向）[工程假设]。"""
+NOD_SCALE: float = 0.72
+"""nod：FaceAngleY 峰值 = intensity × 本系数 × 半量程（低头方向）
+[2026-07-31 标定：0.35→0.62→0.72，俯仰像素响应弱（原 @0.5 仅 -6.8°/像素差 5.9）；
+二轮用户裁定「晃头类幅度再大点」]。"""
 
-SHAKE_SCALE: float = 0.30
-"""shake：FaceAngleX 摆头幅度系数 [工程假设]。"""
+SHAKE_SCALE: float = 0.65
+"""shake：FaceAngleX 摆头幅度系数 [2026-07-31 标定：0.30→0.50→0.65（二轮加幅）]。"""
 
-HEAD_TILT_SCALE: float = 0.30
-"""head_tilt：FaceAngleZ 侧倾幅度系数 [工程假设]。"""
+HEAD_TILT_SCALE: float = 0.42
+"""head_tilt：FaceAngleZ 侧倾幅度系数 [2026-07-31 标定：0.30→0.35→0.42（二轮加幅）]。"""
 
-GLANCE_EYE_SCALE: float = 0.60
-"""glance：EyeLeft/RightX/Y 眼球偏转幅度系数 [工程假设]。"""
+GLANCE_EYE_SCALE: float = 0.85
+"""glance：EyeLeft/RightX/Y 眼球偏转幅度系数 [2026-07-31 标定：0.60→0.85，
+原 @0.5 眼球仅偏 0.30（±1 量程），眼部小面积需更大摆幅才可读]。"""
 
-GLANCE_HEAD_SCALE: float = 0.12
-"""glance 降级（缺眼球参数借 head）：FaceAngleX/Y 微偏幅度系数 [工程假设]。"""
+GLANCE_HEAD_SCALE: float = 0.18
+"""glance 降级（缺眼球参数借 head）：FaceAngleX/Y 微偏幅度系数
+[2026-07-31 随主系数等比上调：0.12→0.18]。"""
 
-BLINK_DEPTH_SCALE: float = 1.0
-"""blink：闭合深度 = intensity × 本系数（1=可全闭）[工程假设]。"""
+BLINK_DEPTH_SCALE: float = 1.6
+"""blink：闭合深度 = intensity × 本系数，>1 为有意过驱动
+[2026-07-31 标定：1.0→1.6——原 @0.5 只闭 74% 读作眯眼而非眨眼；过驱动后
+@0.5≈80% 闭合、@1.0 饱和为平底全闭（自然的重眨），乘法门下限 0 由 clamp 保证]。"""
 
-BROW_RAISE_SCALE: float = 0.40
-"""brow_raise：BrowLeftY/BrowRightY 上扬偏移 = intensity × 本系数 [工程假设]。"""
+BROW_RAISE_SCALE: float = 0.50
+"""brow_raise：BrowLeftY/BrowRightY 上扬偏移 = intensity × 本系数
+[2026-07-31 标定：0.40→0.50，@1.0 恰用满静息上行半程;该皮眉被刘海遮挡，
+数值已到位（读回 ±0.79），视觉含蓄属美术现实]。"""
 
-BROW_FURROW_SCALE: float = 0.35
-"""brow_furrow：BrowLeftY/BrowRightY 下压偏移系数 [工程假设]。"""
+BROW_FURROW_SCALE: float = 0.45
+"""brow_furrow：BrowLeftY/BrowRightY 下压偏移系数 [2026-07-31 标定：0.35→0.45]。"""
 
-BROW_FURROW_CENTER_SCALE: float = 0.25
-"""brow_furrow：Brows（综合眉参数）伴随下压系数 [工程假设]。"""
+BROW_FURROW_CENTER_SCALE: float = 0.30
+"""brow_furrow：Brows（综合眉参数）伴随下压系数 [2026-07-31 标定：0.25→0.30]。"""
 
 EYES_WIDEN_EYE_SCALE: float = 0.50
-"""eyes_widen：EyeOpenLeft/Right 加性上推系数（走加法非乘法门，AD-4）[工程假设]。"""
+"""eyes_widen：EyeOpenLeft/Right 加性上推系数（走加法非乘法门，AD-4）[工程假设——
+⚠ 实测 Hiyori_A 静息 ParamEyeLOpen=1.9 已满开，此分量在该类皮上被 clamp 吃掉
+（读回位移恒 0）；保留供静息非满开的皮套，该词可读性由眉+仰头分量承担]。"""
 
-EYES_WIDEN_BROW_SCALE: float = 0.25
-"""eyes_widen：BrowLeftY/BrowRightY 伴随微扬系数 [工程假设]。"""
+EYES_WIDEN_BROW_SCALE: float = 0.40
+"""eyes_widen：BrowLeftY/BrowRightY 伴随微扬系数 [2026-07-31 标定：0.25→0.40，
+EyeOpen 分量在满开皮上失效后眉是主要可见分量]。"""
 
-SMILE_SCALE: float = 0.45
-"""smile：MouthSmile 上扬偏移 = intensity × 本系数 [工程假设]。"""
+EYES_WIDEN_HEAD_SCALE: float = 0.15
+"""eyes_widen：FaceAngleY 仰头后缩系数（startle 的头部构成）[2026-07-31 新增：
+EyeOpen 天花板皮套上该词原本近乎不可见，补经典 startle 后缩使其在任意皮上可读]。"""
+
+SMILE_SCALE: float = 0.50
+"""smile：MouthSmile 上扬偏移 = intensity × 本系数
+[2026-07-31 标定：0.45→0.50，@1.0 恰用满上行半程]。"""
 
 LEAN_BODY_SCALE: float = 0.30
-"""lean_in/lean_back：BodyAngleY 前倾/后撤幅度系数 [工程假设]。"""
+"""lean_in/lean_back：BodyAngleY 前倾/后撤幅度系数 [工程假设——Hiyori_A 无
+BodyAngle，真身体轴幅度未经实机验证]。"""
 
-DEGRADED_BODY_RATIO: float = 1.0 / 3.0
-"""body 三词降级 head 近似时的幅度衰减比（蓝图 AD-5「约 1/3 幅度」）[工程假设]。"""
+DEGRADED_BODY_RATIO: float = 0.70
+"""body 三词降级 head 近似时的幅度衰减比
+[2026-07-31 标定：1/3→0.55→0.70（二轮加幅），蓝图 AD-5 的 1/3 在实机偏淡
+（lean @0.5 像素差 3.4-6.9），用户两轮裁定加力；该皮无 BodyAngle，降级路径即事实主路径]。"""
 
 LEAN_HEAD_SCALE: float = LEAN_BODY_SCALE * DEGRADED_BODY_RATIO
-"""lean_in/lean_back 降级：FaceAngleY 微量近似系数（= body 系数 × 1/3）[工程假设]。"""
+"""lean_in/lean_back 降级：FaceAngleY 微量近似系数（= body 系数 × 降级比）。"""
 
-LEAN_BACK_TILT_SCALE: float = 0.05
-"""lean_back 降级：FaceAngleZ 伴随微倾系数（蓝图 §2「FaceAngleY+Z 微量」）[工程假设]。"""
+LEAN_BACK_TILT_SCALE: float = 0.08
+"""lean_back 降级：FaceAngleZ 伴随微倾系数 [2026-07-31 标定：0.05→0.08]。"""
 
 SWAY_BODY_X_SCALE: float = 0.25
-"""body_sway：BodyAngleX 主摆幅度系数 [工程假设]。"""
+"""body_sway：BodyAngleX 主摆幅度系数 [工程假设——同 LEAN_BODY_SCALE，未经实机]。"""
 
 SWAY_BODY_Z_SCALE: float = 0.15
 """body_sway：BodyAngleZ 伴随摆动系数 [工程假设]。"""
 
 SWAY_HEAD_SCALE: float = SWAY_BODY_X_SCALE * DEGRADED_BODY_RATIO
-"""body_sway 降级：FaceAngleZ 微量近似系数（= 主摆系数 × 1/3）[工程假设]。"""
+"""body_sway 降级：FaceAngleZ 微量近似系数（= 主摆系数 × 降级比）。"""
+
+# ---------------------------------------------------------------------------
+# 去僵硬层（2026-07-31 二轮标定新增）——用户裁定「动作僵硬、不如待机动画俏皮」。
+# 两味药：①拍间衰减（第一拍最重、后拍渐轻，打破节拍器等幅感——手工动画惯例）；
+# ②多轴伴随轨道（真人头动从不单轴：点头带微滚转、摇头带反相侧倾、歪头带低颌、
+# 摇摆走交叉轴 8 字）。均为确定性(无随机)，不破引擎可测性。
+# ---------------------------------------------------------------------------
+
+STROKE_BEAT_DECAY: float = 0.82
+"""stroke 型逐拍幅度衰减比（第 k 拍幅度 × 本系数^k）[2026-07-31 标定新增]。
+⚠ 只作用于 offset 轨道（_shape）；blink 的乘法门轨道**豁免**（gate_at——闭合深度
+逐拍变轻会读作「没闭上」，与词义背离，审查 WARN-1）。"""
+
+NOD_ROLL_SCALE: float = NOD_SCALE * 0.16
+"""nod 伴随：FaceAngleZ 随拍微滚转系数 [2026-07-31 标定新增]。"""
+
+SHAKE_ROLL_SCALE: float = SHAKE_SCALE * 0.32
+"""shake 伴随：FaceAngleZ 反相侧倾系数（钟摆弧线感）[2026-07-31 标定新增]。"""
+
+TILT_DIP_SCALE: float = 0.10
+"""head_tilt 伴随：FaceAngleY 低颌系数（好奇歪头带颌部下沉）[2026-07-31 标定新增]。"""
+
+SWAY_CROSS_SCALE: float = SWAY_HEAD_SCALE * 0.45
+"""body_sway 降级伴随：FaceAngleX 交叉轴反相微摆（8 字轨迹感）[2026-07-31 标定新增]。"""
 
 # ---------------------------------------------------------------------------
 # 波形 / 包络类型 / 方向符号
@@ -231,22 +280,31 @@ def adsr_envelope(t: float, attack_s: float, sustain_s: float, release_s: float)
     return 0.0
 
 
-def half_sine_strokes(u: float, repeat: int) -> float:
+def half_sine_strokes(u: float, repeat: int, decay: float = 1.0) -> float:
     """半周期正弦 stroke：归一化进度 u∈[0,1) 内做 repeat 拍（每拍 0→1→0，同号）。
 
     nod（低头-回位）与 blink 闭合深度共用；u 越界返回 0（端点无残余）。
+    decay：逐拍幅度衰减比（第 k 拍 × decay^k，缺省 1.0 = 等幅；确定性，
+    2026-07-31 去僵硬标定引入，见 STROKE_BEAT_DECAY）。
     """
     if not 0.0 <= u < 1.0:
         return 0.0
     v = u * repeat
-    return math.sin(math.pi * (v - math.floor(v)))
+    beat = math.floor(v)
+    return (decay**beat) * math.sin(math.pi * (v - beat))
 
 
-def full_sine_strokes(u: float, repeat: int) -> float:
-    """整周期正弦 stroke：u∈[0,1) 内做 repeat 拍（每拍一去一回），端点为 0。"""
+def full_sine_strokes(u: float, repeat: int, decay: float = 1.0) -> float:
+    """整周期正弦 stroke：u∈[0,1) 内做 repeat 拍（每拍一去一回），端点为 0。
+
+    decay 语义同 ``half_sine_strokes``（逐拍衰减，每拍相位归零后乘 decay^k，
+    与无衰减时的连续正弦逐点一致——sin(2π(v−k)) ≡ sin(2πv)）。
+    """
     if not 0.0 <= u < 1.0:
         return 0.0
-    return math.sin(2.0 * math.pi * u * repeat)
+    v = u * repeat
+    beat = math.floor(v)
+    return (decay**beat) * math.sin(2.0 * math.pi * (v - beat))
 
 
 def _clamp01(x: float) -> float:
@@ -328,6 +386,8 @@ VOCABULARY: dict[str, BehaviorSpec] = {
         params_schema={"intensity": "点头幅度 0-1", "repeat": "点头次数 1-8"},
         primary=(
             TrackPlan(param="FaceAngleY", waveform=WAVE_HALF_SINE, scale=NOD_SCALE, sign=-1.0),
+            # 伴随微滚转（2026-07-31 去僵硬标定）：随拍同步的小幅 Z 侧倾，破单轴机械感。
+            TrackPlan(param="FaceAngleZ", waveform=WAVE_HALF_SINE, scale=NOD_ROLL_SCALE),
         ),
     ),
     "shake": BehaviorSpec(
@@ -341,7 +401,13 @@ VOCABULARY: dict[str, BehaviorSpec] = {
         default_repeat=2,
         cooldown_s=1.5,
         params_schema={"intensity": "摆头幅度 0-1", "repeat": "往复周期数 1-8（建议 2）"},
-        primary=(TrackPlan(param="FaceAngleX", waveform=WAVE_FULL_SINE, scale=SHAKE_SCALE),),
+        primary=(
+            TrackPlan(param="FaceAngleX", waveform=WAVE_FULL_SINE, scale=SHAKE_SCALE),
+            # 反相侧倾（2026-07-31 去僵硬标定）：头向左摆时向右微倾，钟摆弧线感。
+            TrackPlan(
+                param="FaceAngleZ", waveform=WAVE_FULL_SINE, scale=SHAKE_ROLL_SCALE, sign=-1.0
+            ),
+        ),
     ),
     "head_tilt": BehaviorSpec(
         name="head_tilt",
@@ -362,6 +428,8 @@ VOCABULARY: dict[str, BehaviorSpec] = {
                 scale=HEAD_TILT_SCALE,
                 signed_by_direction=True,
             ),
+            # 低颌伴随（2026-07-31 去僵硬标定）：好奇歪头带颌部微沉，方向无关。
+            TrackPlan(param="FaceAngleY", waveform=WAVE_ADSR, scale=TILT_DIP_SCALE, sign=-1.0),
         ),
     ),
     "glance": BehaviorSpec(
@@ -504,14 +572,18 @@ VOCABULARY: dict[str, BehaviorSpec] = {
     ),
     "eyes_widen": BehaviorSpec(
         name="eyes_widen",
-        definition="震惊：睁大双眼并微微扬眉。",
-        channels=("eyelid", "brows"),
+        definition="震惊：睁大双眼、扬眉并微微仰头后缩。",
+        # ⚠ 仲裁连带（2026-07-31 标定加仰头轨道扩入 head 通道的显式后果）：本词为
+        # reactive 档（最高优先级），现在会抢占任何在播的头部行为（nod/shake/
+        # head_tilt 及 body 三词降级态）——语义上成立（惊吓打断有意动作），
+        # 已由 TestArbitration 显式锁定。
+        channels=("eyelid", "brows", "head"),
         priority=PRIORITY_REACTIVE,
         kind=KIND_HOLD,
         base_duration_ms=800,
         repeat_scales_duration=False,
         cooldown_s=1.5,
-        params_schema={"intensity": "睁眼幅度 0-1"},
+        params_schema={"intensity": "震惊幅度 0-1"},
         primary=(
             TrackPlan(
                 param="EyeOpenLeft",
@@ -536,6 +608,15 @@ VOCABULARY: dict[str, BehaviorSpec] = {
                 waveform=WAVE_ADSR,
                 scale=EYES_WIDEN_BROW_SCALE,
                 angle_scaled=False,
+            ),
+            # 仰头后缩（startle 头部构成，2026-07-31 标定新增）：EyeOpen 分量在
+            # 静息满开的皮套上被 clamp 吃掉（Hiyori_A 读回位移恒 0），无此分量
+            # 该词近乎不可见；方向与 nod 相反（正号 = 抬头）。
+            TrackPlan(
+                param="FaceAngleY",
+                waveform=WAVE_ADSR,
+                scale=EYES_WIDEN_HEAD_SCALE,
+                sign=1.0,
             ),
         ),
     ),
@@ -573,7 +654,7 @@ VOCABULARY: dict[str, BehaviorSpec] = {
         ),
         fallback_channels=("body", "head"),
         degraded_channels=("body",),
-        degraded_note="所连部署缺 BodyAngleY，借 FaceAngleY 微量低头近似（约 1/3 幅度）。",
+        degraded_note="所连部署缺 BodyAngleY，借 FaceAngleY 微量低头近似。",
     ),
     "lean_back": BehaviorSpec(
         name="lean_back",
@@ -608,14 +689,21 @@ VOCABULARY: dict[str, BehaviorSpec] = {
             TrackPlan(param="BodyAngleX", waveform=WAVE_FULL_SINE, scale=SWAY_BODY_X_SCALE),
             TrackPlan(param="BodyAngleZ", waveform=WAVE_FULL_SINE, scale=SWAY_BODY_Z_SCALE),
         ),
-        fallback=(TrackPlan(param="FaceAngleZ", waveform=WAVE_FULL_SINE, scale=SWAY_HEAD_SCALE),),
+        fallback=(
+            TrackPlan(param="FaceAngleZ", waveform=WAVE_FULL_SINE, scale=SWAY_HEAD_SCALE),
+            # 交叉轴反相微摆（2026-07-31 去僵硬标定）：Z 侧倾 + X 反相微偏 → 8 字轨迹感。
+            TrackPlan(
+                param="FaceAngleX", waveform=WAVE_FULL_SINE, scale=SWAY_CROSS_SCALE, sign=-1.0
+            ),
+        ),
         fallback_channels=("body", "head"),
         degraded_channels=("body",),
-        degraded_note="所连部署缺 BodyAngleX/Z，借 FaceAngleZ 微摆近似（约 1/3 幅度）。",
+        degraded_note="所连部署缺 BodyAngleX/Z，借 FaceAngleZ 微摆 + FaceAngleX 交叉微偏近似。",
     ),
 }
 """行为词表 v1（AD-2）：12 词的**唯一真相**——catalog、引擎、测试均以此为准。
-典型时长/冷却/优先级/幅度系数全部 [工程假设，待 Hiyori_A 标定]（蓝图 §2 约定）。"""
+幅度系数/包络形态已经 2026-07-31 Hiyori_A 实机标定（两轮：可见度 + 去僵硬，证据见
+各常量 docstring）；典型时长/冷却/优先级仍为 [工程假设]（蓝图 §2 约定）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +798,9 @@ class ActiveEnvelope:
         for track in self.tracks:
             if track.waveform != WAVE_GATE:
                 continue
+            # gate 轨道**豁免拍间衰减**（审查 WARN-1）：offset 轨道拍间变轻仍读得出
+            # 是动作，闭合深度变轻则直接读作「没闭上」——实测 intensity=0.5 repeat=8
+            # 末拍仅闭 19.9%，与 blink 词义背离。眨眼逐拍等深。
             depth = track.amplitude * half_sine_strokes(u, self.repeat) * fade
             gate *= _clamp01(1.0 - depth)
         return gate
@@ -745,9 +836,9 @@ class ActiveEnvelope:
 
     def _shape(self, waveform: str, t: float, u: float) -> float:
         if waveform == WAVE_HALF_SINE:
-            return half_sine_strokes(u, self.repeat)
+            return half_sine_strokes(u, self.repeat, STROKE_BEAT_DECAY)
         if waveform == WAVE_FULL_SINE:
-            return full_sine_strokes(u, self.repeat)
+            return full_sine_strokes(u, self.repeat, STROKE_BEAT_DECAY)
         return adsr_envelope(t, self.attack_s, self.sustain_s, self.release_s)
 
 

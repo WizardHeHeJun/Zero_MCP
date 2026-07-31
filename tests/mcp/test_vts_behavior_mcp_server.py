@@ -47,6 +47,10 @@ from src.agents.models.vts_behavior import (
     BehaviorRequest,
     BehaviorStatus,
     HotkeyInfo,
+    ParamCatalog,
+    ParamInfo,
+    TrajectoryReceipt,
+    TrajectoryRequest,
     extract_vtsb_code,
 )
 from src.mcp.behavior.service import BehaviorService
@@ -59,11 +63,14 @@ EXPECTED_TOOLS = {
     "behavior_trigger",
     "behavior_interrupt",
     "behavior_status",
+    "params_list",
+    "params_animate",
+    "params_clear",
     "vts_connect",
     "vts_disconnect",
 }
 
-READ_ONLY_TOOLS = {"behavior_list", "behavior_status"}
+READ_ONLY_TOOLS = {"behavior_list", "behavior_status", "params_list"}
 
 # 各工具经 `Tool.run` 调用时的最小合法入参（缺省全走默认值）。
 MINIMAL_ARGS: dict[str, dict[str, Any]] = {
@@ -71,6 +78,9 @@ MINIMAL_ARGS: dict[str, dict[str, Any]] = {
     "behavior_trigger": {"name": "nod"},
     "behavior_interrupt": {},
     "behavior_status": {},
+    "params_list": {},
+    "params_animate": {"keyframes": [{"t_ms": 0, "params": {"FaceAngleX": 0.0}}]},
+    "params_clear": {},
     "vts_connect": {},
     "vts_disconnect": {},
 }
@@ -149,6 +159,17 @@ class FakeBehaviorService:
         self.list_refreshes: list[bool] = []
         self.connect_calls = 0
         self.disconnect_calls = 0
+        self.trajectory_receipt: TrajectoryReceipt = TrajectoryReceipt(
+            status="accepted", duration_ms=500, queue_depth=1
+        )
+        self.param_catalog: ParamCatalog = ParamCatalog(
+            params=[
+                ParamInfo(name="FaceAngleX", min=-30.0, max=30.0, default_value=0.0, governed=True)
+            ],
+            connected=True,
+        )
+        self.animate_requests: list[TrajectoryRequest] = []
+        self.clear_params_calls = 0
 
     def _maybe_raise(self) -> None:
         if self.raise_exc is not None:
@@ -182,6 +203,22 @@ class FakeBehaviorService:
     def status(self) -> BehaviorStatus:
         self._maybe_raise()
         return self.status_model
+
+    # ── 轨迹通道（2026-07-31 二期）──────────────────────────────────────────
+
+    def animate(self, request: TrajectoryRequest) -> TrajectoryReceipt:
+        self._maybe_raise()
+        self.animate_requests.append(request)
+        return self.trajectory_receipt
+
+    def clear_params(self) -> TrajectoryReceipt:
+        self._maybe_raise()
+        self.clear_params_calls += 1
+        return self.trajectory_receipt
+
+    def list_params(self) -> ParamCatalog:
+        self._maybe_raise()
+        return self.param_catalog
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +257,8 @@ def real_unconnected_service(monkeypatch: pytest.MonkeyPatch) -> BehaviorService
 
 
 class TestRegistration:
-    def test_six_tools_registered(self) -> None:
-        """六工具全部注册，无多无少。"""
+    def test_all_tools_registered(self) -> None:
+        """九工具全部注册，无多无少（六行为/连接 + 三轨迹通道，2026-07-31 二期）。"""
         assert set(mcp._tool_manager._tools.keys()) == EXPECTED_TOOLS
 
     def test_read_only_hints(self) -> None:

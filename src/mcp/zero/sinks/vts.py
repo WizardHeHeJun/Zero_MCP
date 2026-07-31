@@ -52,6 +52,7 @@ from src.mcp.zero.expression_sink import HeadPolicy
 
 if TYPE_CHECKING:  # 仅类型标注用——运行时不导入，避免与 behavior_overlay 环导
     from src.mcp.zero.sinks.behavior_overlay import BehaviorOverlayEngine
+    from src.mcp.zero.sinks.trajectory import TrajectoryPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +391,8 @@ class VtsExpressionSink:
         self.api: VtsApiClient | None = None
         self.ranges: dict[str, tuple[float, float, float]] = {}
         self.unavailable_params: list[str] = []
+        self.all_params: dict[str, tuple[float, float, float]] = {}
+        self.trajectory: TrajectoryPlayer | None = None
         # 行为叠加引擎（蓝图 AD-4）：由行为 service 连接后挂上；None=无手势叠加（零回归）
         self.behavior_overlay: BehaviorOverlayEngine | None = None
         self.render_task: asyncio.Task[None] | None = None
@@ -601,6 +604,11 @@ class VtsExpressionSink:
         assert self.api is not None
         data = await self.api.request("InputParameterListRequest")
         listed = [*data.get("defaultParameters", []), *data.get("customParameters", [])]
+        # 全量参数表（轨迹通道的作用空间，2026-07-31 二期）：动作模型可驱动任意
+        # 所连部署实际存在的输入参数，不限于 GOVERNED/OPTIONAL 白名单。
+        self.all_params = {
+            p["name"]: (float(p["min"]), float(p["max"]), float(p["defaultValue"])) for p in listed
+        }
         table = {
             p["name"]: (
                 float(p["min"]),
@@ -681,25 +689,40 @@ class VtsExpressionSink:
                     bf = blink.factor(now, self.arousal)
                     frame["EyeOpenLeft"] *= bf
                     frame["EyeOpenRight"] *= bf
-                if self.behavior_overlay is not None:
+                if self.behavior_overlay is not None or self.trajectory is not None:
                     # 局部防御（AD-4 故障面）：先在副本上合成，成功才替换 frame
-                    # ——引擎异常时整帧丢弃手势叠加（无半应用态），表情注入照常。
+                    # ——引擎/回放器异常时整帧丢弃叠加（无半应用态），表情注入照常。
                     try:
-                        overlay = self.behavior_overlay.apply(now)
                         merged = dict(frame)
-                        for k, delta in overlay.offsets.items():
-                            if k in merged:
-                                merged[k] += delta
-                            elif k in self.ranges:
-                                # 可选参数仅活跃期进 frame，基线取 defaultValue（AD-5）
-                                merged[k] = self.ranges[k][2] + delta
-                        merged["EyeOpenLeft"] *= overlay.eye_gate
-                        merged["EyeOpenRight"] *= overlay.eye_gate
+                        if self.behavior_overlay is not None:
+                            overlay = self.behavior_overlay.apply(now)
+                            for k, delta in overlay.offsets.items():
+                                if k in merged:
+                                    merged[k] += delta
+                                elif k in self.ranges:
+                                    # 可选参数仅活跃期进 frame，基线取 defaultValue（AD-5）
+                                    merged[k] = self.ranges[k][2] + delta
+                            merged["EyeOpenLeft"] *= overlay.eye_gate
+                            merged["EyeOpenRight"] *= overlay.eye_gate
+                        if self.trajectory is not None:
+                            # 轨迹回放（2026-07-31 二期）最后应用=对其参数有最终话语权：
+                            # absolute 按 takeover 强度向目标值混合，offset 加性叠加。
+                            tf = self.trajectory.apply(now)
+                            if tf is not None:
+                                for k, v in tf.values.items():
+                                    table = self.ranges.get(k) or self.all_params.get(k)
+                                    if table is None:
+                                        continue
+                                    base = merged.get(k, table[2])
+                                    if tf.mode == "offset":
+                                        merged[k] = base + v * tf.strength
+                                    else:
+                                        merged[k] = base + (v - base) * tf.strength
                         frame = merged
                     except Exception as exc:
                         if not self.warned_overlay_failure:
                             logger.warning(
-                                "行为叠加引擎异常——丢弃本帧手势叠加（仅告警一次），"
+                                "行为叠加/轨迹回放层异常——丢弃本帧叠加（仅告警一次），"
                                 "表情注入不受影响：%r",
                                 exc,
                             )
@@ -708,10 +731,14 @@ class VtsExpressionSink:
                 for k in GOVERNED_PARAMS:
                     lo, hi, _ = self.ranges[k]
                     vals.append({"id": k, "value": _clamp(lo, hi, frame[k])})
-                for k in OPTIONAL_OVERLAY_PARAMS:
-                    if k in frame:
-                        lo, hi, _ = self.ranges[k]
-                        vals.append({"id": k, "value": _clamp(lo, hi, frame[k])})
+                for k in frame:
+                    if k in GOVERNED_PARAMS:
+                        continue
+                    table = self.ranges.get(k) or self.all_params.get(k)
+                    if table is None:
+                        continue
+                    lo, hi, _ = table
+                    vals.append({"id": k, "value": _clamp(lo, hi, frame[k])})
                 await self.api.request(
                     "InjectParameterDataRequest",
                     {"faceFound": True, "mode": "set", "parameterValues": vals},

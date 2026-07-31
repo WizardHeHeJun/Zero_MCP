@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from src.agents.models.vts_behavior import (
@@ -32,17 +34,20 @@ from src.agents.models.vts_behavior import (
 )
 from src.mcp.zero.sinks.behavior_overlay import (
     ATTACK_FRACTION,
+    BLINK_DEPTH_SCALE,
     CROSSFADE_S,
     DEGRADED_BODY_RATIO,
     GLANCE_EYE_SCALE,
     GLANCE_HEAD_SCALE,
     GLOBAL_THROTTLE_S,
+    HEAD_TILT_SCALE,
     LEAN_BODY_SCALE,
     LEAN_HEAD_SCALE,
     NOD_SCALE,
     RELEASE_FRACTION,
     SHAKE_SCALE,
     SMILE_SCALE,
+    STROKE_BEAT_DECAY,
     BehaviorOverlayEngine,
     Ranges,
     adsr_envelope,
@@ -154,7 +159,7 @@ class TestEnvelopeHold:
 
     def test_head_tilt_direction_flips_sign(self) -> None:
         """direction 决定 FaceAngleZ 偏移符号（left=负、right=正，角度参数乘半量程）。"""
-        peak = 0.30 * _half(FULL_RANGES, "FaceAngleZ")  # HEAD_TILT_SCALE × 半量程
+        peak = HEAD_TILT_SCALE * _half(FULL_RANGES, "FaceAngleZ")
         engine = BehaviorOverlayEngine()
         _trigger(engine, "head_tilt", 0.0, intensity=1.0)  # 缺省 direction=left
         assert engine.apply(1.0).offsets["FaceAngleZ"] == pytest.approx(-peak)
@@ -170,7 +175,8 @@ class TestEnvelopeHold:
 
 class TestEnvelopeStroke:
     def test_nod_repeat_beats_peak_same_sign(self) -> None:
-        """nod repeat=2：半周期正弦每拍 0→峰→0 同号（低头），峰值在每拍中点。"""
+        """nod repeat=2：半周期正弦每拍 0→峰→0 同号（低头），峰值在每拍中点；
+        拍间幅度按 STROKE_BEAT_DECAY 逐拍衰减（2026-07-31 去僵硬标定）。"""
         peak = NOD_SCALE * _half(FULL_RANGES, "FaceAngleY")
         engine = BehaviorOverlayEngine()
         receipt = _trigger(engine, "nod", 0.0, intensity=1.0, repeat=2)
@@ -180,8 +186,8 @@ class TestEnvelopeStroke:
         # 两拍交界 u=0.5 → 回位过零，但键不消失（防 sink 停发/复发抖动）
         boundary = engine.apply(0.70).offsets
         assert boundary["FaceAngleY"] == pytest.approx(0.0, abs=1e-9)
-        # 第二拍中点 u=0.75 → 再次同号满幅（半周期正弦不变号）
-        assert engine.apply(1.05).offsets["FaceAngleY"] == pytest.approx(-peak)
+        # 第二拍中点 u=0.75 → 同号但幅度衰减一拍（半周期正弦不变号）
+        assert engine.apply(1.05).offsets["FaceAngleY"] == pytest.approx(-peak * STROKE_BEAT_DECAY)
         # 总长到期键消失
         assert engine.apply(1.40).offsets == {}
 
@@ -230,10 +236,23 @@ class TestArbitration:
         mid = engine.apply(0.35).offsets
         assert mid["FaceAngleY"] != 0.0  # 旧包络（nod）仍在场
         assert mid["FaceAngleZ"] != 0.0  # 新包络（head_tilt）已入场
-        # 淡出窗口结束后旧包络剪除，只剩新包络
+        # 淡出窗口结束后旧包络剪除，只剩新包络（head_tilt 自带 FaceAngleY 低颌
+        # 伴随轨道——2026-07-31 标定新增——故不能再用「FaceAngleY 键消失」判旧包络
+        # 剪除，改按活跃包络名单断言）
         after = engine.apply(0.3 + CROSSFADE_S + 0.01).offsets
-        assert "FaceAngleY" not in after
+        assert [env.name for env in engine.envelopes] == ["head_tilt"]
         assert "FaceAngleZ" in after
+
+    def test_eyes_widen_preempts_head_channel_behavior(self) -> None:
+        """eyes_widen 扩入 head 通道的仲裁连带（2026-07-31 标定新增仰头轨道，
+        审查 WARN-2 显式化）：reactive 档现在会抢占在播的 deliberate 头部行为
+        ——惊吓打断有意动作，语义成立，此处显式锁定。"""
+        engine = BehaviorOverlayEngine()
+        _trigger(engine, "nod", 0.0, intensity=1.0)
+        # 0.3s：已过 250ms 全局节流窗、nod（700ms）仍在播
+        receipt = _trigger(engine, "eyes_widen", 0.3)
+        assert receipt.status == "replaced"
+        assert receipt.detail is not None and "nod" in receipt.detail
 
     def test_higher_priority_replaces_lower(self) -> None:
         engine = BehaviorOverlayEngine()
@@ -399,23 +418,41 @@ class TestDegradation:
 
 class TestEyeGate:
     def test_blink_gate_closes_and_reopens(self) -> None:
-        """blink：门值 1→0→1 半周期正弦包络；gate 轨道不进 offsets。"""
+        """blink：门值 1→0→1 半周期正弦包络；gate 轨道不进 offsets。
+
+        BLINK_DEPTH_SCALE 过驱动（>1，2026-07-31 标定）下满强度在拍中段饱和为
+        平底全闭（clamp 到 0），未饱和段仍应精确跟随 1 − depth·sin(πu)。
+        """
         engine = BehaviorOverlayEngine()
         receipt = _trigger(engine, "blink", 0.0, intensity=1.0, repeat=1)  # 220ms 一拍
         assert receipt.status == "accepted"
         assert receipt.channels == ["eyelid"]
         assert engine.apply(0.0).eye_gate == pytest.approx(1.0)  # 起点未闭合
-        quarter = engine.apply(0.055)  # u=0.25：闭合深度 sin(π/4)
-        assert quarter.eye_gate == pytest.approx(1.0 - 0.5**0.5)
-        assert quarter.offsets == {}  # 乘法门不走加性偏移
+        early = engine.apply(0.022)  # u=0.1：未饱和段，形状可判
+        assert early.eye_gate == pytest.approx(1.0 - BLINK_DEPTH_SCALE * math.sin(0.1 * math.pi))
+        assert early.offsets == {}  # 乘法门不走加性偏移
+        assert engine.apply(0.055).eye_gate == pytest.approx(0.0)  # u=0.25 已饱和(过驱动)
         assert engine.apply(0.11).eye_gate == pytest.approx(0.0)  # u=0.5 全闭
         assert engine.apply(0.22).eye_gate == pytest.approx(1.0)  # 包络结束，门回中性
 
     def test_blink_depth_scales_with_intensity(self) -> None:
-        """intensity 即闭合深度：0.4 → 最深处门值 0.6（不全闭）。"""
+        """intensity 缩放闭合深度：0.4 → 最深处门值 1 − 0.4×BLINK_DEPTH_SCALE（不全闭）。"""
         engine = BehaviorOverlayEngine()
         _trigger(engine, "blink", 0.0, intensity=0.4, repeat=1)
-        assert engine.apply(0.11).eye_gate == pytest.approx(0.6)
+        assert engine.apply(0.11).eye_gate == pytest.approx(1.0 - 0.4 * BLINK_DEPTH_SCALE)
+
+    def test_blink_repeat_beats_equal_depth_no_decay(self) -> None:
+        """gate 轨道豁免拍间衰减（审查 WARN-1 判别性回归）。
+
+        非饱和强度多拍：每拍最深门值必须相等——若 gate 误用 STROKE_BEAT_DECAY，
+        第二拍闭合深度衰减（0.5×1.6×0.82 → 门值 0.344 ≠ 0.2），眨眼读作「没闭上」。
+        """
+        engine = BehaviorOverlayEngine()
+        _trigger(engine, "blink", 0.0, intensity=0.5, repeat=2)
+        first = engine.apply(0.11).eye_gate  # 第一拍最深：1 − 0.5×BLINK_DEPTH_SCALE
+        second = engine.apply(0.33).eye_gate  # 第二拍最深
+        assert first == pytest.approx(1.0 - 0.5 * BLINK_DEPTH_SCALE)
+        assert second == pytest.approx(first)
 
     def test_blink_repeat_closes_per_beat(self) -> None:
         engine = BehaviorOverlayEngine()
