@@ -31,6 +31,8 @@ from src.agents.models.vts_behavior import (
     VTSB_INVALID_PARAMS,
     VTSB_VTS_ERROR,
     BehaviorRequest,
+    TrajectoryKeyframe,
+    TrajectoryRequest,
 )
 
 if TYPE_CHECKING:  # 仅类型标注用——运行时经 _get_service() 延迟 import
@@ -236,6 +238,103 @@ async def behavior_status() -> str:
     except Exception as exc:
         logger.error("behavior_status 失败：%s", exc, exc_info=True)
         raise ToolError(f"{VTSB_VTS_ERROR} behavior_status 执行失败：{exc}") from exc
+
+
+# ── 裸参数轨迹工具（2026-07-31 二期：Zero 侧动作模型直驱） ────────────────────
+
+
+@mcp.tool(
+    name="params_list",
+    description=(
+        "获取所连 VTS 部署的全量输入参数表（ParamCatalog JSON：name/min/max/"
+        "default_value/governed）——动作模型的作用空间。governed=true 的参数由表情"
+        "通路恒定注入（轨迹接管时按强度混合），其余参数按需注入、停喂 1s 后 VTS "
+        "自动收回。未连接时 params=null。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def params_list() -> str:
+    """列出全量输入参数量程表。
+
+    Returns:
+        ParamCatalog 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        return _dump_model(service.list_params())
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("params_list 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} params_list 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="params_animate",
+    description=(
+        "投喂一段参数关键帧轨迹（动作模型输出），渲染循环按时间轴插值回放注入 VTS。"
+        "keyframes=[{t_ms, params:{参数名:值}}]（t_ms 严格升序、同段键集一致、"
+        "单段≤10s）；mode='absolute'（按值接管，渐入渐出无跳变）或 'offset'（在表情"
+        "基线上加性叠加）；append=true 排队无缝续接（流式投喂），false 清队即刻接管。"
+        "返回 TrajectoryReceipt JSON：rejected 为正常业务拒绝（code 带 [vtsb:*]，"
+        "queue_depth 供背压退避），非错误。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def params_animate(
+    keyframes: list[TrajectoryKeyframe],
+    mode: str = "absolute",
+    append: bool = True,
+) -> str:
+    """投喂轨迹段。
+
+    Args:
+        keyframes: 关键帧列表（t_ms 相对段起点，params 为该时刻各参数值）。
+        mode: absolute（接管）| offset（叠加）。
+        append: True=队尾续接；False=清队即刻接管。
+
+    Returns:
+        TrajectoryReceipt 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        request = TrajectoryRequest(keyframes=keyframes, mode=mode, append=append)
+    except ValidationError as exc:
+        raise ToolError(f"{VTSB_INVALID_PARAMS} 轨迹参数不合法：{exc}") from exc
+    try:
+        return _dump_model(service.animate(request))
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("params_animate 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} params_animate 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="params_clear",
+    description=(
+        "清除轨迹队列并交还参数控制权（幂等；250ms 缓出无跳变，非 governed 参数"
+        "停喂 1s 后由 VTS 收回）。返回 TrajectoryReceipt JSON。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def params_clear() -> str:
+    """清除轨迹并交还参数。
+
+    Returns:
+        TrajectoryReceipt 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        return _dump_model(service.clear_params())
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("params_clear 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} params_clear 执行失败：{exc}") from exc
 
 
 # ── 连接管理工具 ──────────────────────────────────────────────────────────────

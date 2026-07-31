@@ -289,3 +289,131 @@ class BehaviorStatus(BaseModel):
     unavailable_params: list[str] = Field(default_factory=list)
     hotkey_count: int | None = None
     model_id: str | None = None
+    trajectory_active: bool = False
+    trajectory_remaining_ms: int = 0
+
+
+# ---------------------------------------------------------------------------
+# 裸参数轨迹通道（2026-07-31 二期）——Zero 侧动作模型 → 参数级直驱
+# ---------------------------------------------------------------------------
+
+TRAJECTORY_MODES: frozenset[str] = frozenset({"absolute", "offset"})
+"""轨迹回放模式：absolute=按值接管（takeover 强度渐变，无跳变）；
+offset=在表情/微表情基线上加性叠加。"""
+
+TRAJECTORY_MAX_SEGMENT_MS: int = 10_000
+"""单段轨迹时长上限（防单次投喂长期霸占参数；流式续接用 append 分块）。"""
+
+TRAJECTORY_MAX_KEYFRAMES: int = 600
+"""单段关键帧数上限（20Hz × 10s + 裕量；防超大 payload）。"""
+
+TRAJECTORY_MAX_QUEUE: int = 5
+"""轨迹段队列限深——满时新段回 rejected `[vtsb:throttled]`（背压：按回执退避重发）。"""
+
+
+class TrajectoryKeyframe(BaseModel):
+    """轨迹单关键帧：``t_ms`` 为相对段起点的毫秒时刻，``params`` 为该时刻各参数值。
+
+    同一段内**所有关键帧的参数键集必须一致**（动作模型输出天然是稠密统一帧；
+    键集不一致在执行侧回 rejected + `VTSB_INVALID_PARAMS`，不做隐式补值猜测）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    t_ms: int
+    params: dict[str, float]
+
+    @model_validator(mode="after")
+    def _validate(self) -> TrajectoryKeyframe:
+        if self.t_ms < 0:
+            raise ValueError(f"t_ms={self.t_ms} 不得为负")
+        if not self.params:
+            raise ValueError("params 不得为空")
+        for name, value in self.params.items():
+            if not math.isfinite(value):
+                raise ValueError(f"params[{name!r}]={value} 必须为有限值（NaN/inf 拒收）")
+        return self
+
+
+class TrajectoryRequest(BaseModel):
+    """轨迹投喂请求（Zero 侧动作模型 → MCP，`params_animate` 工具输入）。
+
+    - keyframes: 按 ``t_ms`` 严格升序；帧间线性插值（动作模型输出稠密帧，
+      插值形态不做花活）；首帧建议 t_ms=0。
+    - mode: 见 ``TRAJECTORY_MODES``（str 不 Literal——同 BehaviorRequest.name 的
+      演进理由；未知模式执行侧回 rejected）。
+    - append: True=排到当前队列末尾无缝续接（流式投喂形态）；False=清队即刻
+      接管（旧轨迹淡出）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    keyframes: list[TrajectoryKeyframe]
+    mode: str = "absolute"
+    append: bool = True
+
+    @model_validator(mode="after")
+    def _validate(self) -> TrajectoryRequest:
+        if not self.keyframes:
+            raise ValueError("keyframes 不得为空")
+        if len(self.keyframes) > TRAJECTORY_MAX_KEYFRAMES:
+            raise ValueError(
+                f"keyframes 数 {len(self.keyframes)} 超上限 {TRAJECTORY_MAX_KEYFRAMES}"
+            )
+        times = [kf.t_ms for kf in self.keyframes]
+        if any(b <= a for a, b in zip(times, times[1:], strict=False)):
+            raise ValueError("keyframes 的 t_ms 必须严格升序")
+        if times[-1] > TRAJECTORY_MAX_SEGMENT_MS:
+            raise ValueError(f"单段时长 {times[-1]}ms 超上限 {TRAJECTORY_MAX_SEGMENT_MS}ms")
+        return self
+
+
+class TrajectoryReceipt(BaseModel):
+    """轨迹投喂/清除回执。三态语义同 BehaviorReceipt（AD-6/AD-11）：
+    业务性拒绝（未知模式/键集不一致/未知参数占比过高/队列满）进 ``code``，
+    协议性失败（未连接等）才抛 ToolError。
+
+    - dropped_params: 所连部署不存在、已被静默丢弃的参数名（其余照常回放）；
+      **全部参数都不存在**才整段 rejected。
+    - queue_depth: 回执后的队列深度（含当前播放段），供投喂方做背压。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    duration_ms: int = 0
+    dropped_params: list[str] = Field(default_factory=list)
+    queue_depth: int = 0
+    code: str | None = None
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> TrajectoryReceipt:
+        if self.status not in RECEIPT_STATUSES:
+            raise ValueError(f"status {self.status!r} 不在 {sorted(RECEIPT_STATUSES)} 内")
+        return self
+
+
+class ParamInfo(BaseModel):
+    """单个 VTS 输入参数的量程信息（`params_list` 输出——动作模型的作用空间）。
+
+    - governed: 是否属于表情通路恒定注入的 GOVERNED_PARAMS（轨迹接管这些参数时
+      与表情通路按 takeover 强度混合；非 governed 参数按需注入、停喂 1s 后 VTS 回收）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    min: float
+    max: float
+    default_value: float
+    governed: bool = False
+
+
+class ParamCatalog(BaseModel):
+    """`params_list` 输出：所连 VTS 部署的全量输入参数表。未连接时 params=None。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    params: list[ParamInfo] | None = None
+    connected: bool = False

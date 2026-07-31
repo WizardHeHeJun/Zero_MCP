@@ -64,6 +64,10 @@ from src.agents.models.vts_behavior import (
     BehaviorRequest,
     BehaviorStatus,
     HotkeyInfo,
+    ParamCatalog,
+    ParamInfo,
+    TrajectoryReceipt,
+    TrajectoryRequest,
 )
 from src.mcp.zero.sinks.behavior_overlay import (
     VOCABULARY,
@@ -72,7 +76,9 @@ from src.mcp.zero.sinks.behavior_overlay import (
     Ranges,
     resolve_degradation,
 )
+from src.mcp.zero.sinks.trajectory import TrajectoryPlayer
 from src.mcp.zero.sinks.vts import (
+    GOVERNED_PARAMS,
     VtsApiError,
     VtsExpressionSink,
     bool_env,
@@ -221,6 +227,7 @@ class BehaviorService:
     def __init__(self, sink: VtsExpressionSink | None = None) -> None:
         self.sink = sink
         self.engine = BehaviorOverlayEngine()
+        self.trajectory_player = TrajectoryPlayer()
         self.connected = False
         self.hotkeys: list[HotkeyInfo] | None = None
         self.hotkey_cooldown_until: dict[str, float] = {}
@@ -262,6 +269,7 @@ class BehaviorService:
             if self.sink is None:
                 self.sink = VtsExpressionSink(**kwargs_from_env())
             self.sink.behavior_overlay = self.engine
+            self.sink.trajectory = self.trajectory_player
             if not self.sink.running:
                 await self.sink.__aenter__()
             self.connected = True
@@ -319,6 +327,51 @@ class BehaviorService:
         self._require_connected()
         return self.engine.interrupt(channel, now=time.monotonic())
 
+    # ── 裸参数轨迹通道（2026-07-31 二期：Zero 侧动作模型直驱） ────────────────
+
+    def animate(self, request: TrajectoryRequest) -> TrajectoryReceipt:
+        """轨迹投喂：动作模型输出的关键帧段进回放队列（纯状态操作，无 I/O）。
+
+        业务性拒绝（未知 mode/键集不一致/参数全缺席/队列满）进回执 ``code``；
+        未连接/循环故障走 ``_require_connected`` 抛 ToolError（AD-11 分界不变）。
+        """
+        sink = self._require_connected()
+        known = frozenset(sink.ranges) | frozenset(sink.all_params)
+        result = self.trajectory_player.feed(
+            [(kf.t_ms / 1000.0, kf.params) for kf in request.keyframes],
+            mode=request.mode,
+            append=request.append,
+            now=time.monotonic(),
+            known_params=known,
+        )
+        status = "accepted" if result.ok else "rejected"
+        return TrajectoryReceipt(
+            status=status,
+            duration_ms=result.duration_ms,
+            dropped_params=result.dropped_params,
+            queue_depth=result.queue_depth,
+            code=result.code,
+            detail=result.detail,
+        )
+
+    def clear_params(self) -> TrajectoryReceipt:
+        """清除轨迹队列并交还参数控制权（幂等；250ms 缓出无跳变）。"""
+        self._require_connected()
+        self.trajectory_player.clear(time.monotonic())
+        return TrajectoryReceipt(status="accepted", detail="轨迹已清除，参数交还中（缓出）。")
+
+    def list_params(self) -> ParamCatalog:
+        """所连 VTS 部署的全量输入参数表（动作模型的作用空间）；未连接时 params=None。"""
+        sink = self.sink
+        if not self.connected or sink is None or not sink.all_params:
+            return ParamCatalog(params=None, connected=False)
+        governed = set(GOVERNED_PARAMS)
+        params = [
+            ParamInfo(name=name, min=lo, max=hi, default_value=dv, governed=name in governed)
+            for name, (lo, hi, dv) in sorted(sink.all_params.items())
+        ]
+        return ParamCatalog(params=params, connected=True)
+
     # ── 清单 / 状态（AD-7 / §5） ─────────────────────────────────────────────
 
     async def list_catalog(self, refresh: bool = False) -> BehaviorCatalog:
@@ -367,6 +420,7 @@ class BehaviorService:
             if sink.last_error is not None:
                 last_error = repr(sink.last_error)
             unavailable = list(sink.unavailable_params)
+        traj_active, traj_remaining = self.trajectory_player.snapshot(now)
         return BehaviorStatus(
             connected=connected,
             healthy=healthy,
@@ -376,6 +430,8 @@ class BehaviorService:
             unavailable_params=unavailable,
             hotkey_count=len(self.hotkeys) if self.hotkeys is not None else None,
             model_id=self.model_id,
+            trajectory_active=traj_active,
+            trajectory_remaining_ms=traj_remaining,
         )
 
     # ── 内部 ─────────────────────────────────────────────────────────────────
