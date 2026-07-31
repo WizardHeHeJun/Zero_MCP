@@ -483,3 +483,66 @@ class TestLifecycle:
         assert len(token_reqs) == 1  # 失效后自动重走一次弹窗授权
         assert auth_reqs[1]["data"]["authenticationToken"] == "fake-token-123"
         assert token_file.read_text(encoding="utf-8") == "fake-token-123"  # 缓存已刷新
+
+
+# ---------------------------------------------------------------------------
+# 8. VtsApiClient 并发串行化（蓝图 AD-10 请求锁）
+# ---------------------------------------------------------------------------
+
+
+class TestVtsApiClientConcurrency:
+    """两协程并发 request 各自拿到匹配响应、无超时（AD-10）。
+
+    无锁时的失败形态：两协程同时 ``ws.recv()``，先醒者消费并永久丢弃
+    （``continue`` 分支）对方的响应，使对方超时。本用例判别力已按
+    「先证能红」纪律实证：临时把 ``request`` 的 ``async with self.lock``
+    换成每次新建的一次性锁（等效去锁）后，本用例以 TimeoutError 稳定变红。
+    """
+
+    async def test_concurrent_requests_each_get_matching_response(self) -> None:
+        import asyncio
+
+        ws = FakeWs()
+        client = VtsApiClient(ws, timeout=1.0)  # 短超时：判别失败时 fail-fast
+
+        def _response_for(req: dict[str, Any]) -> dict[str, Any]:
+            mt = req["messageType"]
+            return {
+                "requestID": req["requestID"],
+                "messageType": f"{mt.removesuffix('Request')}Response",
+                "data": {"echo": mt},
+            }
+
+        async def respond_adversarially() -> None:
+            # 对抗式应答：尽量等到两个请求同时在场，再按**逆序**投递响应。
+            # 有锁（串行化）时任意时刻至多一个请求在场，逆序退化为顺序，
+            # 客户端各取所需；无锁时两请求同时在场，先醒的协程会先撞上
+            # 对方的响应并丢弃，暴露撕响应。
+            answered = 0
+            while answered < 2:
+                for _ in range(200):  # 让出调度，给第二个请求入场窗口
+                    if len(ws.sent) - answered >= 2:
+                        break
+                    await asyncio.sleep(0)
+                pending = ws.sent[answered:]
+                if not pending:
+                    await asyncio.sleep(0)
+                    continue
+                for req in reversed(pending):
+                    ws.to_recv.append(_response_for(req))
+                answered += len(pending)
+
+        responder = asyncio.ensure_future(respond_adversarially())
+        try:
+            first, second = await asyncio.gather(
+                client.request("APIStateRequest"),
+                client.request("StatisticsRequest"),
+            )
+        finally:
+            responder.cancel()
+            try:
+                await responder
+            except asyncio.CancelledError:
+                pass
+        assert first == {"echo": "APIStateRequest"}
+        assert second == {"echo": "StatisticsRequest"}

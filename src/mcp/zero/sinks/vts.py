@@ -45,10 +45,13 @@ import random
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.agents.models.zero_affect import ExpressionBundle, ExpressionHead
 from src.mcp.zero.expression_sink import HeadPolicy
+
+if TYPE_CHECKING:  # 仅类型标注用——运行时不导入，避免与 behavior_overlay 环导
+    from src.mcp.zero.sinks.behavior_overlay import BehaviorOverlayEngine
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,20 @@ GOVERNED_PARAMS: tuple[str, ...] = (
     "FaceAngleZ",
 )
 """本 sink 治理的 VTS 默认输入参数白名单——每帧全量注入（缺 AU 回语义静息）。"""
+
+OPTIONAL_OVERLAY_PARAMS: tuple[str, ...] = (
+    "BodyAngleX",
+    "BodyAngleY",
+    "BodyAngleZ",
+    "EyeLeftX",
+    "EyeLeftY",
+    "EyeRightX",
+    "EyeRightY",
+)
+"""行为叠加层（蓝图 AD-5）的可选注入参数——**只收不 raise**：连接时在场的并入
+``ranges``，缺席的记入 ``unavailable_params``（对应离散行为降级，如 body→head）。
+不进 ``GOVERNED_PARAMS``（其"缺参即 raise"语义被现有测试锁定）；仅在对应行为
+活跃期按需注入，release 收束到 0 后停发，借 VTS 1s lost 回收机制自然交还控制权。"""
 
 LEAK_PARAMS: frozenset[str] = frozenset(
     {"Brows", "BrowLeftY", "BrowRightY", "EyeOpenLeft", "EyeOpenRight"}
@@ -238,6 +255,7 @@ class VtsApiClient:
     def __init__(self, ws: Any, timeout: float = REQUEST_TIMEOUT_S) -> None:
         self.ws = ws
         self.timeout = timeout
+        self.lock = asyncio.Lock()
 
     async def request(
         self,
@@ -252,6 +270,11 @@ class VtsApiClient:
         ``REQUEST_TIMEOUT_S``）抛 ``TimeoutError``——VTS 卡死但连接未断时
         fail-fast，由调用方按连接层故障处置。``timeout=None`` 显式传入表示
         无限等待（仅授权弹窗场景）。
+
+        收发全程持 ``self.lock`` 串行化（蓝图 AD-10）：渲染循环与热键触发/枚举
+        共用本 client，并发调用时两个协程同时 ``ws.recv()`` 会撕响应——一方消费
+        并永久丢弃（``continue`` 分支）另一方的帧使其超时（websockets 库亦禁止
+        并发 recv）。锁放 client 内而非调用方约定，防未来第三个调用方再踩。
         """
         req_id = uuid.uuid4().hex[:16]
         payload: dict[str, Any] = {
@@ -264,19 +287,58 @@ class VtsApiClient:
             payload["data"] = data
 
         async def _roundtrip() -> dict[str, Any]:
-            await self.ws.send(json.dumps(payload))
-            while True:
-                resp = json.loads(await self.ws.recv())
-                if resp.get("requestID") != req_id:
-                    continue
-                if resp.get("messageType") == "APIError":
-                    raise VtsApiError(f"{message_type} -> APIError: {resp.get('data')}")
-                return resp.get("data", {})
+            async with self.lock:
+                await self.ws.send(json.dumps(payload))
+                while True:
+                    resp = json.loads(await self.ws.recv())
+                    if resp.get("requestID") != req_id:
+                        continue
+                    if resp.get("messageType") == "APIError":
+                        raise VtsApiError(f"{message_type} -> APIError: {resp.get('data')}")
+                    return resp.get("data", {})
 
         wait = self.timeout if timeout is _UNSET else timeout
         if wait is None:
             return await _roundtrip()
         return await asyncio.wait_for(_roundtrip(), timeout=wait)
+
+
+def bool_env(key: str, default: str) -> bool:
+    """读布尔型 env（真值集 {"1", "true", "yes"}，与仓内先例一致）。
+
+    公开（无下划线前缀，INFO1 修订）：本仓多处跨模块复用（`from_env`、行为层
+    ``src/mcp/behavior/service.py`` 的 ``VTS_BEHAVIOR_HOTKEYS`` 门控），
+    前导下划线曾暗示"仅本模块私有"，与实际被跨模块 import 的事实不符。
+    """
+    return os.environ.get(key, default).lower() in {"1", "true", "yes"}
+
+
+def kwargs_from_env() -> dict[str, Any]:
+    """从 ``VTS_*`` env 组装 ``VtsExpressionSink`` 构造 kwargs（不含开关门控）。
+
+    公开（无下划线前缀，INFO1 修订，理由同 ``bool_env``）：供 ``from_env``
+    （``VTS_SINK_ENABLED`` 门）与行为层 service
+    （``VTS_BEHAVIOR_ENABLED`` 门，蓝图 AD-9）共用同一套连接/模型/表现力配置。
+
+    Raises:
+        ValueError: ``VTS_SINK_EXPRESSIVENESS`` 配了非数值（fail-fast，
+            错误信息带 env 键名）。
+    """
+    raw_gain = os.environ.get("VTS_SINK_EXPRESSIVENESS", "1.0")
+    try:
+        gain = float(raw_gain)
+    except ValueError as exc:
+        raise ValueError(f"VTS_SINK_EXPRESSIVENESS={raw_gain!r} 不是合法数值") from exc
+    token_file = os.environ.get("VTS_TOKEN_FILE", ".vts_token")
+    model = os.environ.get("VTS_SINK_MODEL", "").strip() or None
+    return {
+        "url": os.environ.get("VTS_API_URL", "ws://127.0.0.1:8001"),
+        "token_path": Path(token_file) if token_file else None,
+        "model_name": model,
+        "expressiveness": gain,
+        "apply_intensity": bool_env("VTS_SINK_APPLY_INTENSITY", "true"),
+        "ambient_motion": bool_env("VTS_SINK_AMBIENT_MOTION", "true"),
+    }
 
 
 class VtsExpressionSink:
@@ -327,10 +389,14 @@ class VtsExpressionSink:
         self.ws: Any = None
         self.api: VtsApiClient | None = None
         self.ranges: dict[str, tuple[float, float, float]] = {}
+        self.unavailable_params: list[str] = []
+        # 行为叠加引擎（蓝图 AD-4）：由行为 service 连接后挂上；None=无手势叠加（零回归）
+        self.behavior_overlay: BehaviorOverlayEngine | None = None
         self.render_task: asyncio.Task[None] | None = None
         self.running = False
         self.last_error: BaseException | None = None
         self.warned_not_connected = False
+        self.warned_overlay_failure = False
         # render() 与渲染循环间的共享目标状态
         self.target: dict[str, float] = {}
         self.leak: dict[str, float] = {}
@@ -352,37 +418,22 @@ class VtsExpressionSink:
     def from_env(cls) -> VtsExpressionSink | None:
         """按 .env 构造；``VTS_SINK_ENABLED`` 非真值（默认）返回 None——零回归。
 
+        kwargs 组装在模块级 ``kwargs_from_env``（与行为层 service 共用）。
+
         Raises:
             ValueError: ``VTS_SINK_EXPRESSIVENESS`` 配了非数值（fail-fast，
                 错误信息带 env 键名）。
         """
-
-        def _bool(key: str, default: str) -> bool:
-            return os.environ.get(key, default).lower() in {"1", "true", "yes"}
-
-        if not _bool("VTS_SINK_ENABLED", "false"):
+        if not bool_env("VTS_SINK_ENABLED", "false"):
             return None
-        raw_gain = os.environ.get("VTS_SINK_EXPRESSIVENESS", "1.0")
-        try:
-            gain = float(raw_gain)
-        except ValueError as exc:
-            raise ValueError(f"VTS_SINK_EXPRESSIVENESS={raw_gain!r} 不是合法数值") from exc
-        token_file = os.environ.get("VTS_TOKEN_FILE", ".vts_token")
-        model = os.environ.get("VTS_SINK_MODEL", "").strip() or None
-        return cls(
-            url=os.environ.get("VTS_API_URL", "ws://127.0.0.1:8001"),
-            token_path=Path(token_file) if token_file else None,
-            model_name=model,
-            expressiveness=gain,
-            apply_intensity=_bool("VTS_SINK_APPLY_INTENSITY", "true"),
-            ambient_motion=_bool("VTS_SINK_AMBIENT_MOTION", "true"),
-        )
+        return cls(**kwargs_from_env())
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
     async def __aenter__(self) -> VtsExpressionSink:
         self.last_error = None
         self.warned_not_connected = False
+        self.warned_overlay_failure = False
         self.ws = await _connect(self.url)
         try:
             self.api = VtsApiClient(self.ws)
@@ -536,8 +587,20 @@ class VtsExpressionSink:
         await asyncio.sleep(3.0)  # 官方 2s 全局冷却 + 加载动画余量
 
     async def _read_ranges(self) -> None:
+        """读回参数值域表：``GOVERNED_PARAMS`` 缺参即 raise（现有语义不变）；
+        ``OPTIONAL_OVERLAY_PARAMS`` 只收不 raise（蓝图 AD-5）——官方对 custom
+        参数所在数组未明示，``defaultParameters`` 与 ``customParameters`` 两个
+        数组都查（防御性兼顾）；缺席的记 ``unavailable_params``。
+
+        缺可选参数的告警级别按 ``self.behavior_overlay`` 是否已挂载分级
+        （INFO2 修订）：已挂（行为层用户，经 ``BehaviorService.connect()`` 在
+        ``__aenter__`` **之前**挂上——见其 docstring）时该信息与降级执行直接
+        相关，保持 WARNING；未挂（纯表情通路用户，未启用行为层）时是无关
+        噪音，降为 DEBUG 且措辞中性化（不预设读者已知道"行为层"概念）。
+        """
         assert self.api is not None
         data = await self.api.request("InputParameterListRequest")
+        listed = [*data.get("defaultParameters", []), *data.get("customParameters", [])]
         table = {
             p["name"]: (
                 float(p["min"]),
@@ -550,6 +613,29 @@ class VtsExpressionSink:
         missing = [g for g in GOVERNED_PARAMS if g not in table]
         if missing:
             raise VtsApiError(f"所连 VTS 部署缺输入参数：{missing}")
+        optional = {
+            p["name"]: (
+                float(p["min"]),
+                float(p["max"]),
+                float(p["defaultValue"]),
+            )
+            for p in listed
+            if p["name"] in OPTIONAL_OVERLAY_PARAMS
+        }
+        self.unavailable_params = [p for p in OPTIONAL_OVERLAY_PARAMS if p not in optional]
+        if self.unavailable_params:
+            if self.behavior_overlay is not None:
+                logger.warning(
+                    "所连 VTS 部署缺可选叠加参数 %s——对应离散行为将降级执行"
+                    "（如 body→head 微量近似，见蓝图 AD-5）。",
+                    self.unavailable_params,
+                )
+            else:
+                logger.debug(
+                    "所连 VTS 部署缺可选参数 %s（当前未启用，不影响表情渲染）。",
+                    self.unavailable_params,
+                )
+        table.update(optional)
         self.ranges = table
 
     async def _render_loop(self) -> None:
@@ -558,6 +644,14 @@ class VtsExpressionSink:
         广谱兜底 ``Exception``（保留 CancelledError 语义）：任何异常（连接层、
         APIError——如用户中途换模型致参数不存在、畸形响应）都置 running=False
         并记入 last_error，使故障对 render() 与 ``healthy`` 可见；不自动重连。
+
+        行为叠加（蓝图 AD-4）：ambient 块之后、逐参 clamp 之前把
+        ``behavior_overlay`` 的手势帧合入——offsets 加性合入（可选参数以
+        defaultValue 为基线、仅活跃期按需注入，AD-5），eye_gate 乘到
+        EyeOpenLeft/Right（与 ambient 眨眼同为乘法链）。该段**单独兜
+        Exception**：引擎异常只整帧丢弃手势叠加 + warning 一次，不杀 sink——
+        否则引擎 bug 会沿本循环的广谱兜底杀死整条表情通道且不自动重连
+        （故障隔离/可观测性理由，对齐模块 docstring 的失败可观测性约定）。
         """
         assert self.api is not None
         dt = 1.0 / self.render_hz
@@ -587,10 +681,37 @@ class VtsExpressionSink:
                     bf = blink.factor(now, self.arousal)
                     frame["EyeOpenLeft"] *= bf
                     frame["EyeOpenRight"] *= bf
+                if self.behavior_overlay is not None:
+                    # 局部防御（AD-4 故障面）：先在副本上合成，成功才替换 frame
+                    # ——引擎异常时整帧丢弃手势叠加（无半应用态），表情注入照常。
+                    try:
+                        overlay = self.behavior_overlay.apply(now)
+                        merged = dict(frame)
+                        for k, delta in overlay.offsets.items():
+                            if k in merged:
+                                merged[k] += delta
+                            elif k in self.ranges:
+                                # 可选参数仅活跃期进 frame，基线取 defaultValue（AD-5）
+                                merged[k] = self.ranges[k][2] + delta
+                        merged["EyeOpenLeft"] *= overlay.eye_gate
+                        merged["EyeOpenRight"] *= overlay.eye_gate
+                        frame = merged
+                    except Exception as exc:
+                        if not self.warned_overlay_failure:
+                            logger.warning(
+                                "行为叠加引擎异常——丢弃本帧手势叠加（仅告警一次），"
+                                "表情注入不受影响：%r",
+                                exc,
+                            )
+                            self.warned_overlay_failure = True
                 vals = []
                 for k in GOVERNED_PARAMS:
                     lo, hi, _ = self.ranges[k]
                     vals.append({"id": k, "value": _clamp(lo, hi, frame[k])})
+                for k in OPTIONAL_OVERLAY_PARAMS:
+                    if k in frame:
+                        lo, hi, _ = self.ranges[k]
+                        vals.append({"id": k, "value": _clamp(lo, hi, frame[k])})
                 await self.api.request(
                     "InjectParameterDataRequest",
                     {"faceFound": True, "mode": "set", "parameterValues": vals},

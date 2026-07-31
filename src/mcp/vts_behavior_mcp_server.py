@@ -1,0 +1,319 @@
+"""VTS 离散行为 MCP Server（FastMCP stdio · 蓝图 2026-07-31 §5/§6 · T5）。
+
+feature flag：VTS_BEHAVIOR_ENABLED（默认 false）。
+传输：stdio（供 Zero 侧经 MCP client spawn 子进程）。
+
+设计约束（AD-8，逐条对照 desktop_mcp_server.py 先例）：
+- 传输层零业务逻辑：工具体只做参数转换 + 转发 + 错误映射。
+- 业务全在 src/mcp/behavior/service.py（模块级惰性 global + 延迟 import）。
+- VTS_BEHAVIOR_ENABLED=false 时始终注册工具、运行时首行 raise（更易测）。
+- 机读错误码走位置无关令牌 [vtsb:*]（AD-11，符号唯一真相在
+  src/agents/models/vts_behavior.py）：业务性拒绝在回执 code 字段（正常返回），
+  协议性失败才抛 ToolError（服务层的 ToolError 原样透传，其余异常映射
+  [vtsb:vts_error]）。
+- ⚠ stdout 是 JSON-RPC 线路，绝不可写——日志一律 stderr（configure_logging）。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import TYPE_CHECKING, Any
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import ValidationError
+
+from src.agents.models.vts_behavior import (
+    INTENSITY_DEFAULT,
+    VTSB_DISABLED,
+    VTSB_INVALID_PARAMS,
+    VTSB_VTS_ERROR,
+    BehaviorRequest,
+)
+
+if TYPE_CHECKING:  # 仅类型标注用——运行时经 _get_service() 延迟 import
+    from src.mcp.behavior.service import BehaviorService
+
+logger = logging.getLogger(__name__)
+
+# ── 全局状态 ──────────────────────────────────────────────────────────────────
+
+_SERVICE: BehaviorService | None = None
+
+mcp = FastMCP(
+    name="vts-behavior",
+    instructions=(
+        "VTube Studio 离散行为执行层：以 12 个离散行为词驱动 Live2D 皮套做"
+        "点头/摇头/歪头/瞥视/眨眼/扬眉/皱眉/瞪眼/微笑/前倾/后撤/摇摆等瞬态动作，"
+        "并可触发 VTS 侧已配置的热键动画。仅 VTS_BEHAVIOR_ENABLED=true 时生效。\n"
+        "用法：① 先 vts_connect 建立连接（幂等；渲染循环故障后再次调用即显式重连）。"
+        "② behavior_list 取词表——每词含定义文本/参数 schema/典型时长/冷却/降级态，"
+        "已发现的 VTS 热键在同一张清单（经 behavior_trigger 以 name='hotkey:<hotkeyID>' "
+        "触发）。③ behavior_trigger 触发行为并读回执：status=accepted/replaced 表示已"
+        "执行，rejected 是正常业务回执（code 带 [vtsb:*] 机读令牌，如冷却/节流/通道"
+        "占用），不是错误——行为不排队，被拒后不必立即重试。④ 话锋突转时用 "
+        "behavior_interrupt 打断活跃行为；behavior_status 探测连接/健康态。\n"
+        "⚠ 跨进程共存警告：本 server 与另一进程的表情流 sink（VTS_SINK_ENABLED）"
+        "同时连 VTS 会形成两个插件对同一参数的 set 模式独占冲突（VTS 454）——"
+        "同一时刻只允许一个进程持有 VTS 注入连接；同进程共存请注入同一 sink 实例。"
+    ),
+)
+
+
+def _is_enabled() -> bool:
+    """检查 VTS_BEHAVIOR_ENABLED feature flag（真值集与仓内先例一致）。"""
+    return os.environ.get("VTS_BEHAVIOR_ENABLED", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _require_enabled() -> None:
+    """feature flag 未开时 raise ToolError（带 [vtsb:disabled] 机读令牌）。"""
+    if not _is_enabled():
+        raise ToolError(
+            f"{VTSB_DISABLED} VTS 行为能力未启用（VTS_BEHAVIOR_ENABLED=false）。"
+            "请在 .env 中设置 VTS_BEHAVIOR_ENABLED=true 后重启 server。"
+        )
+
+
+def _get_service() -> BehaviorService:
+    """获取模块级惰性 BehaviorService 单例（延迟 import：flag 关时不拉业务依赖）。"""
+    global _SERVICE
+    if _SERVICE is None:
+        from src.mcp.behavior.service import BehaviorService  # noqa: PLC0415
+
+        _SERVICE = BehaviorService()
+    return _SERVICE
+
+
+def _dump_model(obj: Any) -> str:
+    """将 pydantic 模型序列化为 JSON 字符串（类型安全包装）。"""
+    result: str = obj.model_dump_json()
+    return result
+
+
+# ── 行为工具 ──────────────────────────────────────────────────────────────────
+
+
+@mcp.tool(
+    name="behavior_list",
+    description=(
+        "获取离散行为词表 + 已发现 VTS 热键的同一张清单（BehaviorCatalog JSON）。"
+        "词表是静态知识，未连接也完整返回（hotkeys=null 表示尚未枚举）；"
+        "refresh=true 且已连接时重枚举热键（用户中途换模型场景）。"
+        "示例词：nod（肯定点头）、eyes_widen（震惊瞪眼）、body_sway（愉悦摇摆）。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def behavior_list(refresh: bool = False) -> str:
+    """列出行为词表与热键。
+
+    Args:
+        refresh: 已连接时重枚举热键（只刷热键不刷参数值域）。
+
+    Returns:
+        BehaviorCatalog 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        catalog = await service.list_catalog(refresh=refresh)
+        return _dump_model(catalog)
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("behavior_list 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} behavior_list 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="behavior_trigger",
+    description=(
+        "触发一个离散行为词（词表见 behavior_list）或 VTS 热键"
+        "（name='hotkey:<hotkeyID>'），返回 BehaviorReceipt JSON 三态回执："
+        "accepted/replaced=已执行，rejected=正常业务拒绝（code 带 [vtsb:*] 机读令牌，"
+        "非错误）。示例：name='nod' repeat=2（连点两下头）；"
+        "name='glance' direction='left'（向左瞥一眼）。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def behavior_trigger(
+    name: str,
+    intensity: float = INTENSITY_DEFAULT,
+    repeat: int = 1,
+    duration_ms: int | None = None,
+    direction: str | None = None,
+) -> str:
+    """触发离散行为或热键。
+
+    Args:
+        name: 行为词（如 "nod"）或 "hotkey:<hotkeyID>"。
+        intensity: 幅度 [0, 1]（缺省 0.5）。
+        repeat: stroke 周期数 [1, 8]（仅节律行为有意义）。
+        duration_ms: 覆盖词表典型时长（None=典型值，上限 10000）。
+        direction: 方向词（head_tilt: left|right；glance: left|right|up|down）。
+
+    Returns:
+        BehaviorReceipt 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        request = BehaviorRequest(
+            name=name,
+            intensity=intensity,
+            repeat=repeat,
+            duration_ms=duration_ms,
+            direction=direction,
+        )
+    except ValidationError as exc:
+        raise ToolError(f"{VTSB_INVALID_PARAMS} 触发参数不合法：{exc}") from exc
+    try:
+        receipt = await service.trigger(request)
+        return _dump_model(receipt)
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("behavior_trigger 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} behavior_trigger 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="behavior_interrupt",
+    description=(
+        "打断活跃行为（交叉淡出回语义静息基准），话锋突转时用。channel=null 清全部，"
+        "也可只清指定通道（head/gaze/eyelid/brows/mouth/body）。只清手势层，"
+        "不触碰表情通路。返回 BehaviorReceipt JSON。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def behavior_interrupt(channel: str | None = None) -> str:
+    """打断活跃行为。
+
+    Args:
+        channel: 目标通道（None=全部；合法值 head/gaze/eyelid/brows/mouth/body）。
+
+    Returns:
+        BehaviorReceipt 序列化 JSON（幂等：无活跃行为也返回 accepted）。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        receipt = service.interrupt(channel)
+        return _dump_model(receipt)
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("behavior_interrupt 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} behavior_interrupt 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="behavior_status",
+    description=(
+        "获取行为层健康/状态快照（BehaviorStatus JSON）：connected/healthy/last_error/"
+        "活跃行为/冷却剩余/缺席可选参数/热键数/model_id。healthy=false 表示渲染循环"
+        "已故障——恢复路径为再次 vts_connect（显式重连）。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def behavior_status() -> str:
+    """获取行为层状态快照。
+
+    Returns:
+        BehaviorStatus 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        return _dump_model(service.status())
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("behavior_status 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} behavior_status 执行失败：{exc}") from exc
+
+
+# ── 连接管理工具 ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool(
+    name="vts_connect",
+    description=(
+        "连接 VTube Studio 并挂载手势引擎（幂等）：连接/认证/读参数值域/起渲染循环 + "
+        "热键枚举。渲染循环故障后（behavior_status.healthy=false）再次调用即显式重连。"
+        "返回 BehaviorStatus JSON。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def vts_connect() -> str:
+    """连接 VTS（幂等；失败抛 ToolError [vtsb:vts_error]）。
+
+    Returns:
+        BehaviorStatus 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        return _dump_model(await service.connect())
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("vts_connect 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} vts_connect 执行失败：{exc}") from exc
+
+
+@mcp.tool(
+    name="vts_disconnect",
+    description=(
+        "断开 VTube Studio（幂等）：停渲染循环、关 WebSocket，1s 后 VTS 收回参数"
+        "控制权。返回 BehaviorStatus JSON。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def vts_disconnect() -> str:
+    """断开 VTS（幂等）。
+
+    Returns:
+        BehaviorStatus 序列化 JSON。
+    """
+    _require_enabled()
+    service = _get_service()
+    try:
+        return _dump_model(await service.disconnect())
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("vts_disconnect 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} vts_disconnect 执行失败：{exc}") from exc
+
+
+# ── 入口 ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from src.logging_config import configure_logging  # noqa: PLC0415
+
+    # 接管 root：FastMCP 构造时 SDK 已抢注 RichHandler(stderr)——configure_logging
+    # 摘掉抢注 handler，统一为 LOG_FORMAT + stderr（stdout 是 JSON-RPC 线路，绝不可写；
+    # 不接管会 stderr 双份日志）。ZERO_MCP_LOG_LEVEL / ZERO_MCP_LOG_FILE 可调级别与落盘，
+    # 见 .env.example。
+    configure_logging()
+
+    enabled = _is_enabled()
+    logger.info("vts_behavior_mcp_server 启动：VTS_BEHAVIOR_ENABLED=%s", enabled)
+
+    if enabled:
+        # 惰性持有 sink（AD-9）：不在启动时连 VTS——VTS 未启动/未开 API 也能起
+        # server，连接由 vts_connect 工具显式建立（连接失败只在该工具报错）。
+        logger.info("行为层就绪：经 vts_connect 显式建立 VTS 连接（惰性持有 sink）。")
+    else:
+        logger.warning(
+            "VTS_BEHAVIOR_ENABLED=false：所有工具调用将被拒绝（运行时检查），"
+            "设置为 true 并重启以启用 VTS 行为能力。"
+        )
+
+    mcp.run(transport="stdio")
