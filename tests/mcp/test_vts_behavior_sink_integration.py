@@ -277,5 +277,5 @@ class TestEngineFailureIsolation:
         assert frames and all(_frame_ids(f) == set(GOVERNED_PARAMS) for f in frames), (
             "overlay 丢弃后表情注入应照常（无半应用态）"
         )
-        warnings = [r for r in caplog.records if "行为叠加引擎异常" in r.getMessage()]
+        warnings = [r for r in caplog.records if "丢弃本帧叠加" in r.getMessage()]
         assert len(warnings) == 1

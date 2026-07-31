@@ -19,6 +19,9 @@
      ``engine.trigger`` 每个 direction 的实际回执一致（审查员复现场景）；
   7. INFO2 端到端核验：``BehaviorService.connect()`` 内 behavior_overlay 先于
      ``__aenter__`` 挂上，缺可选参数告警应为 WARNING（非 DEBUG）。
+  8. 裸参数轨迹通道面（2026-07-31 二期）：``animate``/``clear_params``/
+     ``list_params``/``status`` 的未连接协议性拒绝、回执透传、幂等、全参数表
+     governed 标注、trajectory_active/remaining 聚合。
 
 不标 ``zerorepo``（离线假 ws，无关 D:\\Zero）；无未标记的 skip。
 """
@@ -30,15 +33,20 @@ import logging
 from typing import Any
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from src.agents.models.vts_behavior import (
     VTSB_COOLDOWN,
     VTSB_HOTKEY_UNAVAILABLE,
+    VTSB_NOT_CONNECTED,
     BehaviorRequest,
+    TrajectoryKeyframe,
+    TrajectoryRequest,
+    extract_vtsb_code,
 )
 from src.mcp.behavior.service import BehaviorService, _behavior_info
 from src.mcp.zero.sinks.behavior_overlay import VOCABULARY, BehaviorOverlayEngine, Ranges
-from src.mcp.zero.sinks.vts import VtsApiError
+from src.mcp.zero.sinks.vts import GOVERNED_PARAMS, VtsApiError
 from tests.mcp.test_vts_expression_sink import RANGES, FakeVtsServer
 
 # ---------------------------------------------------------------------------
@@ -431,5 +439,118 @@ class TestOptionalParamWarningLevel:
                 if r.levelno == logging.WARNING and "缺可选叠加参数" in r.getMessage()
             ]
             assert len(warnings) == 1
+        finally:
+            await service.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# 8. 裸参数轨迹通道面（2026-07-31 二期）：
+#    animate / clear_params / list_params / status
+# ---------------------------------------------------------------------------
+
+RANGES_WITH_MOUTH_X: dict[str, tuple[float, float, float]] = {
+    **RANGES,
+    "MouthX": (-1.0, 1.0, 0.0),
+}
+"""全参数表非降级用例：MouthX 既非 GOVERNED_PARAMS 也非可选叠加白名单，仅在
+``sink.all_params``（``list_params`` 的作用空间）现身。"""
+
+
+class TestTrajectoryServiceFace:
+    """service 层轨迹面：未连接协议性拒绝、回执透传、``clear_params`` 幂等、
+    全参数表 governed 标注、``status`` 的 trajectory_active/remaining 聚合。"""
+
+    def test_animate_not_connected_raises_tool_error(self) -> None:
+        service = BehaviorService()
+        request = TrajectoryRequest(
+            keyframes=[TrajectoryKeyframe(t_ms=0, params={"MouthSmile": 0.5})]
+        )
+        with pytest.raises(ToolError) as exc_info:
+            service.animate(request)
+        assert extract_vtsb_code(str(exc_info.value)) == VTSB_NOT_CONNECTED
+
+    def test_list_params_not_connected_returns_none(self) -> None:
+        service = BehaviorService()
+        catalog = service.list_params()
+        assert catalog.connected is False
+        assert catalog.params is None
+
+    async def test_animate_accepted_passes_through_queue_depth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, BehaviorFakeVtsServer())
+        service = BehaviorService()
+        await service.connect()
+        try:
+            first = service.animate(
+                TrajectoryRequest(
+                    keyframes=[
+                        TrajectoryKeyframe(t_ms=0, params={"MouthSmile": 0.2}),
+                        TrajectoryKeyframe(t_ms=500, params={"MouthSmile": 0.2}),
+                    ]
+                )
+            )
+            assert first.status == "accepted"
+            assert first.queue_depth == 1  # 首次投喂无队可入，直接接管
+            second = service.animate(
+                TrajectoryRequest(
+                    keyframes=[
+                        TrajectoryKeyframe(t_ms=0, params={"MouthSmile": 0.3}),
+                        TrajectoryKeyframe(t_ms=500, params={"MouthSmile": 0.3}),
+                    ],
+                    append=True,
+                )
+            )
+            assert second.status == "accepted"
+            assert second.queue_depth == 2  # 透传 TrajectoryPlayer.feed 的实际队深，非硬编码
+        finally:
+            await service.disconnect()
+
+    async def test_clear_params_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install(monkeypatch, BehaviorFakeVtsServer())
+        service = BehaviorService()
+        await service.connect()
+        try:
+            first = service.clear_params()
+            second = service.clear_params()
+            assert first.status == "accepted"
+            assert second.status == "accepted"
+        finally:
+            await service.disconnect()
+
+    async def test_list_params_connected_returns_full_table_with_governed_flags(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, BehaviorFakeVtsServer(ranges=RANGES_WITH_MOUTH_X))
+        service = BehaviorService()
+        await service.connect()
+        try:
+            catalog = service.list_params()
+            assert catalog.connected is True
+            assert catalog.params is not None
+            by_name = {p.name: p for p in catalog.params}
+            assert set(by_name) == set(RANGES_WITH_MOUTH_X)
+            for name in GOVERNED_PARAMS:
+                assert by_name[name].governed is True
+            assert by_name["MouthX"].governed is False
+        finally:
+            await service.disconnect()
+
+    async def test_status_reflects_active_trajectory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install(monkeypatch, BehaviorFakeVtsServer())
+        service = BehaviorService()
+        await service.connect()
+        try:
+            service.animate(
+                TrajectoryRequest(
+                    keyframes=[
+                        TrajectoryKeyframe(t_ms=0, params={"MouthSmile": 0.5}),
+                        TrajectoryKeyframe(t_ms=500, params={"MouthSmile": 0.5}),
+                    ]
+                )
+            )
+            status = service.status()
+            assert status.trajectory_active is True
+            assert status.trajectory_remaining_ms > 0
         finally:
             await service.disconnect()
