@@ -289,6 +289,40 @@ class TestAppendContinuation:
 
 
 class TestReplaceBridging:
+    def test_feed_mid_release_bridges_without_strength_reset(self) -> None:
+        """缓出中途投喂必须桥接 + strength 续爬（审查 BLOCK-1 回归）。
+
+        修复前：缓出期 `_active()` 恒 False → feed 落「从零开始」分支，strength
+        瞬间归零再重爬 = 可视跳变；修复后：值从缓出当前值经 BRIDGE_S 桥入新轨迹，
+        strength 借 `_inv_ease` 反解 attack 起点从当前衰减值**连续**续爬。
+        """
+        player = TrajectoryPlayer()
+        player.feed(
+            [(0.0, {"X": 5.0}), (0.5, {"X": 5.0})],
+            mode="absolute",
+            append=True,
+            now=0.0,
+            known_params={"X"},
+        )
+        mid_release = 0.5 + RELEASE_S / 2.0
+        before = player.apply(mid_release)
+        assert before is not None and 0.0 < before.strength < 1.0  # 确在缓出中
+        player.feed(
+            [(0.0, {"X": 9.0}), (1.0, {"X": 9.0})],
+            mode="absolute",
+            append=False,
+            now=mid_release,
+            known_params={"X"},
+        )
+        after = player.apply(mid_release)
+        assert after is not None
+        assert after.strength == pytest.approx(before.strength, abs=1e-9)  # 无归零重爬
+        assert after.values["X"] == pytest.approx(before.values["X"])  # 桥接起点=旧值
+        settled = player.apply(mid_release + max(BRIDGE_S, ATTACK_S) + 0.01)
+        assert settled is not None
+        assert settled.values["X"] == pytest.approx(9.0)
+        assert settled.strength == pytest.approx(1.0)
+
     def test_same_mode_bridges_old_output_into_new_trajectory(self) -> None:
         player = TrajectoryPlayer()
         player.feed(
@@ -436,12 +470,11 @@ class TestSnapshot:
         expected = int(round((1.0 + RELEASE_S - 0.5) * 1000.0))
         assert remaining == pytest.approx(expected, abs=1)
 
-    def test_snapshot_without_prior_apply_reports_idle_at_exact_exhaustion(self) -> None:
-        """已知细节（非缺陷断言）：队列播尽但从未调用过 `apply()` 驱动「转入
-        交还缓出」的状态迁移（该迁移只在 `apply()` 内发生）时，`snapshot()`
-        如实报告空闲——不代表 RELEASE_S 缓出未发生，只是本实例还未被驱动
-        感知到。生产链路 `_render_loop` 每 tick 都调 `apply()`，该窗口通常
-        < 一帧（render_hz 量级）；此处仅记录实测行为。"""
+    def test_snapshot_without_prior_apply_sees_release_window(self) -> None:
+        """播尽后即便从未调过 `apply()`，`snapshot()` 也能感知交还缓出窗口——
+        `_settle()` 状态自迁移被 apply/snapshot/clear/feed 共用（审查 WARN-4 修复：
+        旧实现的迁移只在 apply() 内发生，snapshot 存在调用顺序依赖，曾如实报告
+        空闲）。缓出窗口内 (True, 剩余ms)，窗口过后归空闲。"""
         player = TrajectoryPlayer()
         player.feed(
             [(0.0, {"X": 0.0}), (0.2, {"X": 1.0})],
@@ -450,7 +483,10 @@ class TestSnapshot:
             now=0.0,
             known_params={"X"},
         )
-        assert player.snapshot(0.25) == (False, 0)
+        active, remaining = player.snapshot(0.25)  # 播尽 0.05s，仍在 RELEASE_S 窗口
+        assert active is True
+        assert remaining == pytest.approx((0.2 + RELEASE_S - 0.25) * 1000.0, abs=1.0)
+        assert player.snapshot(0.2 + RELEASE_S + 0.01) == (False, 0)
 
     def test_idle_after_release_completes(self) -> None:
         player = TrajectoryPlayer()

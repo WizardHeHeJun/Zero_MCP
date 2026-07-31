@@ -47,6 +47,16 @@ def _ease(u: float) -> float:
     return 0.5 * (1.0 - math.cos(math.pi * u))
 
 
+def _inv_ease(y: float) -> float:
+    """余弦缓动反函数：``_ease(_inv_ease(y)) == y``（y∈[0,1]）。
+
+    缓出中途被重新投喂时用它反解 attack 起点，使 strength 从当前衰减值**续爬**
+    而非归零重来（审查 BLOCK-1 的无跳变要求）。
+    """
+    y = max(0.0, min(1.0, y))
+    return math.acos(1.0 - 2.0 * y) / math.pi
+
+
 @dataclass(frozen=True, kw_only=True)
 class TrajectoryFrame:
     """单帧回放输出：``values`` 参数值（按 mode 解释）、``strength`` 接管强度 [0,1]。"""
@@ -167,16 +177,24 @@ class TrajectoryPlayer:
             frames = [dict(frames[0]), *frames]
         seg = _Segment(mode=mode, times=times, frames=frames)
 
+        self._settle(now)
         active = self._active(now)
         if append and active:
             seg.start_s = self.segments[-1].end_s
             self.segments.append(seg)
         else:
-            if active:  # 即刻接管：桥接旧输出值防跳变
-                current = self.apply(now)
-                if current is not None and current.mode == mode:
-                    self.bridge_values = dict(current.values)
-                    self.bridge_from = now
+            # 即刻接管（append=False，或队列已空/正在缓出时的 append）：从当前
+            # 输出桥接旧值 + strength 从当前衰减值续爬——**缓出中的投喂同样桥接**，
+            # 否则 strength 瞬间归零再重爬会产生可视跳变（审查 BLOCK-1 实测）。
+            current = self.apply(now)
+            if current is not None and current.mode == mode:
+                self.bridge_values = dict(current.values)
+                self.bridge_from = now
+                self.attack_from = (
+                    None
+                    if current.strength >= 1.0
+                    else now - ATTACK_S * _inv_ease(current.strength)
+                )
             else:
                 self.attack_from = now
                 self.bridge_values = None
@@ -184,6 +202,7 @@ class TrajectoryPlayer:
             self.timeline_start = now
             seg.start_s = 0.0
             self.release_from = None
+            self.release_values = {}
         return FeedResult(
             ok=True,
             dropped_params=dropped,
@@ -192,7 +211,10 @@ class TrajectoryPlayer:
         )
 
     def clear(self, now: float) -> None:
-        """清空队列并进入交还缓出（幂等；未在播时 no-op）。"""
+        """清空队列并进入交还缓出（幂等——已在缓出/空闲时 no-op，不重启缓出）。"""
+        self._settle(now)
+        if not self._active(now):
+            return
         current = self.apply(now)
         self.segments = []
         self.timeline_start = None
@@ -206,6 +228,7 @@ class TrajectoryPlayer:
 
     def apply(self, now: float) -> TrajectoryFrame | None:
         """当前时刻回放帧；空闲（含交还完成）返回 None。"""
+        self._settle(now)
         if self._active(now):
             assert self.timeline_start is not None
             t = now - self.timeline_start
@@ -226,8 +249,34 @@ class TrajectoryPlayer:
                     self.attack_from = None
             return TrajectoryFrame(values=values, strength=strength, mode=seg.mode)
 
-        # 队列播尽：转入交还缓出
-        if self.segments:
+        if self.release_from is not None:  # _settle 保证此处必在缓出窗口内
+            u = (now - self.release_from) / RELEASE_S
+            return TrajectoryFrame(
+                values=dict(self.release_values),
+                strength=1.0 - _ease(u),
+                mode=self.release_mode,
+            )
+        return None
+
+    def snapshot(self, now: float) -> tuple[bool, int]:
+        """(是否在播, 距播尽含交还缓出的剩余 ms)——BehaviorStatus 可观测性用。"""
+        self._settle(now)
+        if self._active(now):
+            assert self.timeline_start is not None
+            end = self.timeline_start + self.segments[-1].end_s
+            return True, max(0, int(round((end + RELEASE_S - now) * 1000.0)))
+        if self.release_from is not None:
+            return True, max(0, int(round((self.release_from + RELEASE_S - now) * 1000.0)))
+        return False, 0
+
+    def _settle(self, now: float) -> None:
+        """状态自迁移：队列播尽 → 转入交还缓出；缓出耗尽 → 清残余。
+
+        被 ``apply``/``snapshot``/``clear``/``feed`` 共用——消除「必须先调 apply
+        才感知播尽」的调用顺序依赖（审查 WARN-4），也是缓出期桥接（BLOCK-1）
+        的前置状态归一点。
+        """
+        if self.segments and not self._active(now):
             assert self.timeline_start is not None
             last = self.segments[-1]
             self.release_from = self.timeline_start + last.end_s
@@ -236,27 +285,9 @@ class TrajectoryPlayer:
             self.segments = []
             self.timeline_start = None
             self.bridge_values = None
-        if self.release_from is not None:
-            u = (now - self.release_from) / RELEASE_S
-            if u < 1.0:
-                return TrajectoryFrame(
-                    values=dict(self.release_values),
-                    strength=1.0 - _ease(u),
-                    mode=self.release_mode,
-                )
+        if self.release_from is not None and now - self.release_from >= RELEASE_S:
             self.release_from = None
             self.release_values = {}
-        return None
-
-    def snapshot(self, now: float) -> tuple[bool, int]:
-        """(是否在播, 距播尽含交还缓出的剩余 ms)——BehaviorStatus 可观测性用。"""
-        if self._active(now):
-            assert self.timeline_start is not None
-            end = self.timeline_start + self.segments[-1].end_s
-            return True, max(0, int(round((end + RELEASE_S - now) * 1000.0)))
-        if self.release_from is not None:
-            return True, max(0, int(round((self.release_from + RELEASE_S - now) * 1000.0)))
-        return False, 0
 
     def _active(self, now: float) -> bool:
         if not self.segments or self.timeline_start is None:

@@ -218,8 +218,9 @@ async def behavior_interrupt(channel: str | None = None) -> str:
     name="behavior_status",
     description=(
         "获取行为层健康/状态快照（BehaviorStatus JSON）：connected/healthy/last_error/"
-        "活跃行为/冷却剩余/缺席可选参数/热键数/model_id。healthy=false 表示渲染循环"
-        "已故障——恢复路径为再次 vts_connect（显式重连）。"
+        "活跃行为/冷却剩余/缺席可选参数/热键数/model_id/trajectory_active/"
+        "trajectory_remaining_ms（轨迹回放态，含交还缓出窗口）。healthy=false 表示"
+        "渲染循环已故障——恢复路径为再次 vts_connect（显式重连）。"
     ),
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )

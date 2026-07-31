@@ -203,7 +203,9 @@ SWAY_HEAD_SCALE: float = SWAY_BODY_X_SCALE * DEGRADED_BODY_RATIO
 # ---------------------------------------------------------------------------
 
 STROKE_BEAT_DECAY: float = 0.82
-"""stroke 型逐拍幅度衰减比（第 k 拍幅度 × 本系数^k）[2026-07-31 标定新增]。"""
+"""stroke 型逐拍幅度衰减比（第 k 拍幅度 × 本系数^k）[2026-07-31 标定新增]。
+⚠ 只作用于 offset 轨道（_shape）；blink 的乘法门轨道**豁免**（gate_at——闭合深度
+逐拍变轻会读作「没闭上」，与词义背离，审查 WARN-1）。"""
 
 NOD_ROLL_SCALE: float = NOD_SCALE * 0.16
 """nod 伴随：FaceAngleZ 随拍微滚转系数 [2026-07-31 标定新增]。"""
@@ -571,6 +573,10 @@ VOCABULARY: dict[str, BehaviorSpec] = {
     "eyes_widen": BehaviorSpec(
         name="eyes_widen",
         definition="震惊：睁大双眼、扬眉并微微仰头后缩。",
+        # ⚠ 仲裁连带（2026-07-31 标定加仰头轨道扩入 head 通道的显式后果）：本词为
+        # reactive 档（最高优先级），现在会抢占任何在播的头部行为（nod/shake/
+        # head_tilt 及 body 三词降级态）——语义上成立（惊吓打断有意动作），
+        # 已由 TestArbitration 显式锁定。
         channels=("eyelid", "brows", "head"),
         priority=PRIORITY_REACTIVE,
         kind=KIND_HOLD,
@@ -648,7 +654,7 @@ VOCABULARY: dict[str, BehaviorSpec] = {
         ),
         fallback_channels=("body", "head"),
         degraded_channels=("body",),
-        degraded_note="所连部署缺 BodyAngleY，借 FaceAngleY 微量低头近似（约 1/3 幅度）。",
+        degraded_note="所连部署缺 BodyAngleY，借 FaceAngleY 微量低头近似。",
     ),
     "lean_back": BehaviorSpec(
         name="lean_back",
@@ -792,7 +798,10 @@ class ActiveEnvelope:
         for track in self.tracks:
             if track.waveform != WAVE_GATE:
                 continue
-            depth = track.amplitude * half_sine_strokes(u, self.repeat, STROKE_BEAT_DECAY) * fade
+            # gate 轨道**豁免拍间衰减**（审查 WARN-1）：offset 轨道拍间变轻仍读得出
+            # 是动作，闭合深度变轻则直接读作「没闭上」——实测 intensity=0.5 repeat=8
+            # 末拍仅闭 19.9%，与 blink 词义背离。眨眼逐拍等深。
+            depth = track.amplitude * half_sine_strokes(u, self.repeat) * fade
             gate *= _clamp01(1.0 - depth)
         return gate
 

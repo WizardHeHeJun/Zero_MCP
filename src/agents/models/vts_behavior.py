@@ -339,7 +339,9 @@ class TrajectoryRequest(BaseModel):
     """轨迹投喂请求（Zero 侧动作模型 → MCP，`params_animate` 工具输入）。
 
     - keyframes: 按 ``t_ms`` 严格升序；帧间线性插值（动作模型输出稠密帧，
-      插值形态不做花活）；首帧建议 t_ms=0。
+      插值形态不做花活）；首帧建议 t_ms=0。⚠ **单帧段 = 短暂闪现**（时长 0，
+      仅经交还缓出持住约 250ms）——要「持续保持某姿态」请用首尾同值的双帧段
+      或持续流式投喂，勿依赖单帧。
     - mode: 见 ``TRAJECTORY_MODES``（str 不 Literal——同 BehaviorRequest.name 的
       演进理由；未知模式执行侧回 rejected）。
     - append: True=排到当前队列末尾无缝续接（流式投喂形态）；False=清队即刻

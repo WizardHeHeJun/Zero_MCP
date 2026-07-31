@@ -243,6 +243,17 @@ class TestArbitration:
         assert [env.name for env in engine.envelopes] == ["head_tilt"]
         assert "FaceAngleZ" in after
 
+    def test_eyes_widen_preempts_head_channel_behavior(self) -> None:
+        """eyes_widen 扩入 head 通道的仲裁连带（2026-07-31 标定新增仰头轨道，
+        审查 WARN-2 显式化）：reactive 档现在会抢占在播的 deliberate 头部行为
+        ——惊吓打断有意动作，语义成立，此处显式锁定。"""
+        engine = BehaviorOverlayEngine()
+        _trigger(engine, "nod", 0.0, intensity=1.0)
+        # 0.3s：已过 250ms 全局节流窗、nod（700ms）仍在播
+        receipt = _trigger(engine, "eyes_widen", 0.3)
+        assert receipt.status == "replaced"
+        assert receipt.detail is not None and "nod" in receipt.detail
+
     def test_higher_priority_replaces_lower(self) -> None:
         engine = BehaviorOverlayEngine()
         _trigger(engine, "brow_furrow", 0.0)  # priority 2
@@ -429,6 +440,19 @@ class TestEyeGate:
         engine = BehaviorOverlayEngine()
         _trigger(engine, "blink", 0.0, intensity=0.4, repeat=1)
         assert engine.apply(0.11).eye_gate == pytest.approx(1.0 - 0.4 * BLINK_DEPTH_SCALE)
+
+    def test_blink_repeat_beats_equal_depth_no_decay(self) -> None:
+        """gate 轨道豁免拍间衰减（审查 WARN-1 判别性回归）。
+
+        非饱和强度多拍：每拍最深门值必须相等——若 gate 误用 STROKE_BEAT_DECAY，
+        第二拍闭合深度衰减（0.5×1.6×0.82 → 门值 0.344 ≠ 0.2），眨眼读作「没闭上」。
+        """
+        engine = BehaviorOverlayEngine()
+        _trigger(engine, "blink", 0.0, intensity=0.5, repeat=2)
+        first = engine.apply(0.11).eye_gate  # 第一拍最深：1 − 0.5×BLINK_DEPTH_SCALE
+        second = engine.apply(0.33).eye_gate  # 第二拍最深
+        assert first == pytest.approx(1.0 - 0.5 * BLINK_DEPTH_SCALE)
+        assert second == pytest.approx(first)
 
     def test_blink_repeat_closes_per_beat(self) -> None:
         engine = BehaviorOverlayEngine()
