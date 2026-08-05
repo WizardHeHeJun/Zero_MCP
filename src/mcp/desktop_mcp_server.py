@@ -242,7 +242,10 @@ async def get_capability_flags() -> str:
 @mcp.tool(
     name="click_element",
     description=(
-        "点击指定坐标或 UIA 元素（默认 coordinate 模式，Task 1 修正）。返回 ActionResult JSON。"
+        "点击指定坐标或 UIA 元素（默认 coordinate 模式，Task 1 修正）。"
+        "expected_root_hwnd：坐标点击的期望落点顶层窗口句柄——仅主窗元素点击设"
+        "（弹出菜单勿设，菜单是独立顶层窗口会误拒）；设了则点击前一刻核验落点，"
+        "不符拒绝并带 [desk:landing_mismatch]。返回 ActionResult JSON。"
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
@@ -250,6 +253,7 @@ async def click_element(
     coordinates: tuple[int, int] | None = None,
     automation_id: str | None = None,
     method: str = "coordinate",
+    expected_root_hwnd: int | None = None,
 ) -> str:
     """点击操作。
 
@@ -259,6 +263,9 @@ async def click_element(
                        非本地索引 UIAElement.element_id）。uia_invoke/uia_click
                        模式使用；微信等 mmui 应用 AutomationId 为空，自动降级坐标。
         method: 点击方式，"coordinate"（默认）| "uia_invoke" | "uia_click"。
+        expected_root_hwnd: 坐标落点核验的期望顶层窗口句柄（K7 批2）；None=
+            不核验（零回归）。**仅主窗元素点击设期望值**，弹出菜单勿设
+            （语义见 ActionSpec.expected_root_hwnd 契约 docstring）。
 
     Returns:
         ActionResult 序列化 JSON。
@@ -271,6 +278,7 @@ async def click_element(
             coordinates=coordinates,
             automation_id=automation_id,
             method=method,
+            expected_root_hwnd=expected_root_hwnd,
         )
         return _dump_model(result)
     except ToolError:
@@ -345,14 +353,31 @@ async def send_key(key_combo: str) -> str:
 
 @mcp.tool(
     name="focus_window",
-    description="将指定句柄的窗口置于前台并获取焦点。返回 ActionResult JSON。",
+    description=(
+        "将指定句柄的窗口置于前台（K8 四级前台唤回梯级 + Win32 级核验；"
+        "success=True 仅 Win32 级核验，最终以后续快照像素锚点为准）。"
+        "返回 ActionResult JSON。"
+        "\n\n"
+        "⚠ 仅供外部 MCP host 直调的手动工具：不在 DesktopControlAgent 安全管线"
+        "（ActionGuard 分级 / TOCTOU 落点核验 / interrupt 人工确认）内——"
+        "ActionSpec 目前无窗口句柄字段，Agent 侧接线待契约扩展后另批（见"
+        "code-review F3）。"
+    ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
-async def focus_window(window_handle: int) -> str:
+async def focus_window(window_handle: int, pin_topmost: bool = False) -> str:
     """聚焦指定窗口。
+
+    ⚠ 本工具仅供外部 MCP host（如 Zero）直调的手动工具，不在
+    DesktopControlAgent 安全管线（ActionGuard/TOCTOU/interrupt）内——
+    `_dispatch_write` 当前不识别 "focus_window"/"pin_topmost" action_type，
+    Agent 侧经安全门接线需等 `ActionSpec` 扩展窗口句柄字段后另批实现
+    （code-review F3，本批只做文档口径澄清，不接线）。
 
     Args:
         window_handle: 目标窗口 HWND 句柄。
+        pin_topmost: True 时梯级期间临时 HWND_TOPMOST 置顶并成对撤销
+            （默认 False，仅顽固遮挡场景用）。
 
     Returns:
         ActionResult 序列化 JSON。
@@ -361,7 +386,10 @@ async def focus_window(window_handle: int) -> str:
     import src.mcp.desktop.tools.control as control  # noqa: PLC0415
 
     try:
-        result = await control.do_focus_window(window_handle=window_handle)
+        result = await control.do_focus_window(
+            window_handle=window_handle,
+            pin_topmost=pin_topmost,
+        )
         return _dump_model(result)
     except ToolError:
         raise

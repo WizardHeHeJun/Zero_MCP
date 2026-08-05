@@ -266,6 +266,25 @@ async def test_click_element_round_trip(monkeypatch: pytest.MonkeyPatch) -> None
     result = await client.click_element(coordinates=(100, 200), method="coordinate")
     assert isinstance(result, ActionResult)
     assert result.success is True
+    # 零回归：未提供 expected_root_hwnd 时参数不带该键（server 侧走现行为不核验）
+    mock_session.call_tool.assert_called_once_with(
+        "click_element", {"method": "coordinate", "coordinates": [100, 200]}
+    )
+
+
+async def test_click_element_expected_root_hwnd_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K7 批2：expected_root_hwnd 提供时随参数透传到 server 工具。"""
+    client, mock_session = _build_mock_client(monkeypatch)
+    _set_tool_return(mock_session, _make_action_result_json())
+    await client.click_element(
+        coordinates=(100, 200), method="coordinate", expected_root_hwnd=0xAAA
+    )
+    mock_session.call_tool.assert_called_once_with(
+        "click_element",
+        {"method": "coordinate", "coordinates": [100, 200], "expected_root_hwnd": 0xAAA},
+    )
 
 
 async def test_type_text_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,7 +326,67 @@ async def test_focus_window_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_tool_return(mock_session, _make_action_result_json())
     result = await client.focus_window(window_handle=99999)
     assert isinstance(result, ActionResult)
+    # 零回归：pin_topmost 默认 False 不随参数下发
     mock_session.call_tool.assert_called_once_with("focus_window", {"window_handle": 99999})
+
+
+async def test_focus_window_pin_topmost_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K8：pin_topmost=True 时随参数透传。"""
+    client, mock_session = _build_mock_client(monkeypatch)
+    _set_tool_return(mock_session, _make_action_result_json())
+    await client.focus_window(window_handle=99999, pin_topmost=True)
+    mock_session.call_tool.assert_called_once_with(
+        "focus_window", {"window_handle": 99999, "pin_topmost": True}
+    )
+
+
+async def test_screen_snapshot_hardening_fields_server_json_to_client_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K2 贯穿断言：server 侧 model_dump_json（_dump_model 同口径）→ client
+    model_validate_json，desktop_locked / window_captured / degradations 三个
+    加固契约字段原样到位（契约模型单一真相，无白名单丢字段）。"""
+    from src.agents.models.screen_snapshot import ScreenSnapshot
+
+    server_side = ScreenSnapshot(
+        snapshot_id="snap-locked",
+        timestamp_ms=2000,
+        screen_width=1920,
+        screen_height=1080,
+        active_window_title=None,
+        uia_elements=[],
+        text_blocks=[],
+        visual_objects=[],
+        screenshot_path=None,
+        perception_mode="uia_ocr",
+        capability_flags={"ocr": True},
+        is_untrusted=True,
+        uia_hollow=False,
+        desktop_locked=True,
+        window_captured=True,
+        degradations=["desktop_locked", "ocr_unavailable"],
+    )
+
+    client, mock_session = _build_mock_client(monkeypatch)
+    _set_tool_return(mock_session, server_side.model_dump_json())
+    result = await client.screen_snapshot()
+
+    assert result.desktop_locked is True
+    assert result.window_captured is True
+    assert result.degradations == ["desktop_locked", "ocr_unavailable"]
+
+
+async def test_screen_snapshot_old_payload_defaults_hardening_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧 payload（无三个加固字段，见 _make_screen_snapshot_json）反序列化零回归：
+    默认 desktop_locked=False / window_captured=False / degradations=[]。"""
+    client, mock_session = _build_mock_client(monkeypatch)
+    _set_tool_return(mock_session, _make_screen_snapshot_json())
+    result = await client.screen_snapshot()
+    assert result.desktop_locked is False
+    assert result.window_captured is False
+    assert result.degradations == []
 
 
 async def test_close_window_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:

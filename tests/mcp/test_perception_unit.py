@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import src.mcp.desktop.session_state as session_state_mod
 import src.mcp.desktop.tools.perception as perception_mod
 from src.agents.models.screen_snapshot import ScreenSnapshot, TextBlock
 from src.mcp.desktop.capability_probe import CapabilityFlags
@@ -32,6 +33,14 @@ def reset_ocr_engine_singleton() -> Any:
     perception_mod._OCR_ENGINE = None
     yield
     perception_mod._OCR_ENGINE = None
+
+
+@pytest.fixture(autouse=True)
+def desktop_unlocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认注桩「桌面未锁」：避免单测真调 Win32（CI 无桌面会话会被判锁定而
+
+    do_screen_snapshot 全线短路成骨架快照）。锁屏用例内再显式覆写。"""
+    monkeypatch.setattr(session_state_mod, "_is_desktop_locked_sync", lambda: (False, False))
 
 
 def _make_caps(
@@ -229,11 +238,12 @@ async def test_screen_snapshot_crops_ocr_to_active_window(
     assert snapshot.capture_origin == (0, 0)
 
 
-async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_outside_virtual(
+async def test_screen_snapshot_ocr_skipped_when_window_outside_virtual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """窗口 rect 与虚拟屏截图完全无交集（如已断开的显示器残留 rect）→
-    裁剪无效，OCR 回退全图（bbox=None），origin 仍为虚拟屏 origin。"""
+    **不再回退全图 OCR**（旧行为是跨窗口注入面，K2 修正）：OCR 完全不执行，
+    text_blocks 置空 + degradations 落机读枚举 ocr_crop_invalid。"""
     caps = _make_caps(ocr=True, mss_available=True)
     monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x3333, "幽灵窗"))
     monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
@@ -257,11 +267,13 @@ async def test_screen_snapshot_ocr_falls_back_fullscreen_when_window_outside_vir
 
     monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
 
-    await perception_mod.do_screen_snapshot(
+    snapshot = await perception_mod.do_screen_snapshot(
         mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
     )
 
-    assert seen_bbox == [(None, (0, 0))]
+    assert seen_bbox == [], "裁剪无效时不得执行任何 OCR（全图 OCR 是跨窗口注入面）"
+    assert snapshot.text_blocks == []
+    assert "ocr_crop_invalid" in snapshot.degradations
 
 
 async def test_screen_snapshot_secondary_screen_window_crops_correctly(
@@ -669,3 +681,212 @@ def test_uia_elements_to_models_element_id_format() -> None:
     ]
     result = perception_mod._uia_elements_to_models(raw, hwnd=0xABCD)
     assert result[0].element_id == "uia_43981_0"  # 0xABCD = 43981
+
+
+# ── K2：锁屏骨架快照 + 各回退分支机读降级枚举 ─────────────────────────────────
+
+
+def _patch_healthy_pipeline(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """注桩一条「全通」感知流水线（前台窗口 + mss + OCR），返回 OCR 调用记录。"""
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", lambda: (0x2222, "健康窗"))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", lambda hwnd: False)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", lambda hwnd, max_depth: [])
+    monkeypatch.setattr(
+        perception_mod,
+        "_take_screenshot_sync",
+        lambda snap_id, tmp_dir: ("C:/fake/shot.png", (0, 0, 1920, 1080)),
+    )
+    monkeypatch.setattr(perception_mod, "_get_window_rect", lambda hwnd: (100, 100, 900, 700))
+
+    seen_ocr: list[Any] = []
+
+    def fake_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        seen_ocr.append((bbox, origin))
+        return []
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fake_ocr)
+    return seen_ocr
+
+
+async def test_screen_snapshot_locked_returns_skeleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """锁定态 → 跳过截图/UIA/OCR，返回 desktop_locked=True + ["desktop_locked"] 骨架。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(session_state_mod, "_is_desktop_locked_sync", lambda: (True, False))
+    monkeypatch.setattr(perception_mod, "_get_screen_size", lambda: (1920, 1080))
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("锁定态不得触碰 UIA/截图/OCR")
+
+    monkeypatch.setattr(perception_mod, "_get_active_window_info", fail)
+    monkeypatch.setattr(perception_mod, "_probe_window_uia_hollow_sync", fail)
+    monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", fail)
+    monkeypatch.setattr(perception_mod, "_capture_window_sync", fail)
+    monkeypatch.setattr(perception_mod, "_take_screenshot_sync", fail)
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", fail)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=True, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert snapshot.desktop_locked is True
+    assert snapshot.degradations == ["desktop_locked"]
+    assert snapshot.uia_elements == []
+    assert snapshot.text_blocks == []
+    assert snapshot.screenshot_path is None
+    assert snapshot.window_captured is False
+    assert snapshot.active_window_title is None
+    assert snapshot.is_untrusted is True
+
+
+async def test_screen_snapshot_lock_probe_failed_marks_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """探测自身失败 → 按未锁继续感知，degradations 落 lock_probe_failed。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    monkeypatch.setattr(session_state_mod, "_is_desktop_locked_sync", lambda: (False, True))
+    _patch_healthy_pipeline(monkeypatch)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert snapshot.desktop_locked is False
+    assert "lock_probe_failed" in snapshot.degradations
+    assert snapshot.screenshot_path == "C:/fake/shot.png"  # 感知未被短路
+
+
+async def test_screen_snapshot_healthy_path_no_degradations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全通路径 → degradations 为空列表、desktop_locked=False（正对照）。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    _patch_healthy_pipeline(monkeypatch)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert snapshot.degradations == []
+    assert snapshot.desktop_locked is False
+
+
+async def test_screen_snapshot_window_capture_failed_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """window_handle 指定且 PrintWindow 失败 → window_capture_failed + 回退 mss，
+    window_captured=False。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    _patch_healthy_pipeline(monkeypatch)
+    monkeypatch.setattr(perception_mod, "_get_window_title", lambda hwnd: "目标窗")
+    monkeypatch.setattr(perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: None)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr",
+        capture_screenshot=False,
+        caps=caps,
+        screenshot_tmp_dir="",
+        window_handle=0x4444,
+    )
+
+    assert "window_capture_failed" in snapshot.degradations
+    assert snapshot.window_captured is False
+    assert snapshot.screenshot_path == "C:/fake/shot.png"  # mss 回退成功
+
+
+async def test_screen_snapshot_window_captured_field_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PrintWindow 成功 → window_captured=True 写进快照，无 window_capture_failed。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    _patch_healthy_pipeline(monkeypatch)
+    monkeypatch.setattr(perception_mod, "_get_window_title", lambda hwnd: "目标窗")
+    monkeypatch.setattr(
+        perception_mod, "_capture_window_sync", lambda hwnd, snap_id, tmp_dir: "C:/fake/win.png"
+    )
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr",
+        capture_screenshot=False,
+        caps=caps,
+        screenshot_tmp_dir="",
+        window_handle=0x5555,
+    )
+
+    assert snapshot.window_captured is True
+    assert snapshot.degradations == []
+
+
+async def test_screen_snapshot_mss_exception_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mss 截图抛异常 → screenshot_failed，无像素产物。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    _patch_healthy_pipeline(monkeypatch)
+
+    def raise_mss(snap_id: str, tmp_dir: str) -> tuple[str, tuple[int, int, int, int]]:
+        raise RuntimeError("mss boom")
+
+    monkeypatch.setattr(perception_mod, "_take_screenshot_sync", raise_mss)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert "screenshot_failed" in snapshot.degradations
+    assert snapshot.screenshot_path is None
+
+
+async def test_screen_snapshot_mss_unavailable_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """caps.mss_available=False 且需截图 → mss_unavailable。"""
+    caps = _make_caps(ocr=True, mss_available=False)
+    _patch_healthy_pipeline(monkeypatch)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert "mss_unavailable" in snapshot.degradations
+    assert snapshot.screenshot_path is None
+
+
+async def test_screen_snapshot_ocr_exception_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OCR 执行抛异常 → ocr_error，text_blocks 为空但快照仍返回。"""
+    caps = _make_caps(ocr=True, mss_available=True)
+    _patch_healthy_pipeline(monkeypatch)
+
+    def raise_ocr(
+        screenshot_path: str, bbox: Any, snapshot_id: str, origin: tuple[int, int] = (0, 0)
+    ) -> list[Any]:
+        raise RuntimeError("ocr boom")
+
+    monkeypatch.setattr(perception_mod, "_run_ocr_on_file_sync", raise_ocr)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert "ocr_error" in snapshot.degradations
+    assert snapshot.text_blocks == []
+
+
+async def test_screen_snapshot_ocr_unavailable_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """caps.ocr=False 且模式需 OCR → ocr_unavailable（截图正常落盘）。"""
+    caps = _make_caps(ocr=False, mss_available=True)
+    seen_ocr = _patch_healthy_pipeline(monkeypatch)
+
+    snapshot = await perception_mod.do_screen_snapshot(
+        mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+    )
+
+    assert "ocr_unavailable" in snapshot.degradations
+    assert seen_ocr == []
+    assert snapshot.screenshot_path == "C:/fake/shot.png"

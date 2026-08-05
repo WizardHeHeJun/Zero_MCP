@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import base64
+import logging
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -151,6 +153,33 @@ class TestClassifyRisk:
             action = _make_action("click", risk)
             result = await guard.classify_risk(action)
             assert isinstance(result, ActionRisk)
+
+    # ── K1 ①：白名单是风险下限——声明低报按白名单升级 ──────────────────────
+
+    async def test_window_close_declared_low_risk_escalates_to_destructive(self) -> None:
+        """K1 ①：window_close 声明 LOW_RISK → 按白名单基线升级为 DESTRUCTIVE。
+
+        修复前实现总是返回声明值（白名单值从未被返回），上游低报即绕过
+        DESTRUCTIVE interrupt 确认——本用例在修复前必红。
+        """
+        guard = self._guard()
+        action = _make_action("window_close", ActionRisk.LOW_RISK)
+        result = await guard.classify_risk(action)
+        assert result == ActionRisk.DESTRUCTIVE
+
+    async def test_delete_declared_read_only_escalates_to_destructive(self) -> None:
+        """K1 ①：delete 声明 READ_ONLY → 升级为白名单基线 DESTRUCTIVE。"""
+        guard = self._guard()
+        action = _make_action("delete", ActionRisk.READ_ONLY)
+        result = await guard.classify_risk(action)
+        assert result == ActionRisk.DESTRUCTIVE
+
+    async def test_click_declared_read_only_escalates_to_low_risk(self) -> None:
+        """K1 ①：click 声明 READ_ONLY → 升级为白名单基线 LOW_RISK（非 DESTRUCTIVE）。"""
+        guard = self._guard()
+        action = _make_action("click", ActionRisk.READ_ONLY)
+        result = await guard.classify_risk(action)
+        assert result == ActionRisk.LOW_RISK
 
 
 # ── toctou_verify 测试 ────────────────────────────────────────────────────────
@@ -324,19 +353,65 @@ class TestToctouVerify:
         assert client.screen_snapshot.call_count == 1
 
     async def test_toctou_degrades_gracefully_when_screenshot_path_none(self) -> None:
-        """截图路径为 None 时，优雅降级返回 pass，不崩溃。"""
+        """非 DESTRUCTIVE 动作截图路径为 None 时，优雅降级返回 pass，不崩溃。
+
+        K1 ③ 适配：降级放行仅保留给非 DESTRUCTIVE（原用例用 window_close
+        DESTRUCTIVE，现改 click LOW_RISK）；DESTRUCTIVE 的 fail-closed 语义见
+        TestToctouDegradedFailClosed。
+        """
         client = _make_mock_client()
         client.screen_snapshot.side_effect = [
             _make_snapshot(screenshot_path=None),
         ]
 
         guard = ActionGuard(client)
-        action = _make_action("window_close", ActionRisk.DESTRUCTIVE)
+        action = _make_action("click", ActionRisk.LOW_RISK)
 
         with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
             result = await guard.toctou_verify(action)
 
         assert result == "pass"
+
+    # ── K1 ②：TOCTOU 触发按 effective_risk 判定，不信声明值 ────────────────
+
+    async def test_effective_destructive_forces_toctou_despite_declared_read_only(
+        self, tmp_path: Path
+    ) -> None:
+        """K1 ②：声明 READ_ONLY 且无坐标，但 effective_risk=DESTRUCTIVE →
+        TOCTOU 执行（两次截图）而非跳过。
+
+        修复前 needs_toctou 只看 action.risk_level 声明值，本场景直接跳过
+        （screen_snapshot 零调用）——修复前必红。
+        """
+        img_path_a = str(tmp_path / "snap_a.png")
+        img_path_b = str(tmp_path / "snap_b.png")
+        _write_gray_png(img_path_a, gray_value=128)
+        _write_gray_png(img_path_b, gray_value=128)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(img_path_a),
+            _make_snapshot(img_path_b),
+        ]
+
+        guard = ActionGuard(client)
+        action = _make_action("screenshot", ActionRisk.READ_ONLY, coordinates=None)
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            result = await guard.toctou_verify(action, effective_risk=ActionRisk.DESTRUCTIVE)
+
+        assert result == "pass"
+        # 两次 screen_snapshot 都被调用 —— TOCTOU 实际执行而非跳过
+        assert client.screen_snapshot.call_count == 2
+
+    async def test_effective_risk_none_falls_back_to_declared(self) -> None:
+        """K1 ② 兼容：effective_risk=None 时回退声明值——READ_ONLY 无坐标仍跳过。"""
+        client = _make_mock_client()
+        guard = ActionGuard(client)
+        action = _make_action("screenshot", ActionRisk.READ_ONLY, coordinates=None)
+        result = await guard.toctou_verify(action, effective_risk=None)
+        assert result == "pass"
+        client.screen_snapshot.assert_not_called()
 
     # ── 局部裁剪口径（Task 12 §四.2：整图 hash 被应用动效误报，无静止基线） ──
 
@@ -442,6 +517,122 @@ class TestToctouVerify:
                     result = await guard.toctou_verify(action, snapshot_before=snapshot_before)
 
         assert result == "pass"
+
+
+# ── K1 ③：TOCTOU 验证降级时 DESTRUCTIVE fail-closed ──────────────────────────
+
+
+class TestToctouDegradedFailClosed:
+    """K1 ③：验证链路降级（截图无路径 / phash 失败）时的分级裁决。
+
+    DESTRUCTIVE：四种降级失败态均须 abort（fail-closed），error 日志含机读
+    令牌 [desk:toctou_degraded]（位置无关，按消费侧口径用 re.search 提取）。
+    修复前四处均为无条件放行（fail-open）——四个 abort 用例在修复前必红。
+    """
+
+    _TOKEN_PATTERN = r"\[desk:toctou_degraded\]"
+
+    def _destructive_action(self) -> ActionSpec:
+        return _make_action("window_close", ActionRisk.DESTRUCTIVE)
+
+    async def test_destructive_first_screenshot_path_none_aborts(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """失败态 1：第一次截图无路径 → DESTRUCTIVE abort + 机读令牌。"""
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(screenshot_path=None),
+        ]
+        guard = ActionGuard(client)
+
+        with caplog.at_level(logging.ERROR, logger="src.orchestration.safety.action_guard"):
+            result = await guard.toctou_verify(
+                self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
+            )
+
+        assert result == "abort"
+        assert re.search(self._TOKEN_PATTERN, caplog.text)
+
+    async def test_destructive_first_phash_failure_aborts(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """失败态 2：第一次 phash 抛 ValueError（文件不可读）→ abort + 机读令牌。"""
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(str(tmp_path / "missing_a.png")),  # 路径存在但文件缺失
+        ]
+        guard = ActionGuard(client)
+
+        with caplog.at_level(logging.ERROR, logger="src.orchestration.safety.action_guard"):
+            result = await guard.toctou_verify(
+                self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
+            )
+
+        assert result == "abort"
+        assert re.search(self._TOKEN_PATTERN, caplog.text)
+
+    async def test_destructive_second_screenshot_path_none_aborts(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """失败态 3：第一张正常、第二次截图无路径 → abort + 机读令牌。"""
+        img_path = str(tmp_path / "snap_a.png")
+        _write_gray_png(img_path, gray_value=128)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(img_path),
+            _make_snapshot(screenshot_path=None),
+        ]
+        guard = ActionGuard(client)
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with caplog.at_level(logging.ERROR, logger="src.orchestration.safety.action_guard"):
+                result = await guard.toctou_verify(
+                    self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
+                )
+
+        assert result == "abort"
+        assert re.search(self._TOKEN_PATTERN, caplog.text)
+
+    async def test_destructive_second_phash_failure_aborts(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """失败态 4：第一张正常、第二次 phash 抛 ValueError → abort + 机读令牌。"""
+        img_path = str(tmp_path / "snap_a.png")
+        _write_gray_png(img_path, gray_value=128)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(img_path),
+            _make_snapshot(str(tmp_path / "missing_b.png")),
+        ]
+        guard = ActionGuard(client)
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with caplog.at_level(logging.ERROR, logger="src.orchestration.safety.action_guard"):
+                result = await guard.toctou_verify(
+                    self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
+                )
+
+        assert result == "abort"
+        assert re.search(self._TOKEN_PATTERN, caplog.text)
+
+    async def test_non_destructive_degraded_still_passes_without_token(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """负对照：非 DESTRUCTIVE（LOW_RISK）降级仍放行，且不落机读令牌。"""
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(screenshot_path=None),
+        ]
+        guard = ActionGuard(client)
+        action = _make_action("click", ActionRisk.LOW_RISK)
+
+        with caplog.at_level(logging.DEBUG, logger="src.orchestration.safety.action_guard"):
+            result = await guard.toctou_verify(action, effective_risk=ActionRisk.LOW_RISK)
+
+        assert result == "pass"
+        assert not re.search(self._TOKEN_PATTERN, caplog.text)
 
 
 # ── phash 辅助函数单测 ─────────────────────────────────────────────────────────

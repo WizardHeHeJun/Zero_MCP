@@ -35,6 +35,7 @@ from src.agents.models.screen_snapshot import (
     UIAElement,
     VisualObject,
 )
+from src.mcp.desktop import session_state
 
 if TYPE_CHECKING:
     from src.mcp.desktop.capability_probe import CapabilityFlags
@@ -553,6 +554,18 @@ def _run_ocr_on_file_sync(
 # ── 公开感知接口 ───────────────────────────────────────────────────────────────
 
 
+def _build_capability_flags(caps: CapabilityFlags, uia_hollow: bool) -> dict[str, bool]:
+    """组装写入快照的能力 flags（正常路径与锁屏骨架快照共用，保持键集一致）。"""
+    return {
+        "ocr": caps.ocr,
+        "omniparser": caps.omniparser,
+        "cuda_accel": caps.cuda_accel,
+        "dml_accel": caps.dml_accel,
+        "mss_available": caps.mss_available,
+        "uia_hollow": uia_hollow,
+    }
+
+
 async def do_screen_snapshot(
     mode: str,
     capture_screenshot: bool,
@@ -581,6 +594,38 @@ async def do_screen_snapshot(
     snapshot_id = str(uuid.uuid4())
     timestamp_ms = int(time.time() * 1000)
     screen_width, screen_height = _get_screen_size()
+
+    # ── K2：锁屏探测（锁定下像素/OCR 全不可信，跳过感知返回骨架快照） ─────────
+    degradations: list[str] = []
+    desktop_locked, lock_probe_failed = await asyncio.to_thread(
+        session_state._is_desktop_locked_sync
+    )
+    if lock_probe_failed:
+        degradations.append("lock_probe_failed")
+    if desktop_locked:
+        # 锁屏下 mss 采到锁屏前旧帧、PrintWindow 整幅黑屏（实测），UIA 也可能
+        # 挂起——截图/UIA/OCR 全部跳过，只返回带机读标记的骨架快照，消费方按
+        # desktop_locked / degradations 判断，不据此做 grounding。
+        logger.warning("桌面会话已锁定，跳过截图/UIA/OCR，返回骨架快照")
+        return ScreenSnapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=timestamp_ms,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            active_window_title=None,
+            uia_elements=[],
+            text_blocks=[],
+            visual_objects=[],
+            screenshot_path=None,
+            perception_mode=mode,  # type: ignore[arg-type]
+            capability_flags=_build_capability_flags(caps, uia_hollow=False),
+            is_untrusted=True,
+            uia_hollow=False,
+            capture_origin=(0, 0),
+            desktop_locked=True,
+            window_captured=False,
+            degradations=["desktop_locked"],
+        )
 
     # ── L1：窗口级定位（始终执行；指定 window_handle 时解除前台耦合） ─────────
     if window_handle is not None:
@@ -646,6 +691,10 @@ async def do_screen_snapshot(
             wc_rect = _get_window_rect(window_handle)
             if wc_rect is not None:
                 capture_origin = (wc_rect[0], wc_rect[1])
+        else:
+            # PrintWindow 直取失败（最小化/未渲染/GDI 失败/异常），机读标记后
+            # 回退全屏截图口径（K2 降级枚举）
+            degradations.append("window_capture_failed")
     if need_screenshot and screenshot_path is None:
         if caps.mss_available:
             try:
@@ -659,8 +708,10 @@ async def do_screen_snapshot(
                 capture_origin = (mss_result[1][0], mss_result[1][1])
             except Exception as exc:
                 logger.error("截图失败（非致命，继续感知）：%s", exc, exc_info=True)
+                degradations.append("screenshot_failed")
         else:
             logger.warning("mss 不可用，跳过截图（caps.mss_available=False）")
+            degradations.append("mss_unavailable")
 
     # ── L2：OCR（uia_ocr / full，需截图文件） ─────────────────────────────────
     text_blocks: list[TextBlock] = []
@@ -675,6 +726,7 @@ async def do_screen_snapshot(
             # **图像坐标**（屏幕绝对坐标 − 虚拟屏 origin），origin 参数传
             # capture_origin，_run_ocr_on_file_sync 会补偿回屏幕绝对坐标。
             ocr_bbox: dict[str, int] | None = None
+            ocr_crop_invalid = False
             if not window_captured and active_hwnd is not None and virtual_rect is not None:
                 win_rect = _get_window_rect(active_hwnd)
                 if win_rect is not None:
@@ -691,23 +743,32 @@ async def do_screen_snapshot(
                             "height": clamp_y1 - clamp_y0,
                         }
                     else:
+                        # K2 修正：旧行为回退全图 OCR 会把其他应用文本混入
+                        # perception_summary（跨窗口注入面，见上方 Task 12 注释）。
+                        # 改为 text_blocks 置空 + 机读标记，不再全图 OCR。
+                        ocr_crop_invalid = True
+                        degradations.append("ocr_crop_invalid")
                         logger.warning(
-                            "窗口 rect=%s 不在虚拟屏截图范围 %s 内，OCR 回退全图",
+                            "窗口 rect=%s 与虚拟屏截图范围 %s 无交集，OCR 跳过"
+                            "（不回退全图：跨窗口注入面）",
                             win_rect,
                             virtual_rect,
                         )
-            try:
-                text_blocks = await asyncio.to_thread(
-                    _run_ocr_on_file_sync,
-                    screenshot_path,
-                    ocr_bbox,
-                    snapshot_id,
-                    capture_origin,
-                )
-            except Exception as exc:
-                logger.error("OCR 失败（非致命）：%s", exc, exc_info=True)
+            if not ocr_crop_invalid:
+                try:
+                    text_blocks = await asyncio.to_thread(
+                        _run_ocr_on_file_sync,
+                        screenshot_path,
+                        ocr_bbox,
+                        snapshot_id,
+                        capture_origin,
+                    )
+                except Exception as exc:
+                    logger.error("OCR 失败（非致命）：%s", exc, exc_info=True)
+                    degradations.append("ocr_error")
         else:
             logger.warning("caps.ocr=False，跳过 OCR（RapidOCR 不可用）")
+            degradations.append("ocr_unavailable")
 
     # ── L3：视觉（full，当前仅模板匹配占位；OmniParser 仅 caps.omniparser） ───
     visual_objects: list[VisualObject] = []
@@ -718,14 +779,7 @@ async def do_screen_snapshot(
         # 后续 Task 4+ 扩展时填充此处
 
     # ── 能力 flags（写入 snapshot） ──────────────────────────────────────────
-    capability_flags: dict[str, bool] = {
-        "ocr": caps.ocr,
-        "omniparser": caps.omniparser,
-        "cuda_accel": caps.cuda_accel,
-        "dml_accel": caps.dml_accel,
-        "mss_available": caps.mss_available,
-        "uia_hollow": uia_hollow,
-    }
+    capability_flags = _build_capability_flags(caps, uia_hollow=uia_hollow)
 
     return ScreenSnapshot(
         snapshot_id=snapshot_id,
@@ -742,6 +796,9 @@ async def do_screen_snapshot(
         is_untrusted=True,
         uia_hollow=uia_hollow,
         capture_origin=capture_origin,
+        desktop_locked=False,
+        window_captured=window_captured,
+        degradations=degradations,
     )
 
 

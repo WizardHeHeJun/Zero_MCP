@@ -77,7 +77,7 @@ class ActionGuardProtocol(Protocol):
     """
 
     async def classify_risk(self, action: ActionSpec) -> ActionRisk:
-        """三级风险判定：白名单二次确认 + 声明风险取最高级。
+        """三级风险判定：白名单二次确认 + 声明与白名单基线取较高者。
 
         Args:
             action: 待判定的动作规格。
@@ -91,15 +91,22 @@ class ActionGuardProtocol(Protocol):
         self,
         action: ActionSpec,
         snapshot_before: ScreenSnapshot | None = None,
+        effective_risk: ActionRisk | None = None,
     ) -> Literal["pass", "abort"]:
         """TOCTOU 验证（Pre-execution UI State Verification）。
+
+        K1 ②：触发判定按 effective_risk（classify_risk 结果）而非声明值；
+        None 时回退 action.risk_level（向后兼容）。降级语义（K1 ③）：验证链路
+        降级时 DESTRUCTIVE fail-closed 返回 "abort"（error 日志含机读令牌
+        [desk:toctou_degraded]），非 DESTRUCTIVE 保留放行。
 
         Args:
             action: 待验证的动作规格。
             snapshot_before: 可选的执行前快照（已有截图则复用）。
+            effective_risk: classify_risk 判定后的有效风险级别；None 回退声明值。
 
         Returns:
-            "pass"（界面稳定，可执行）或 "abort"（界面已变，拒绝执行）。
+            "pass"（界面稳定，可执行）或 "abort"（界面已变/验证降级且高危，拒绝执行）。
         """
         ...
 

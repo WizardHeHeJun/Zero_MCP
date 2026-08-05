@@ -24,6 +24,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import cv2
+import numpy as np
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
@@ -34,8 +36,14 @@ from src.agents.desktop_control_agent import (
     _build_control_increment,
     make_control_node,
 )
-from src.agents.models.screen_snapshot import ActionResult, ActionRisk, ActionSpec
+from src.agents.models.screen_snapshot import (
+    ActionResult,
+    ActionRisk,
+    ActionSpec,
+    ScreenSnapshot,
+)
 from src.agents.protocols import ConfirmRequest, ConfirmResponse
+from src.orchestration.safety.action_guard import ActionGuard
 
 # ── 测试辅助 ──────────────────────────────────────────────────────────────────
 
@@ -195,6 +203,8 @@ async def test_resume_abort_returns_failed() -> None:
 
     assert result2.get("task_status") == "FAILED", f"期望 FAILED，得到 {result2.get('task_status')}"
     assert result2.get("control_error") is not None
+    # K5 ④：拒绝分支清 pending_action——同一被拒动作不得再次进入 control interrupt
+    assert result2.get("pending_action") is None
 
     # 拒绝后无写操作
     client.close_window.assert_not_called()
@@ -300,7 +310,7 @@ async def test_missing_pending_action_returns_error() -> None:
 
 
 def test_build_control_increment_success() -> None:
-    """_build_control_increment 成功时返回 control_error=None。"""
+    """_build_control_increment 成功时 control_error=None 且清 pending_action（K4 ③）。"""
     action = _make_action()
     result = ActionResult(
         action_id="test-action-001",
@@ -309,7 +319,7 @@ def test_build_control_increment_success() -> None:
         ui_changed=True,
     )
     increment = _build_control_increment(action, result)
-    assert increment == {"control_error": None}
+    assert increment == {"control_error": None, "pending_action": None}
 
 
 def test_build_control_increment_failure() -> None:
@@ -325,6 +335,8 @@ def test_build_control_increment_failure() -> None:
     assert increment.get("control_error") is not None
     assert "test-action-001" in increment["control_error"]
     assert "窗口不存在" in increment["control_error"]
+    # K4 ③：失败同样清 pending_action（动作已执行完毕，不得原样重放）
+    assert "pending_action" in increment and increment["pending_action"] is None
 
 
 # ── 9. dispatch_write 路由测试 ────────────────────────────────────────────────
@@ -415,7 +427,14 @@ async def test_window_close_missing_handle() -> None:
 
 
 async def test_mcp_call_error_caught_by_control_node() -> None:
-    """client 写操作抛 DesktopMCPCallError 时，control_node 捕获并返回 control_error。"""
+    """client 写操作抛 DesktopMCPCallError 时，control_node 捕获并返回 control_error。
+
+    F4 语义修订（code-review WARN）：本用例原先只断言 control_error 非空，未
+    对 pending_action 表态。新语义下 MCP 异常分支须清空 pending_action（见
+    _control_node docstring 的 at-least-once 论证）——本用例补上该断言，
+    与专门的 test_mcp_call_error_clears_pending_action 互为正反面覆盖
+    （该用例另做变异实证）。
+    """
     from src.mcp.desktop_mcp_client import DesktopMCPCallError
 
     client = _make_mock_client()
@@ -439,6 +458,8 @@ async def test_mcp_call_error_caught_by_control_node() -> None:
     result = await graph.ainvoke(initial_state, config=config)
 
     assert result.get("control_error") is not None
+    # F4：MCP 异常分支清 pending_action，防 Supervisor 原样重放非幂等写操作
+    assert result.get("pending_action") is None
 
 
 # ── 12. ConfirmRequest/ConfirmResponse 模型测试 ───────────────────────────────
@@ -670,6 +691,7 @@ async def test_dispatch_click_element_alias() -> None:
     client.click_element.assert_called_once_with(
         automation_id="btn-ok",
         coordinates=None,
+        expected_root_hwnd=None,
     )
 
 
@@ -689,6 +711,373 @@ async def test_missing_pending_action_dict_state() -> None:
 
     assert result.get("control_error") is not None
     assert "pending_action" in result["control_error"]
+
+
+# ── 21. K1 ④：execute 把 effective_risk 传入 toctou_verify ───────────────────
+
+
+async def test_execute_passes_effective_risk_to_toctou_verify() -> None:
+    """K1 ④：execute 把 classify_risk 结果作为 effective_risk 传入 toctou_verify。
+
+    场景：声明 READ_ONLY，guard.classify_risk 升级为 LOW_RISK——toctou_verify
+    必须收到升级后的 LOW_RISK（而非声明值），否则低报动作会跳过 TOCTOU。
+    """
+    action = ActionSpec(
+        action_id="act-eff-risk",
+        action_type="click",
+        target_element_id=None,
+        coordinates=(10, 20),
+        text_payload=None,
+        risk_level=ActionRisk.READ_ONLY,
+    )
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    await agent.execute(action)
+
+    kwargs = guard.toctou_verify.call_args.kwargs
+    assert kwargs.get("effective_risk") == ActionRisk.LOW_RISK, (
+        f"toctou_verify 应收到 classify_risk 升级后的 effective_risk=LOW_RISK，"
+        f"实际 kwargs={kwargs!r}"
+    )
+
+
+# ── 22. K1 ⑤：make_control_node snapshot_store 注入与新鲜度门 ────────────────
+
+
+def _make_store_snapshot(
+    screenshot_path: str | None,
+    timestamp_ms: int,
+) -> ScreenSnapshot:
+    """构造 SnapshotStore 返回的最小 ScreenSnapshot（新鲜度门测试用）。"""
+    return ScreenSnapshot(
+        snapshot_id="snap-ctrl-store",
+        timestamp_ms=timestamp_ms,
+        screen_width=1920,
+        screen_height=1080,
+        active_window_title="Test",
+        uia_elements=[],
+        text_blocks=[],
+        visual_objects=[],
+        screenshot_path=screenshot_path,
+        perception_mode="uia_only",
+        capability_flags={},
+        uia_hollow=False,
+    )
+
+
+def _write_gray_png(path: str, gray_value: int = 128) -> None:
+    """写一张 64x64 单色灰度 PNG（TOCTOU phash 比对用，同 test_action_guard 口径）。"""
+    img = np.full((64, 64), gray_value, dtype=np.uint8)
+    cv2.imwrite(path, img)
+
+
+def _make_low_risk_click_no_coords() -> ActionSpec:
+    """LOW_RISK 无坐标 click：触发 TOCTOU（整图口径）但不触发 interrupt。"""
+    return ActionSpec(
+        action_id="act-store-001",
+        action_type="click",
+        target_element_id=None,
+        coordinates=None,
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+    )
+
+
+async def test_control_node_passes_fresh_snapshot_to_guard() -> None:
+    """K1 ⑤：新鲜 snapshot_ref → 加载的快照作为 snapshot_before 传入 guard。"""
+    import time
+
+    fresh_snap = _make_store_snapshot(None, timestamp_ms=int(time.time() * 1000))
+    store = MagicMock()
+    store.load = AsyncMock(return_value=fresh_snap)
+
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent, snapshot_store=store)
+
+    await node_fn({"pending_action": _make_low_risk_click_no_coords(), "snapshot_ref": "snap-1"})
+
+    store.load.assert_awaited_once_with("snap-1")
+    kwargs = guard.toctou_verify.call_args.kwargs
+    assert kwargs.get("snapshot_before") is fresh_snap
+
+
+async def test_control_node_stale_snapshot_passes_none_to_guard() -> None:
+    """K1 ⑤ 新鲜度门：过旧快照（timestamp 远古）不复用，snapshot_before=None。"""
+    stale_snap = _make_store_snapshot(None, timestamp_ms=1000)  # 1970 年，远超 5000ms
+    store = MagicMock()
+    store.load = AsyncMock(return_value=stale_snap)
+
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent, snapshot_store=store)
+
+    await node_fn({"pending_action": _make_low_risk_click_no_coords(), "snapshot_ref": "snap-2"})
+
+    kwargs = guard.toctou_verify.call_args.kwargs
+    assert kwargs.get("snapshot_before") is None
+
+
+async def test_control_node_fresh_snapshot_saves_one_rpc(tmp_path: Any) -> None:
+    """K1 ⑤（真 ActionGuard）：新鲜快照复用为 TOCTOU 基线——screen_snapshot 少调一次。"""
+    import time
+
+    img_a = str(tmp_path / "before.png")
+    img_b = str(tmp_path / "after.png")
+    _write_gray_png(img_a, gray_value=128)
+    _write_gray_png(img_b, gray_value=128)
+
+    fresh_snap = _make_store_snapshot(img_a, timestamp_ms=int(time.time() * 1000))
+    store = MagicMock()
+    store.load = AsyncMock(return_value=fresh_snap)
+
+    client = _make_mock_client()
+    client.screen_snapshot = AsyncMock(
+        side_effect=[_make_store_snapshot(img_b, timestamp_ms=int(time.time() * 1000))]
+    )
+    guard = ActionGuard(client=client)  # 真安全门
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent, snapshot_store=store)
+
+    with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+        result = await node_fn(
+            {"pending_action": _make_low_risk_click_no_coords(), "snapshot_ref": "snap-3"}
+        )
+
+    # 第一张基线来自 store 快照，只重拍了第二张
+    assert client.screen_snapshot.call_count == 1
+    assert result.get("control_error") is None
+    client.click_element.assert_called_once()
+
+
+async def test_control_node_stale_snapshot_reshoots_both(tmp_path: Any) -> None:
+    """K1 ⑤（真 ActionGuard）：过旧快照不复用——两张截图都重拍（现行为）。"""
+    import time
+
+    img_a = str(tmp_path / "before.png")
+    img_b = str(tmp_path / "after.png")
+    _write_gray_png(img_a, gray_value=128)
+    _write_gray_png(img_b, gray_value=128)
+
+    stale_snap = _make_store_snapshot(img_a, timestamp_ms=1000)
+    store = MagicMock()
+    store.load = AsyncMock(return_value=stale_snap)
+
+    client = _make_mock_client()
+    client.screen_snapshot = AsyncMock(
+        side_effect=[
+            _make_store_snapshot(img_a, timestamp_ms=int(time.time() * 1000)),
+            _make_store_snapshot(img_b, timestamp_ms=int(time.time() * 1000)),
+        ]
+    )
+    guard = ActionGuard(client=client)
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent, snapshot_store=store)
+
+    with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+        result = await node_fn(
+            {"pending_action": _make_low_risk_click_no_coords(), "snapshot_ref": "snap-4"}
+        )
+
+    assert client.screen_snapshot.call_count == 2
+    assert result.get("control_error") is None
+
+
+async def test_control_node_store_load_failure_falls_back() -> None:
+    """K1 ⑤ 防御：store.load 抛异常时回退重拍（snapshot_before=None），不阻断执行。"""
+    store = MagicMock()
+    store.load = AsyncMock(side_effect=RuntimeError("存储不可用"))
+
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent, snapshot_store=store)
+
+    result = await node_fn(
+        {"pending_action": _make_low_risk_click_no_coords(), "snapshot_ref": "snap-5"}
+    )
+
+    kwargs = guard.toctou_verify.call_args.kwargs
+    assert kwargs.get("snapshot_before") is None
+    assert result.get("control_error") is None
+
+
+async def test_control_node_without_store_keeps_current_behavior() -> None:
+    """K1 ⑤ 零回归：不注入 snapshot_store 时 snapshot_before 恒为 None（现行为）。"""
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent)
+
+    result = await node_fn({"pending_action": _make_low_risk_click_no_coords()})
+
+    kwargs = guard.toctou_verify.call_args.kwargs
+    assert kwargs.get("snapshot_before") is None
+    assert result.get("control_error") is None
+
+
+# ── 23. F1（code-review BLOCK）：_dispatch_write 落点核验参数透传 ────────────
+
+
+async def test_dispatch_click_passes_expected_root_hwnd_to_client() -> None:
+    """F1：ActionSpec.expected_root_hwnd 设为具体整数时，client.click_element
+    必须收到同一个值——_dispatch_write 是唯一集中调用点，漏传会让落点核验
+    （K7 批2）在 Agent 执行链路上静默失效（client 侧支持但收不到实参）。
+    """
+    action = ActionSpec(
+        action_id="act-hwnd",
+        action_type="click",
+        target_element_id=None,
+        coordinates=(10, 20),
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+        expected_root_hwnd=98765,
+    )
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    await agent.execute(action)
+
+    client.click_element.assert_called_once_with(
+        automation_id=None,
+        coordinates=(10, 20),
+        expected_root_hwnd=98765,
+    )
+
+
+async def test_dispatch_click_default_expected_root_hwnd_is_none() -> None:
+    """F1 零回归对照：ActionSpec.expected_root_hwnd 未设置（默认 None）时，
+    client.click_element 收到的 expected_root_hwnd 同样为 None（不核验落点）。
+    """
+    action = ActionSpec(
+        action_id="act-hwnd-default",
+        action_type="click_element",
+        target_element_id="btn-cancel",
+        coordinates=None,
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+    )
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    await agent.execute(action)
+
+    client.click_element.assert_called_once_with(
+        automation_id="btn-cancel",
+        coordinates=None,
+        expected_root_hwnd=None,
+    )
+
+
+# ── 24. F4（code-review WARN）：MCP 异常分支清 pending_action ────────────────
+
+
+async def test_mcp_call_error_clears_pending_action() -> None:
+    """F4：DesktopMCPCallError 分支须清空 pending_action。
+
+    RPC 已发出、结果未知（at-least-once）——保留 pending_action 会让
+    Supervisor 把它当「未执行」原样重放，对非幂等写操作（如发消息）有重复
+    副作用风险；清空后 Supervisor 需重新规划（经 node_fn 直接验证节点级
+    增量，避开图 state 合并语义）。
+    """
+    from src.mcp.desktop_mcp_client import DesktopMCPCallError
+
+    client = _make_mock_client()
+    client.click_element = AsyncMock(side_effect=DesktopMCPCallError("click_element", "调用失败"))
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent)
+
+    action = ActionSpec(
+        action_id="act-mcp-err",
+        action_type="click",
+        target_element_id=None,
+        coordinates=(1, 2),
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+    )
+
+    increment = await node_fn({"pending_action": action})
+
+    assert increment.get("control_error") is not None
+    assert "pending_action" in increment and increment["pending_action"] is None
+
+
+async def test_mcp_connection_error_clears_pending_action() -> None:
+    """F4：DesktopMCPConnectionError 分支同样清空 pending_action（同一 except 元组）。"""
+    from src.mcp.desktop_mcp_client import DesktopMCPConnectionError
+
+    client = _make_mock_client()
+    client.click_element = AsyncMock(side_effect=DesktopMCPConnectionError("连接断开"))
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent)
+
+    action = ActionSpec(
+        action_id="act-mcp-conn-err",
+        action_type="click",
+        target_element_id=None,
+        coordinates=(1, 2),
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+    )
+
+    increment = await node_fn({"pending_action": action})
+
+    assert increment.get("control_error") is not None
+    assert "pending_action" in increment and increment["pending_action"] is None
+
+
+async def test_unexpected_exception_clears_pending_action() -> None:
+    """F4 复核追加：except Exception 兜底分支同样清空 pending_action。
+
+    该分支可捕获「RPC 响应已返回、解析/后处理才抛」的异常（如 ActionResult
+    响应体 ValidationError）——server 大概率已真执行写操作，比连接断开更接近
+    「已执行」，保留 pending_action 的重放风险更高，故与 MCP 异常分支同语义。
+    """
+    client = _make_mock_client()
+    client.click_element = AsyncMock(side_effect=ValueError("响应体解析失败"))
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent)
+
+    action = ActionSpec(
+        action_id="act-unexpected-err",
+        action_type="click",
+        target_element_id=None,
+        coordinates=(1, 2),
+        text_payload=None,
+        risk_level=ActionRisk.LOW_RISK,
+    )
+
+    increment = await node_fn({"pending_action": action})
+
+    assert (increment.get("control_error") or "").startswith("unexpected:")
+    assert "pending_action" in increment and increment["pending_action"] is None
+
+
+async def test_toctou_abort_retains_pending_action_at_node_level() -> None:
+    """F4 对照（零回归）：TOCTOU abort 发生在写操作派发前（只读区），语义不变。
+
+    node 级增量不含 pending_action 键（LastValue 保留旧值）——重试前仍会
+    重新经过 TOCTOU 核验，不构成 at-least-once 风险，故不清空。
+    """
+    action = _make_low_risk_click_no_coords()
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="abort")
+    agent = DesktopControlAgent(client=client, guard=guard)
+    node_fn = make_control_node(agent)
+
+    increment = await node_fn({"pending_action": action})
+
+    assert "TOCTOU abort" in (increment.get("control_error") or "")
+    assert "pending_action" not in increment
 
 
 # ── pytest 配置提示（不是测试函数） ──────────────────────────────────────────

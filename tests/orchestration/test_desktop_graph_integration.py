@@ -29,8 +29,10 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import cv2
+import numpy as np
 from langgraph.types import Command
 
 from src.agents.desktop_control_agent import DesktopControlAgent
@@ -47,6 +49,7 @@ from src.agents.screen_perception_agent import ScreenPerceptionAgent
 from src.orchestration.desktop_graph import get_graph
 from src.orchestration.desktop_supervisor import DesktopSupervisorAgent
 from src.orchestration.prompt_loader import PromptLoader
+from src.orchestration.safety.action_guard import ActionGuard
 from src.orchestration.state import (
     ConfirmRequest,
     ConfirmResponse,
@@ -638,12 +641,13 @@ class TestInterruptResumePath:
         2. 图继续运行直到 END（不因 abort 直接停止）。
         3. memory_flush 被调（不管最终 task_status）。
 
-        图行为：abort → control_error 非 None（task_status=FAILED by control）
-          → route_after_control → stall_detect（因 control 设 FAILED）
+        图行为（K5 ③ 修订）：abort → control 增量设 FAILED + 清 pending_action
+          → route_after_control → stall_detect（control_error 非 None）
           → route_after_stall（stall_count 未达阈）→ supervisor
-          → supervisor 用 LLM 第二响应声明 FAILED → memory_flush → END。
+          → **终态守卫**：FAILED 不再调 LLM，直接空增量 → memory_flush → END。
 
-        此测试用两个 LLM 响应：第一个触发 control，第二个 supervisor 声明 FAILED。
+        LLM 第二响应（声明 FAILED）在守卫生效后不再被消费——保留仅为
+        「守卫失效则由 LLM 收口」的防御纵深，不作断言依赖。
         """
         task_id = "task-resume-abort-001"
         mock_client = _make_mock_client()
@@ -764,7 +768,10 @@ class TestPerceptionFailureStallPath:
     """感知失败停滞路径集成测试（R3 决策：perceive→stall_detect→supervisor）。
 
     验证：
-      - perception_error 连续出现 → stall_count 达 STALL_THRESHOLD。
+      - 持续感知失败 → stall_count 达 STALL_THRESHOLD。
+        K5 修订后的机制：同一错误指纹只计一次（信号 C 去重 + 无信号轮归零），
+        持续失败的收口由**信号 B**（同 Worker 步骤重复，K4 的 step_history
+        真实写回使其通电）在第 6/7/8 轮累加至阈值——实测 8 轮 FAILED。
       - 停滞超阈 → error_report 被调 → memory_flush → END。
       - task_status 最终为 FAILED。
       - R3 图结构正确：perceive 后经 stall_detect（不直接回 supervisor）。
@@ -1123,3 +1130,98 @@ class TestMissingApiKeyGracefulFallback:
             f"缺 ANTHROPIC_API_KEY 应优雅回退为 FAILED，实际 {result.get('task_status')!r}"
         )
         # 不应崩溃（到达此处即通过）
+
+
+# ── 测试 6：K1 ①——真 ActionGuard 下低声明高危动作仍触发 interrupt ────────────
+
+
+class TestLowDeclaredDestructiveEscalation:
+    """K1 ① 集成验证：真 ActionGuard + mock client。
+
+    window_close 声明 LOW_RISK（上游低报）——classify_risk 按白名单基线升级为
+    DESTRUCTIVE，仍触发 lg_interrupt 人工确认，写操作留在 resume 后。
+    修复前 classify_risk 总返回声明值 → 无 interrupt 直接执行——本用例必红。
+    """
+
+    async def test_window_close_declared_low_risk_still_interrupts(self, tmp_path: Any) -> None:
+        """window_close 声明 LOW_RISK → 真安全门升级 → interrupt 触发、写操作被拦。"""
+        task_id = "task-k1-escalation-001"
+
+        # TOCTOU 需要真实截图做 phash 比对：两次取同一张灰度图 → delta=0 → pass
+        img_path = str(tmp_path / "stable.png")
+        cv2.imwrite(img_path, np.full((64, 64), 128, dtype=np.uint8))
+        snapshot_with_img = _make_snapshot().model_copy(update={"screenshot_path": img_path})
+
+        mock_client = _make_mock_client(snapshot=snapshot_with_img)
+        mock_memory_api = _make_mock_memory_api()
+        mock_llm = _make_mock_llm_client([_R_CONTROL_RUNNING, _R_PERCEIVE_DONE])
+
+        # 真 ActionGuard（非 mock）——K1 升级逻辑真实生效
+        real_guard = ActionGuard(client=mock_client)
+        control_agent = DesktopControlAgent(client=mock_client, guard=real_guard)
+
+        prompt_loader = PromptLoader()
+        supervisor_agent = DesktopSupervisorAgent(
+            llm_client=mock_llm,
+            prompt_loader=prompt_loader,
+        )
+        perception_agent = ScreenPerceptionAgent(client=mock_client, snapshot_store=None)
+
+        graph = get_graph(
+            supervisor_agent=supervisor_agent,
+            perception_agent=perception_agent,
+            control_agent=control_agent,
+            memory_api=mock_memory_api,
+            checkpointer=None,
+        )
+
+        # 上游低报：window_close 声明 LOW_RISK
+        pending_action = ActionSpec(
+            action_id="act-k1-lowdecl-001",
+            action_type="window_close",
+            target_element_id="24680",
+            coordinates=None,
+            text_payload=None,
+            risk_level=ActionRisk.LOW_RISK,
+        )
+
+        config = {"configurable": {"thread_id": task_id}}
+
+        with _ApiKeyContext():
+            with patch(
+                "src.orchestration.safety.action_guard.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                result1 = await graph.ainvoke(
+                    DesktopTaskState(
+                        task_id=task_id,
+                        task_description="K1 低声明升级集成测试",
+                        task_status=TaskStatus.RUNNING,
+                        pending_action=pending_action,
+                    ),
+                    config=config,
+                )
+
+                # 低声明动作仍触发 interrupt（升级为 DESTRUCTIVE）
+                interrupts = result1.get("__interrupt__", [])
+                assert len(interrupts) > 0, (
+                    "K1：window_close 声明 LOW_RISK 仍应经白名单升级触发 interrupt，"
+                    f"实际未触发。result keys: {list(result1.keys())}"
+                )
+                payload = _extract_interrupt_payload(result1)
+                assert payload is not None
+                assert payload.risk_level == ActionRisk.DESTRUCTIVE, (
+                    f"ConfirmRequest 应携带升级后的 DESTRUCTIVE，实际 {payload.risk_level!r}"
+                )
+
+                # interrupt 前写操作被拦（只读区红线）
+                mock_client.close_window.assert_not_called()
+
+                # resume 确认后写操作恰好执行一次
+                result2 = await graph.ainvoke(
+                    Command(resume=ConfirmResponse(confirmed=True, reason="K1 集成确认")),
+                    config=config,
+                )
+
+        mock_client.close_window.assert_called_once_with(window_handle=24680)
+        assert result2.get("task_status") == TaskStatus.DONE

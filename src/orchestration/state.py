@@ -14,6 +14,11 @@ DesktopTaskState 是贯穿整个桌面任务执行图的核心 state 容器，
 - ConfirmRequest / ConfirmResponse 权威定义在 src.agents.protocols（agents 层），
   本文件从那里 re-export，供编排层内部（graph.py 等）使用。
   orchestration 下调 agents.protocols 符合三层单向依赖方向。
+- StepRecord / append_step 权威定义在 src.agents.models.step_record（code-review
+  F2 根治：原先本体在此文件、被 src/agents/*.py 反向 import 违反三层单向依赖，
+  现挪到 agents 与 orchestration 共同下调的契约层，本文件从那里 re-export）。
+  既有 `from src.orchestration.state import StepRecord, append_step` 消费面
+  （15 处调用点）无需改动，import 路径保持可用。
 
 层依赖：本文件 import pydantic / enum / src.agents.*（下调允许），
 不 import orchestration 内其他模块（避免循环 import）。
@@ -23,14 +28,15 @@ from __future__ import annotations
 
 import os
 from enum import StrEnum
-from typing import Any
 
 from pydantic import BaseModel, Field
 
 from src.agents.models.screen_snapshot import ActionSpec
+from src.agents.models.step_record import StepRecord, append_step
 from src.agents.protocols import ConfirmRequest, ConfirmResponse
 
-# re-export：编排层内其他模块可从此处 import，无需知道权威定义在 agents.protocols
+# re-export：编排层内其他模块可从此处 import，无需知道权威定义在
+# agents.protocols / agents.models.step_record
 __all__ = [
     "ConfirmRequest",
     "ConfirmResponse",
@@ -38,6 +44,7 @@ __all__ = [
     "StepArchive",
     "StepRecord",
     "TaskStatus",
+    "append_step",
 ]
 
 # ── TaskStatus StrEnum ─────────────────────────────────────────────────────────
@@ -64,26 +71,9 @@ class TaskStatus(StrEnum):
 # 下游模块可继续 from src.orchestration.state import ConfirmRequest/ConfirmResponse。
 # __all__ 中声明即为显式 re-export（PEP 484），无需重赋值。
 
-
-# ── StepRecord ────────────────────────────────────────────────────────────────
-
-
-class StepRecord(BaseModel):
-    """单步执行记录，追加到 step_history。
-
-    字段设计以「可序列化、不含大对象」为原则（orchestration-rules）。
-    snapshot_ref 只存 ID，ScreenSnapshot 本体经 SnapshotStore 外存。
-    """
-
-    step_index: int
-    agent: str  # "perceive" | "control" | "supervisor" | 等
-    instruction: str  # 本步执行的指令摘要
-    snapshot_ref: str | None  # 感知快照 ID（外存引用）
-    perception_summary: str | None  # 感知摘要（可选，截断由 prompt_loader 处理）
-    control_error: str | None  # 控制错误信息（None 表示成功）
-    perception_error: str | None  # 感知错误信息（None 表示成功）
-    task_status: str  # 执行后 task_status 快照
-    metadata: dict[str, Any] = Field(default_factory=dict)  # 扩展字段
+# ── StepRecord / append_step re-export（权威定义在 src.agents.models.step_record）
+# 下游模块可继续 from src.orchestration.state import StepRecord/append_step。
+# __all__ 中声明即为显式 re-export（PEP 484），无需重赋值。
 
 
 # ── StepArchive Protocol 打桩 ─────────────────────────────────────────────────
@@ -142,10 +132,17 @@ class DesktopTaskState(BaseModel):
       perception_error  — 最新感知错误（None=无错误）。
       pending_action    — 待执行动作（Supervisor 分配给控制 Worker）。
       control_error     — 最新控制错误（None=无错误）。
-      stall_count       — 连续停滞计数（stall_detect_node 累加）。
+      stall_count       — **连续**停滞计数（stall_detect_node 维护：本轮有信号则
+                          累加，无任何信号则归零——K5 ② 连续语义）。
       last_screen_hash  — 上次感知的屏幕 phash（停滞检测用，字符串序列化 bits）。
-      uia_hollow        — 当前目标窗口是否 UIA 空洞（Task 1 实测，影响提示词）。
+      counted_error_fingerprint — 信号 C 已计数的错误指纹（K5 ① 去重）。
+      uia_hollow        — 当前目标窗口是否 UIA 空洞（Task 1 实测，影响提示词；
+                          由 perceive 增量随快照刷新，感知失败时保留旧值）。
+      target_window_handle — 定向感知目标窗口 HWND（K6，None=前台窗口）。
       capability_flags  — 能力协商结果（来自 DesktopMCPClient 缓存）。
+
+    step_history 由 Worker 节点经 `append_step` 纯函数追加（K4：perceive /
+    control 增量各自带回追加后的完整 list），Supervisor 只做截断归档。
     """
 
     # 任务基础信息
@@ -172,9 +169,22 @@ class DesktopTaskState(BaseModel):
     # 停滞检测（stall_detect_node 更新）
     stall_count: int = 0
     last_screen_hash: str | None = None
+    # K5 ①：信号 C 去重——上次已计入 stall_count 的错误指纹
+    # （(perception_error, control_error) 的序列化形态）。错误文本在 LastValue
+    # state 里会跨节点残留（perceive 成功不清 control_error），按指纹去重保证
+    # 同一错误只计一次；错误清空后指纹归 None，同一错误再现视为新停滞事件。
+    counted_error_fingerprint: str | None = None
 
-    # UIA 空洞标记（Task 1 实测）
+    # UIA 空洞标记（Task 1 实测；K4 起由 perceive 增量随快照刷新）
     uia_hollow: bool = False
+
+    # K6：定向感知目标窗口 HWND（None=前台窗口，现状口径零回归）。
+    # ⚠ HWND 生命周期风险：跨 checkpoint resume 后句柄可能已失效（窗口关闭/
+    #   重建），失效表现为 screen_snapshot 调用失败，经既有 perception_error
+    #   路径回报，不需新错误通道。
+    # ⚠ 任务中途切换 target 会使下一次 stall 信号 A 比对失真一轮：新旧窗口
+    #   画面必然不同 → 误判「有进展」（保守方向——只会少计停滞，不会误杀）。
+    target_window_handle: int | None = None
 
     # 能力协商结果（来自 DesktopMCPClient 缓存）
     capability_flags: dict[str, bool] = Field(default_factory=dict)

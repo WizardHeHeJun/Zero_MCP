@@ -360,6 +360,7 @@ class DesktopMCPClient:
         automation_id: str | None = None,
         coordinates: tuple[int, int] | None = None,
         method: str = "coordinate",
+        expected_root_hwnd: int | None = None,
     ) -> ActionResult:
         """点击指定坐标或 UIA 元素。
 
@@ -369,6 +370,9 @@ class DesktopMCPClient:
                            模式使用；None 或空字符串时自动降级到 coordinate 模式。
             coordinates: 目标物理像素坐标 (x, y)。
             method: 点击方式，"coordinate"（默认）| "uia_invoke" | "uia_click"。
+            expected_root_hwnd: 坐标落点核验的期望顶层窗口句柄（K7 批2，来自
+                ActionSpec.expected_root_hwnd）；None=不核验（零回归，不随参数
+                下发）。仅主窗元素点击设期望值，弹出菜单勿设（契约 docstring）。
 
         Returns:
             ActionResult 模型实例（含 success / error_message / ui_changed）。
@@ -381,6 +385,8 @@ class DesktopMCPClient:
             args["automation_id"] = automation_id
         if coordinates is not None:
             args["coordinates"] = list(coordinates)
+        if expected_root_hwnd is not None:
+            args["expected_root_hwnd"] = expected_root_hwnd
         text = await self._call_tool("click_element", args)
         return ActionResult.model_validate_json(text)
 
@@ -436,11 +442,21 @@ class DesktopMCPClient:
         result: list[dict[str, Any]] = json.loads(text)
         return result
 
-    async def focus_window(self, window_handle: int) -> ActionResult:
-        """将指定窗口置于前台并获取焦点。
+    async def focus_window(self, window_handle: int, pin_topmost: bool = False) -> ActionResult:
+        """将指定窗口置于前台（K8 前台唤回梯级 + Win32 级核验）。
+
+        success=True 仅表示 Win32 级核验通过（前台根==目标且非 iconic），
+        最终确认以后续快照像素锚点为准；全梯失败时 error_message 带
+        [desk:focus_unverified] 令牌。
+
+        ⚠ 仅供外部 MCP host 直调的手动工具，不在 DesktopControlAgent 安全管线
+        （ActionGuard/TOCTOU/interrupt）内——`ActionSpec` 目前无窗口句柄字段，
+        Agent 侧接线待契约扩展后另批（code-review F3，本批只做文档口径澄清）。
 
         Args:
             window_handle: 目标窗口 HWND 句柄。
+            pin_topmost: True 时梯级期间临时 HWND_TOPMOST 置顶并成对撤销
+                （默认 False，不随参数下发——零回归）。
 
         Returns:
             ActionResult 模型实例。
@@ -448,7 +464,10 @@ class DesktopMCPClient:
         Raises:
             DesktopMCPCallError: server 工具调用失败。
         """
-        text = await self._call_tool("focus_window", {"window_handle": window_handle})
+        args: dict[str, Any] = {"window_handle": window_handle}
+        if pin_topmost:
+            args["pin_topmost"] = True
+        text = await self._call_tool("focus_window", args)
         return ActionResult.model_validate_json(text)
 
     async def close_window(self, window_handle: int) -> ActionResult:

@@ -1,12 +1,13 @@
-"""stall_detect_node 三信号单元测试（Task 10BC）。
+"""stall_detect_node 三信号单元测试（Task 10BC，K5 修订）。
 
 覆盖：
   信号 A — 画面 phash 不变（snapshot_store 注入，hamming 距离 < 阈值）
   信号 B — 步骤重复（len(step_history) > STALL_MAX_STEPS 且最近 N 步同 Worker）
-  信号 C — 连续错误（最近步骤均有 perception_error 或 control_error）
-  感知失败信号 — perception_error 非 None 触发 C 信号（R3 路径关键）
-  组合 — 多信号同时触发，stall_count 累加正确
-  快乐路径 — 无信号，stall_count 不变
+  信号 C — 错误指纹去重计数（K5 ①：(perception_error, control_error) 指纹相对
+           「上次已计数指纹」新产生时 +1；同指纹不重复计；错误清空后指纹归 None）
+  连续语义 — 本轮无任何信号（increment==0）时 stall_count **归零**（K5 ②，
+           修订理由：文档语义本为「连续停滞计数」，旧实现只加不清）
+  K5 场景 — control 失败 1 次 + 感知成功 2 次不误杀；停滞-进展交替不达阈值
 """
 
 from __future__ import annotations
@@ -14,9 +15,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 from src.orchestration.desktop_graph import (
-    STALL_CONSECUTIVE_ERROR_WINDOW,
     STALL_MAX_STEPS,
+    STALL_THRESHOLD,
     _compute_average_hash,
+    _error_fingerprint,
     _hamming_distance,
     make_stall_detect_node,
 )
@@ -278,104 +280,105 @@ class TestStallDetectSignalB:
         assert result["stall_count"] >= 1
 
 
-# ── 信号 C：连续错误 ──────────────────────────────────────────────────────────
+# ── 信号 C：错误指纹去重计数（K5 ①）──────────────────────────────────────────
+
+
+class TestErrorFingerprint:
+    """_error_fingerprint 纯函数。"""
+
+    def test_no_errors_returns_none(self) -> None:
+        """两者皆 None → 无指纹。"""
+        assert _error_fingerprint(None, None) is None
+
+    def test_fingerprint_deterministic_and_distinct(self) -> None:
+        """同错误同指纹；不同错误/不同通道指纹不同。"""
+        assert _error_fingerprint("e1", None) == _error_fingerprint("e1", None)
+        assert _error_fingerprint("e1", None) != _error_fingerprint("e2", None)
+        # 同文本落在不同通道也算不同指纹（感知错≠控制错）
+        assert _error_fingerprint("e1", None) != _error_fingerprint(None, "e1")
 
 
 class TestStallDetectSignalC:
-    """信号 C：最近步骤均有 perception_error 或 control_error → 触发停滞。"""
+    """信号 C：错误指纹相对「上次已计数指纹」新产生时 +1（去重）。"""
 
-    async def test_signal_c_triggers_with_consecutive_perception_errors(self) -> None:
-        """最近 STALL_CONSECUTIVE_ERROR_WINDOW 步均有 perception_error → 信号 C。
+    async def test_new_perception_error_fingerprint_counts(self) -> None:
+        """新感知错误（counted 指纹为 None）→ +1，且回写已计数指纹。"""
+        state = _make_state(perception_error="MCP 连接失败")
 
-        这是 R3 决策中感知失败停滞路径的关键验证：
-        perceive_node 返回 perception_error，stall_detect_node 识别信号 C。
+        node = make_stall_detect_node(snapshot_store=None)
+        result = await node(state)
+
+        assert result["stall_count"] == 1
+        assert result["counted_error_fingerprint"] == _error_fingerprint("MCP 连接失败", None)
+
+    async def test_new_control_error_fingerprint_counts(self) -> None:
+        """新控制错误 → +1。"""
+        state = _make_state(control_error="点击失败：元素不可见")
+
+        node = make_stall_detect_node(snapshot_store=None)
+        result = await node(state)
+
+        assert result["stall_count"] == 1
+
+    async def test_same_fingerprint_not_recounted(self) -> None:
+        """同一错误指纹已计数 → 不再 +1（LastValue 残留错误文本不重复计）。
+
+        典型场景：control_error 残留在 state 里，后续 perceive 轮次反复经过
+        stall_detect——旧实现每轮 +1（误杀），新语义只计一次。
         """
-        steps = [
-            _make_step(
-                agent="perceive",
-                step_index=i,
-                perception_error="MCP 连接失败",
-            )
-            for i in range(STALL_CONSECUTIVE_ERROR_WINDOW)
-        ]
-        state = _make_state(step_history=steps, perception_error="MCP 连接失败")
+        fp = _error_fingerprint(None, "点击失败")
+        state = _make_state(control_error="点击失败", counted_error_fingerprint=fp, stall_count=1)
 
         node = make_stall_detect_node(snapshot_store=None)
         result = await node(state)
 
-        assert result["stall_count"] >= 1
-
-    async def test_signal_c_triggers_with_consecutive_control_errors(self) -> None:
-        """最近步骤均有 control_error → 信号 C。"""
-        steps = [
-            _make_step(
-                agent="control",
-                step_index=i,
-                control_error="点击失败：元素不可见",
-            )
-            for i in range(STALL_CONSECUTIVE_ERROR_WINDOW)
-        ]
-        state = _make_state(step_history=steps, control_error="点击失败")
-
-        node = make_stall_detect_node(snapshot_store=None)
-        result = await node(state)
-
-        assert result["stall_count"] >= 1
-
-    async def test_signal_c_triggers_with_mixed_errors(self) -> None:
-        """perception_error 与 control_error 交替出现也触发信号 C。"""
-        steps = [
-            _make_step(agent="perceive", step_index=0, perception_error="感知失败"),
-            _make_step(agent="control", step_index=1, control_error="控制失败"),
-        ]
-        # 确保窗口 = 2（默认）
-        assert STALL_CONSECUTIVE_ERROR_WINDOW == 2
-        state = _make_state(step_history=steps)
-
-        node = make_stall_detect_node(snapshot_store=None)
-        result = await node(state)
-
-        assert result["stall_count"] >= 1
-
-    async def test_signal_c_not_triggered_when_error_not_consecutive(self) -> None:
-        """有成功步骤打断连续错误 → 不触发信号 C。"""
-        steps = [
-            _make_step(agent="perceive", step_index=0, perception_error="感知失败"),
-            _make_step(agent="control", step_index=1),  # 无错误
-        ]
-        state = _make_state(step_history=steps, perception_error=None, control_error=None)
-
-        node = make_stall_detect_node(snapshot_store=None)
-        result = await node(state)
-
+        # 无新信号 → 连续语义归零（而非维持 1）
         assert result["stall_count"] == 0
+        # 指纹保留（错误文本未清，仍是同一个已计数错误）
+        assert result["counted_error_fingerprint"] == fp
 
-    async def test_signal_c_via_current_state_error(self) -> None:
-        """step_history 不足窗口大小但 state 直接字段有错误 → 触发 C（兜底）。"""
+    async def test_changed_fingerprint_counts_again(self) -> None:
+        """错误内容变化（新指纹）→ 再次 +1 并累加。"""
+        old_fp = _error_fingerprint("旧错误", None)
         state = _make_state(
-            step_history=[],  # 空历史
-            perception_error="DesktopMCPConnectionError: 连接断开",
+            perception_error="新错误",
+            counted_error_fingerprint=old_fp,
+            stall_count=2,
         )
 
         node = make_stall_detect_node(snapshot_store=None)
         result = await node(state)
 
-        assert result["stall_count"] >= 1
+        assert result["stall_count"] == 3
+        assert result["counted_error_fingerprint"] == _error_fingerprint("新错误", None)
+
+    async def test_fingerprint_cleared_when_no_error(self) -> None:
+        """本轮无错误 → 已计数指纹归 None（同一错误再现视为新停滞事件）。"""
+        state = _make_state(
+            counted_error_fingerprint=_error_fingerprint("旧错误", None),
+        )
+
+        node = make_stall_detect_node(snapshot_store=None)
+        result = await node(state)
+
+        assert result["counted_error_fingerprint"] is None
+        assert result["stall_count"] == 0
+
+    async def test_error_text_not_cleared_by_stall_detect(self) -> None:
+        """stall_detect 增量不含 perception_error/control_error——
+        执行顺序 stall_detect→supervisor，错误原文必须留给 supervisor 的 prompt。"""
+        state = _make_state(perception_error="连接超时", control_error="点击失败")
+
+        node = make_stall_detect_node(snapshot_store=None)
+        result = await node(state)
+
+        assert "perception_error" not in result
+        assert "control_error" not in result
 
     async def test_perception_failure_signal_r3_path(self) -> None:
-        """R3 路径关键测试：感知失败触发信号 C → stall_count 累加。
-
-        验证 perceive→stall_detect 图连线（R3 决策）中，
-        stall_detect_node 能正确识别感知失败信号并累加 stall_count。
-        """
-        # 模拟连续感知失败（perception_error 连续出现）
-        steps = [
-            _make_step(agent="perceive", step_index=i, perception_error="连接超时")
-            for i in range(STALL_CONSECUTIVE_ERROR_WINDOW)
-        ]
+        """R3 路径关键测试：新感知失败指纹 → stall_count 在已有基础上累加。"""
         initial_stall = 1  # 已有一些停滞
         state = _make_state(
-            step_history=steps,
             stall_count=initial_stall,
             perception_error="连接超时",
         )
@@ -383,8 +386,75 @@ class TestStallDetectSignalC:
         node = make_stall_detect_node(snapshot_store=None)
         result = await node(state)
 
-        # stall_count 应在初始值基础上增加
         assert result["stall_count"] > initial_stall
+
+
+# ── K5 状态机场景（跨多轮 stall_detect 的序列语义）───────────────────────────
+
+
+async def _run_round(state: DesktopTaskState) -> dict[str, object]:
+    """跑一轮 stall_detect 节点，返回增量。"""
+    node = make_stall_detect_node(snapshot_store=None)
+    return await node(state)
+
+
+def _carry(state_kwargs: dict[str, object], result: dict[str, object]) -> dict[str, object]:
+    """把 stall_detect 增量按 LastValue 语义带入下一轮 state 构造参数。"""
+    merged = dict(state_kwargs)
+    merged.update(
+        {
+            "stall_count": result["stall_count"],
+            "last_screen_hash": result["last_screen_hash"],
+            "counted_error_fingerprint": result["counted_error_fingerprint"],
+        }
+    )
+    return merged
+
+
+class TestStallStateMachineScenarios:
+    """K5 要求的序列场景：误杀防护与交替不达阈值。"""
+
+    async def test_one_control_failure_two_perceive_successes_no_false_kill(self) -> None:
+        """control 失败 1 次 + 感知成功 2 次 → 不误杀（stall_count 不累加至阈值）。
+
+        场景关键：perceive 成功增量**不清 control_error**（LastValue 残留），
+        旧实现会把同一控制错误在后两轮各再计一次 → 3 轮即达阈值误杀。
+        """
+        # 轮 1：control 失败（route_after_control → stall_detect）
+        r1 = await _run_round(_make_state(control_error="点击失败: 元素不可见"))
+        assert r1["stall_count"] == 1  # 新错误指纹，正常计数
+
+        # 轮 2：perceive 成功（perception_error=None，control_error 残留）
+        kwargs2 = _carry(
+            {"control_error": "点击失败: 元素不可见", "snapshot_ref": None},
+            r1,
+        )
+        r2 = await _run_round(_make_state(**kwargs2))
+        assert r2["stall_count"] == 0, "同一错误指纹不得重复计数，且无新信号轮归零"
+
+        # 轮 3：perceive 再成功
+        kwargs3 = _carry(kwargs2, r2)
+        r3 = await _run_round(_make_state(**kwargs3))
+        assert r3["stall_count"] == 0
+        assert r3["stall_count"] < STALL_THRESHOLD
+
+    async def test_stall_progress_alternation_never_reaches_threshold(self) -> None:
+        """停滞-进展-停滞交替 → stall_count 反复归零，永不达阈值（连续语义）。"""
+        state_kwargs: dict[str, object] = {}
+        max_seen = 0
+        for i in range(4):
+            if i % 2 == 0:
+                # 停滞轮：出现一个新错误
+                state_kwargs["perception_error"] = f"错误-{i}"
+            else:
+                # 进展轮：错误清空（perceive 成功清 perception_error）
+                state_kwargs["perception_error"] = None
+            result = await _run_round(_make_state(**state_kwargs))
+            state_kwargs = _carry(state_kwargs, result)
+            max_seen = max(max_seen, int(result["stall_count"]))  # type: ignore[call-overload]
+
+        assert max_seen == 1, f"交替场景每轮至多 1 且随进展归零，实见峰值 {max_seen}"
+        assert max_seen < STALL_THRESHOLD
 
 
 # ── 快乐路径（无信号） ────────────────────────────────────────────────────────
@@ -402,14 +472,18 @@ class TestStallDetectNoSignal:
 
         assert result["stall_count"] == 0
 
-    async def test_existing_stall_count_preserved_when_no_new_signal(self) -> None:
-        """已有 stall_count 但本轮无新信号 → stall_count 不增加。"""
+    async def test_existing_stall_count_reset_when_no_new_signal(self) -> None:
+        """已有 stall_count 但本轮无新信号 → **归零**（K5 ② 连续语义修订）。
+
+        修订理由：stall_count 的文档语义本为「连续停滞计数」，旧实现只加不清，
+        间歇性小故障会跨长任务累积到阈值误杀。
+        """
         state = _make_state(stall_count=1, step_history=[])
 
         node = make_stall_detect_node(snapshot_store=None)
         result = await node(state)
 
-        assert result["stall_count"] == 1
+        assert result["stall_count"] == 0
 
     async def test_result_contains_required_fields(self) -> None:
         """返回增量必须包含 stall_count 和 last_screen_hash 字段。"""
@@ -457,24 +531,24 @@ class TestStallDetectCombinedSignals:
         # B 信号 +1，C 信号 +1（step_history >= window）= 至少 +2
         assert result["stall_count"] >= 2
 
-    async def test_accumulation_across_calls(self) -> None:
-        """多轮调用 stall_count 正确累加（模拟多次感知失败）。"""
-        steps = [
-            _make_step(agent="perceive", step_index=i, perception_error="失败")
-            for i in range(STALL_CONSECUTIVE_ERROR_WINDOW)
-        ]
+    async def test_accumulation_across_calls_with_new_fingerprints(self) -> None:
+        """多轮调用：每轮出现**不同**错误（新指纹）→ stall_count 正确累加。
 
-        # 第一轮
-        state1 = _make_state(step_history=steps, stall_count=0, perception_error="失败")
+        K5 修订：同一错误指纹只计一次（去重），故累加验证须用逐轮变化的错误；
+        同错误重复轮由 test_same_fingerprint_not_recounted 覆盖（归零）。
+        """
         node = make_stall_detect_node(snapshot_store=None)
-        result1 = await node(state1)
-        assert result1["stall_count"] >= 1
 
-        # 第二轮（基于第一轮 stall_count）
+        # 第一轮：错误 A
+        state1 = _make_state(stall_count=0, perception_error="失败-A")
+        result1 = await node(state1)
+        assert result1["stall_count"] == 1
+
+        # 第二轮：错误 B（新指纹，带上第一轮已计数指纹）
         state2 = _make_state(
-            step_history=steps,
             stall_count=result1["stall_count"],
-            perception_error="失败",
+            counted_error_fingerprint=result1["counted_error_fingerprint"],
+            perception_error="失败-B",
         )
         result2 = await node(state2)
-        assert result2["stall_count"] > result1["stall_count"]
+        assert result2["stall_count"] == 2

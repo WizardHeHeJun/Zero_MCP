@@ -14,7 +14,8 @@
     supervisor_node  — 调 DesktopSupervisorAgent.plan，无业务路由判断。
     perceive_node    — 调 ScreenPerceptionAgent.perceive，返回感知增量。
     control_node     — 调 DesktopControlAgent.execute，含 interrupt/resume 分区。
-    stall_detect_node— 三信号停滞检测（phash 不变 / 步骤重复 / 错误连续）。
+    stall_detect_node— 三信号停滞检测（phash 不变 / 步骤重复 / 错误指纹去重计数），
+                       无信号轮 stall_count 归零（K5 连续语义）。
     error_report_node— 记录错误 + incident_reporter 打桩，设 FAILED。
     memory_flush_node— 唯一记忆写入点，scope=session 显式，经 MemoryAPI Protocol。
 
@@ -53,6 +54,7 @@ from src.mcp.desktop_mcp_client import DesktopMCPClient
 from src.orchestration.desktop_supervisor import DesktopSupervisorAgent, make_supervisor_node
 from src.orchestration.phash import average_hash_from_bytes as _compute_average_hash
 from src.orchestration.phash import hamming_bits as _hamming_distance
+from src.orchestration.prompt_loader import PromptLoader
 from src.orchestration.protocols import (
     IncidentReporter,
     MemoryAPI,
@@ -77,10 +79,6 @@ STALL_THRESHOLD: int = int(os.environ.get("STALL_THRESHOLD", "3"))
 PHASH_UNCHANGED_THRESHOLD: int = int(os.environ.get("PHASH_UNCHANGED_THRESHOLD", "10"))
 """画面 phash 汉明距离小于此值视为「画面未变」（phash 不变信号）。
 工程假设：取 8x8 = 64 bits，阈值 10 ≈ 15.6% 不同位。"""
-
-STALL_CONSECUTIVE_ERROR_WINDOW: int = 2
-"""连续错误（perception_error | control_error）次数达此值触发停滞信号。
-工程假设：2 次连续错误即视为连续错误停滞。"""
 
 INCIDENT_STEP_WINDOW: int = int(os.environ.get("INCIDENT_STEP_WINDOW", "10"))
 """异常上报时附带的最近步骤窗口大小（error_report_node metadata.recent_steps）。"""
@@ -261,21 +259,52 @@ def route_after_stall(
 # ── stall_detect_node（三信号停滞检测）────────────────────────────────────────
 
 
+def _error_fingerprint(
+    perception_error: str | None,
+    control_error: str | None,
+) -> str | None:
+    """(perception_error, control_error) 的错误指纹（K5 ①，纯函数）。
+
+    两者皆 None 时返回 None（无错误无指纹）；否则返回确定性的序列化字符串，
+    供 stall_detect_node 与 state.counted_error_fingerprint 比对去重。
+
+    Args:
+        perception_error: 当前 state 的感知错误文本（None=无）。
+        control_error: 当前 state 的控制错误文本（None=无）。
+
+    Returns:
+        指纹字符串，或 None（无错误）。
+    """
+    if perception_error is None and control_error is None:
+        return None
+    return f"p={perception_error!r}|c={control_error!r}"
+
+
 def make_stall_detect_node(
     snapshot_store: SnapshotStore | None = None,
 ) -> Any:
     """生成 stall_detect_node 节点函数。
 
-    三停滞信号（任一触发则 stall_count += 1）：
+    三停滞信号（任一触发则 stall_count 累加）：
       信号 A — 画面 phash 不变：当前 snapshot_ref 对应图像与 last_screen_hash 汉明距离
                < PHASH_UNCHANGED_THRESHOLD，视为画面未变化。
                注：snapshot_ref 只存 ID，需通过 snapshot_store 加载图像；
                snapshot_store=None 时跳过此信号（测试/无存储环境）。
       信号 B — 步骤重复：len(step_history) > STALL_MAX_STEPS 且最近 N 步均为同一 Worker。
-      信号 C — 连续错误：perception_error 与 control_error 在最近步骤连续出现。
+      信号 C — 错误指纹去重计数（K5 ①）：(perception_error, control_error) 指纹
+               相对「上次已计数指纹」（state.counted_error_fingerprint）**新产生**时
+               +1。错误文本在 LastValue state 里会跨节点残留（perceive 成功不清
+               control_error），按指纹去重保证同一错误只计一次；持续同 Worker
+               重试造成的停滞由信号 B 兜住。错误清空后指纹归 None，同一错误
+               再现视为新停滞事件（可再计）。
 
-    返回增量：{"stall_count": new_stall_count, "last_screen_hash": hash_str}
-    （只更新这两个字段，LastValue 覆写）。
+    stall_count **连续语义**（K5 ②）：本轮无任何停滞信号（increment==0）时归零。
+    归零逻辑必须在本节点内——control 成功路径绕过 stall_detect 直回 supervisor，
+    放在别处会漏掉「经过本节点但无信号」的清零时机。
+
+    返回增量：{"stall_count", "last_screen_hash", "counted_error_fingerprint"}
+    （只更新这三个字段，LastValue 覆写；错误文本不清——supervisor 的 prompt
+    仍需 perception_error/control_error 原文）。
 
     Args:
         snapshot_store: 快照存取接口（用于信号 A phash 比对）；None 时跳过 A 信号。
@@ -285,13 +314,14 @@ def make_stall_detect_node(
     """
 
     async def stall_detect_node(state: DesktopTaskState) -> dict[str, Any]:
-        """停滞检测节点：三信号任一触发则 stall_count += 1。
+        """停滞检测节点：三信号累加 stall_count，无信号轮归零（连续语义）。
 
         Args:
             state: 当前 DesktopTaskState。
 
         Returns:
-            state 增量字典，含 stall_count / last_screen_hash。
+            state 增量字典，含 stall_count / last_screen_hash /
+            counted_error_fingerprint。
         """
         stall_increment = 0
         new_hash: str | None = state.last_screen_hash
@@ -345,25 +375,30 @@ def make_stall_detect_node(
                 )
                 stall_increment += 1
 
-        # 信号 C：连续错误（perception_error 或 control_error 在最近步骤连续出现）
-        if len(history) >= STALL_CONSECUTIVE_ERROR_WINDOW:
-            recent_errors = history[-STALL_CONSECUTIVE_ERROR_WINDOW:]
-            all_have_errors = all(
-                step.perception_error is not None or step.control_error is not None
-                for step in recent_errors
-            )
-            if all_have_errors:
+        # 信号 C：错误指纹去重计数（K5 ①）——只在 (perception_error, control_error)
+        # 指纹相对「上次已计数指纹」新产生时 +1。错误文本不在此清除（supervisor
+        # 的 prompt 仍需原文），去重靠 counted_error_fingerprint 比对。
+        error_fp = _error_fingerprint(state.perception_error, state.control_error)
+        new_counted_fp: str | None = state.counted_error_fingerprint
+        if error_fp is not None:
+            if error_fp != state.counted_error_fingerprint:
                 logger.info(
-                    "stall_detect_node: 信号C 连续错误 最近 %d 步均有错误",
-                    STALL_CONSECUTIVE_ERROR_WINDOW,
+                    "stall_detect_node: 信号C 新错误指纹 %s",
+                    error_fp,
                 )
                 stall_increment += 1
-        # 也检查当前 state 层（直接字段，不依赖 step_history 写入完整性）
-        elif state.perception_error is not None or state.control_error is not None:
-            # 单步错误但 step_history 不足时，也算一次连续错误信号
-            stall_increment += 1
+                new_counted_fp = error_fp
+        else:
+            # 本轮无错误：清计数指纹——同一错误此后再现视为新停滞事件（可再计）
+            new_counted_fp = None
 
-        new_stall_count = state.stall_count + stall_increment
+        # K5 ②：stall_count 连续语义——本轮无任何停滞信号即归零。
+        # 归零必须放本节点内（control 成功路径绕过 stall_detect 直回 supervisor，
+        # 放别处会漏掉「经过本节点但无信号」的清零时机）。
+        if stall_increment > 0:
+            new_stall_count = state.stall_count + stall_increment
+        else:
+            new_stall_count = 0
 
         logger.info(
             "stall_detect_node: stall_increment=%d new_stall_count=%d "
@@ -377,6 +412,7 @@ def make_stall_detect_node(
         return {
             "stall_count": new_stall_count,
             "last_screen_hash": new_hash,
+            "counted_error_fingerprint": new_counted_fp,
         }
 
     return stall_detect_node
@@ -637,14 +673,23 @@ def get_graph(
     Args:
         client: DesktopMCPClient 实例（async with 块内注入）。
                 None 时各 Agent 节点需已通过 *_agent 参数注入，否则图运行时失败。
-        supervisor_agent: DesktopSupervisorAgent 实例；None 时创建默认实例（缺 key 优雅回退）。
-        perception_agent: ScreenPerceptionAgent 实例；None 且 client 非 None 时自动创建。
+        supervisor_agent: DesktopSupervisorAgent 实例；None 时创建默认实例（K3 ②③）：
+                注入真 PromptLoader（jinja2 模板）；env ANTHROPIC_API_KEY 已设且
+                anthropic 包可用时自动构造 AsyncAnthropic（模型 ID 走 env
+                DESKTOP_SUPERVISOR_MODEL，见 desktop_supervisor.py），否则
+                llm_client=None——注意这**不是**任务可继续的静默回退：plan 会返回
+                FAILED 增量，经 error_report → memory_flush 收口（「优雅回退」＝
+                不崩溃、有终态，而非任务照常执行）。
+        perception_agent: ScreenPerceptionAgent 实例；None 且 client 非 None 时自动创建，
+                并与 stall/incident 共用同一 snapshot_store（K3 ①：store 分裂会让
+                信号 A 加载不到 perceive 存的快照而静默失效）。
         control_agent: DesktopControlAgent 实例；None 且 client 非 None 时自动创建。
         memory_api: MemoryAPI 实现；None 时使用 NoopMemoryAPI 打桩。
         incident_reporter: IncidentReporter 实现；None 时看 env INCIDENT_DIR——
                 已设则启用 FileIncidentReporter（异常现场落盘，Task 14），
                 未设则 NoopIncidentReporter 打桩（默认关零回归）。
-        snapshot_store: SnapshotStore 实现；None 时跳过 phash 信号 A。
+        snapshot_store: SnapshotStore 实现；None 时跳过 phash 信号 A 与 control
+                节点的 TOCTOU 快照复用（K1 ⑤，均为可选优化，零回归）。
         step_archive: StepArchive 实现；None 时使用无操作打桩。
         checkpointer: LangGraph Checkpointer；None 时使用 InMemorySaver（测试默认）。
 
@@ -655,18 +700,40 @@ def get_graph(
     if checkpointer is None:
         checkpointer = InMemorySaver()
 
-    # 默认 Supervisor（缺 key 优雅回退）
+    # 默认 Supervisor（K3 ②③：真 PromptLoader；有 key 且 anthropic 可用时接真 LLM）
     if supervisor_agent is None:
+        llm_client: Any = None
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            try:
+                # 函数内 try-import：anthropic 为可选依赖，无包时不阻断图构建
+                from anthropic import AsyncAnthropic
+
+                llm_client = AsyncAnthropic(api_key=api_key)
+            except ImportError:
+                logger.warning(
+                    "get_graph: 检测到 ANTHROPIC_API_KEY 但 anthropic 包不可用，"
+                    "Supervisor 无 LLM 客户端（plan 将返回 FAILED 经 error_report 收口）"
+                )
+        else:
+            logger.info(
+                "get_graph: 未设 ANTHROPIC_API_KEY，Supervisor 无 LLM 客户端"
+                "（任务将经 plan 的 FAILED 增量 → error_report → memory_flush 收口）"
+            )
         supervisor_agent = DesktopSupervisorAgent(
-            llm_client=None,
+            llm_client=llm_client,
+            prompt_loader=PromptLoader(),
             step_archive=step_archive or StepArchive(),
         )
 
     # 自动创建 PerceptionAgent（需要 client）
     if perception_agent is None and client is not None:
+        # K3 ①：与 stall/incident 共用同一 snapshot_store——agent 私有 InMemory
+        # store 与注入 store 分裂会让信号 A 永远加载不到 perceive 存的快照
+        # （静默失效）。snapshot_store=None 时 agent 内部仍落 InMemory 打桩（现状）。
         perception_agent = ScreenPerceptionAgent(
             client=client,
-            snapshot_store=None,  # 使用内存打桩
+            snapshot_store=snapshot_store,
         )
 
     # 自动创建 ControlAgent（需要 client）
@@ -687,7 +754,9 @@ def get_graph(
             return {"perception_error": "PerceptionAgent 未注入"}
 
     if control_agent is not None:
-        ctrl_node = make_control_node(control_agent)
+        # K1 ⑤：注入 snapshot_store（同 stall 节点先例），control 节点复用
+        # state.snapshot_ref 快照做 TOCTOU 第一张基线（过新鲜度门，省一次 RPC）
+        ctrl_node = make_control_node(control_agent, snapshot_store=snapshot_store)
     else:
 
         async def ctrl_node(state: DesktopTaskState) -> dict[str, Any]:

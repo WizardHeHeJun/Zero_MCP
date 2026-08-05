@@ -48,6 +48,9 @@ _ACTION_RISK_WHITELIST: dict[str, ActionRisk] = {
     "screenshot": ActionRisk.READ_ONLY,
     "get_uia_tree": ActionRisk.READ_ONLY,
     "window_list": ActionRisk.READ_ONLY,
+    # code-review F3：当前 DesktopControlAgent._dispatch_write 不识别
+    # "focus_window"/"pin_topmost" action_type（Agent 侧未接线，ActionSpec 无
+    # 窗口句柄字段），此白名单值为将来接线预留，不代表本条目已在受控路径生效。
     "focus_window": ActionRisk.LOW_RISK,
     "move_mouse": ActionRisk.LOW_RISK,
     "scroll": ActionRisk.LOW_RISK,
@@ -102,13 +105,16 @@ class ActionGuard:
         self.client = client
 
     async def classify_risk(self, action: ActionSpec) -> ActionRisk:
-        """三级风险判定：白名单二次确认 + 声明风险取最高级。
+        """三级风险判定：白名单二次确认 + 声明与白名单基线取较高者。
 
         判定逻辑：
           1. 取 action.risk_level（上游声明级别）。
           2. 查白名单 _ACTION_RISK_WHITELIST，若 action_type 不在白名单，
              直接升级为 DESTRUCTIVE。
-          3. 若 action_type 在白名单，取声明级别与白名单最大允许级别中的较高者。
+          3. 若 action_type 在白名单，返回声明级别与白名单基线级别中的**较高者**
+             （K1：白名单是风险下限——上游把 window_close 等高危动作低报为
+             LOW_RISK/READ_ONLY 时按白名单升级，防止绕过 DESTRUCTIVE interrupt
+             确认；声明高于白名单时保留声明）。
 
         Args:
             action: 待判定的动作规格。
@@ -127,15 +133,26 @@ class ActionGuard:
             )
             return ActionRisk.DESTRUCTIVE
 
-        # 取声明级别与白名单最大允许级别中的较高者
+        # 声明高于白名单基线 → 保留声明（取较高者）
         if _RISK_ORDER[declared_risk] > _RISK_ORDER[whitelist_max]:
             logger.warning(
-                "classify_risk: action_type=%r 声明级别 %r 超出白名单最大 %r，保留声明",
+                "classify_risk: action_type=%r 声明级别 %r 超出白名单基线 %r，保留声明",
                 action.action_type,
                 declared_risk,
                 whitelist_max,
             )
             return declared_risk
+
+        # 声明低于白名单基线 → 按白名单升级（K1 修复：此前白名单值从未被返回，
+        # window_close 低报 LOW_RISK 即绕过 DESTRUCTIVE interrupt 确认）
+        if _RISK_ORDER[declared_risk] < _RISK_ORDER[whitelist_max]:
+            logger.warning(
+                "classify_risk: action_type=%r 声明级别 %r 低于白名单基线 %r，升级为白名单值",
+                action.action_type,
+                declared_risk,
+                whitelist_max,
+            )
+            return whitelist_max
 
         return declared_risk
 
@@ -143,11 +160,14 @@ class ActionGuard:
         self,
         action: ActionSpec,
         snapshot_before: ScreenSnapshot | None = None,
+        effective_risk: ActionRisk | None = None,
     ) -> Literal["pass", "abort"]:
         """TOCTOU 验证（Pre-execution UI State Verification）。
 
         触发条件（满足任一即执行验证）：
-          - risk_level 为 DESTRUCTIVE 或 LOW_RISK
+          - 有效风险为 DESTRUCTIVE 或 LOW_RISK（K1 ②：按 effective_risk 判定，
+            不信 action.risk_level 声明值——上游低报时仍强制走验证；
+            effective_risk=None 回退声明值，保旧调用方兼容）
           - action.coordinates 非 None（坐标点击强制走 TOCTOU，防 notification hijacking）
 
         验证流程：
@@ -159,23 +179,35 @@ class ActionGuard:
              整图 hash 被应用自身动效持续误报，无静止基线）；坐标经各图
              capture_origin 换算，兼容全屏截图与 PrintWindow 窗口图混用。
 
+        降级语义（K1 ③，一期二态 fail-closed）：验证链路降级（截图无路径 /
+        phash 失败）时按有效风险分级——DESTRUCTIVE 返回 "abort"（验证不可得时
+        拒绝执行，error 日志含机读令牌 [desk:toctou_degraded]），非 DESTRUCTIVE
+        保留放行（logger.warning）。
+
         注意：本方法只做只读操作（两次截图 + hash 比对），适合放在 interrupt 前只读区。
 
         Args:
             action: 待验证的动作规格。
             snapshot_before: 可选的执行前快照（已有截图则复用，减少一次 RPC）。
+            effective_risk: classify_risk 判定后的有效风险级别；None 时回退
+                action.risk_level 声明值（向后兼容旧调用方）。
 
         Returns:
-            "pass"（界面稳定，可执行）或 "abort"（界面已变，拒绝执行）。
+            "pass"（界面稳定，可执行）或 "abort"（界面已变/验证降级且高危，拒绝执行）。
         """
+        # K1 ②：触发判定用有效风险（classify_risk 结果），None 回退声明值保兼容
+        risk_for_gate = effective_risk if effective_risk is not None else action.risk_level
+
         # 判断是否需要 TOCTOU 验证
         needs_toctou = (
-            action.risk_level in (ActionRisk.DESTRUCTIVE, ActionRisk.LOW_RISK)
+            risk_for_gate in (ActionRisk.DESTRUCTIVE, ActionRisk.LOW_RISK)
             or action.coordinates is not None
         )
 
         if not needs_toctou:
-            logger.debug("toctou_verify: action=%r 为 READ_ONLY 且无坐标，跳过", action.action_id)
+            logger.debug(
+                "toctou_verify: action=%r 有效风险 READ_ONLY 且无坐标，跳过", action.action_id
+            )
             return "pass"
 
         # --- interrupt 前只读区 ---
@@ -207,14 +239,12 @@ class ActionGuard:
             origin_before = snap_a.capture_origin
 
         if path_before is None:
-            logger.warning("toctou_verify: 第一次截图无路径，无法比对，放行（降级）")
-            return "pass"
+            return self._degraded_verdict(action, risk_for_gate, "第一次截图无路径，无法比对")
 
         try:
             bits_before = _compute_phash_bits(path_before, _crop_for(origin_before))
         except ValueError as exc:
-            logger.warning("toctou_verify: 第一次 phash 失败（%s），放行（降级）", exc)
-            return "pass"
+            return self._degraded_verdict(action, risk_for_gate, f"第一次 phash 失败（{exc}）")
 
         # 等待 TOCTOU 窗口（Task 12 标定：200ms 相对单快照 ~1.2s 延迟为安全下限）
         await asyncio.sleep(TOCTOU_WAIT_MS / 1000.0)
@@ -224,14 +254,12 @@ class ActionGuard:
         path_after = snap_b.screenshot_path
 
         if path_after is None:
-            logger.warning("toctou_verify: 第二次截图无路径，无法比对，放行（降级）")
-            return "pass"
+            return self._degraded_verdict(action, risk_for_gate, "第二次截图无路径，无法比对")
 
         try:
             bits_after = _compute_phash_bits(path_after, _crop_for(snap_b.capture_origin))
         except ValueError as exc:
-            logger.warning("toctou_verify: 第二次 phash 失败（%s），放行（降级）", exc)
-            return "pass"
+            return self._degraded_verdict(action, risk_for_gate, f"第二次 phash 失败（{exc}）")
         # --- interrupt 前只读区结束 ---
 
         delta = _hamming_distance_ratio(bits_before, bits_after)
@@ -251,4 +279,40 @@ class ActionGuard:
             )
             return "abort"
 
+        return "pass"
+
+    def _degraded_verdict(
+        self,
+        action: ActionSpec,
+        risk_for_gate: ActionRisk,
+        detail: str,
+    ) -> Literal["pass", "abort"]:
+        """TOCTOU 验证链路降级（截图无路径 / phash 失败）时的分级裁决（K1 ③）。
+
+        一期二态 fail-closed，不引入三态：
+          - DESTRUCTIVE：验证不可得即拒绝执行（abort），logger.error 文案含机读
+            令牌 [desk:toctou_degraded]（位置无关，消费侧用 re.search 提取）。
+          - 非 DESTRUCTIVE：保留旧行为放行（pass），logger.warning。
+
+        Args:
+            action: 待验证的动作规格。
+            risk_for_gate: 本次验证使用的有效风险级别。
+            detail: 降级原因（人读散文，与机读令牌并存于同一 error 文案）。
+
+        Returns:
+            "abort"（DESTRUCTIVE fail-closed）或 "pass"（非 DESTRUCTIVE 降级放行）。
+        """
+        if risk_for_gate == ActionRisk.DESTRUCTIVE:
+            logger.error(
+                "toctou_verify: TOCTOU 验证降级（%s），DESTRUCTIVE 动作 fail-closed "
+                "拒绝执行 [desk:toctou_degraded] action=%r",
+                detail,
+                action.action_id,
+            )
+            return "abort"
+        logger.warning(
+            "toctou_verify: %s，非 DESTRUCTIVE 放行（降级）action=%r",
+            detail,
+            action.action_id,
+        )
         return "pass"
