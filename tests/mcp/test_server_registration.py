@@ -240,3 +240,62 @@ async def test_get_capability_flags_enabled_returns_json(
     assert parsed["ocr"] is True
     assert parsed["omniparser"] is False
     assert parsed["effective_device"] == "cpu"
+
+
+# ── feat/desktop-hardening：新工具参数（K7 expected_root_hwnd / K8 pin_topmost）──
+
+
+def test_click_element_signature_has_expected_root_hwnd() -> None:
+    """click_element 工具面暴露 expected_root_hwnd，默认 None（不核验零回归）。"""
+    import inspect
+
+    param = inspect.signature(server_mod.click_element).parameters["expected_root_hwnd"]
+    assert param.default is None
+
+
+def test_focus_window_signature_has_pin_topmost() -> None:
+    """focus_window 工具面暴露 pin_topmost，默认 False。"""
+    import inspect
+
+    param = inspect.signature(server_mod.focus_window).parameters["pin_topmost"]
+    assert param.default is False
+
+
+@pytest.mark.asyncio
+async def test_click_element_forwards_expected_root_hwnd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """server 工具体把 expected_root_hwnd 转发到 control.do_click_element（K7 透传）。"""
+    from src.agents.models.screen_snapshot import ActionResult
+
+    monkeypatch.setenv("SCREEN_CAPABILITY_ENABLED", "true")
+    seen_kwargs: dict[str, object] = {}
+
+    async def fake_do_click(**kwargs: object) -> ActionResult:
+        seen_kwargs.update(kwargs)
+        return ActionResult(action_id="a", success=True, error_message=None, ui_changed=False)
+
+    monkeypatch.setattr("src.mcp.desktop.tools.control.do_click_element", fake_do_click)
+
+    await server_mod.click_element(
+        coordinates=(10, 20), method="coordinate", expected_root_hwnd=0xAAA
+    )
+    assert seen_kwargs["expected_root_hwnd"] == 0xAAA
+
+
+@pytest.mark.asyncio
+async def test_focus_window_forwards_pin_topmost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """server 工具体把 pin_topmost 转发到 control.do_focus_window（K8 透传）。"""
+    from src.agents.models.screen_snapshot import ActionResult
+
+    monkeypatch.setenv("SCREEN_CAPABILITY_ENABLED", "true")
+    seen_kwargs: dict[str, object] = {}
+
+    async def fake_do_focus(**kwargs: object) -> ActionResult:
+        seen_kwargs.update(kwargs)
+        return ActionResult(action_id="a", success=True, error_message=None, ui_changed=True)
+
+    monkeypatch.setattr("src.mcp.desktop.tools.control.do_focus_window", fake_do_focus)
+
+    await server_mod.focus_window(window_handle=0x5678, pin_topmost=True)
+    assert seen_kwargs["pin_topmost"] is True

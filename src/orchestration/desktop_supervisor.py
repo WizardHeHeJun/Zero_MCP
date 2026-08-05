@@ -360,6 +360,10 @@ def make_supervisor_node(agent: DesktopSupervisorAgent) -> Any:
         """LangGraph Supervisor 节点。
 
         执行流程：
+          0. 终态单调守卫（K5 ③）：task_status 已是 DONE/FAILED 时不调 LLM，
+             直接返回空增量 {}——route_after_supervisor 规则 1 会导向 memory_flush。
+             防两类回退：终态被 LLM 新 plan 覆写回 RUNNING；人工拒绝（FAILED）后
+             同一 pending_action 再次路由进 control 重复 interrupt。
           1. 调 agent.plan(state) 获取 3 个增量字段。
           2. 截断 step_history（超 STATE_STEP_KEEP 时调 StepArchive 归档）。
           3. 返回增量 dict（4 个字段：plan 3 字段 + step_history）。
@@ -372,8 +376,16 @@ def make_supervisor_node(agent: DesktopSupervisorAgent) -> Any:
 
         Returns:
             state 增量字典，含 next_agent / current_instruction / task_status /
-            step_history（截断后完整 list）。
+            step_history（截断后完整 list）；终态时为空 dict（无更新）。
         """
+        # 0. 终态单调守卫（K5 ③）：DONE/FAILED 不再调 LLM 重新规划
+        if state.task_status in (TaskStatus.DONE, TaskStatus.FAILED):
+            logger.info(
+                "supervisor_node: task_status=%r 已终态，跳过 LLM 直接返回空增量",
+                state.task_status,
+            )
+            return {}
+
         # 1. 获取 plan 增量（3 字段）
         plan_increment = await agent.plan(state)
 

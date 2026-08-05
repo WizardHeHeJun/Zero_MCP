@@ -125,6 +125,8 @@ module = [
     "serial",
     "serial.tools",
     "serial.tools.list_ports",
+    # Supervisor 真 LLM 客户端（可选，默认不装；desktop_graph 函数内 try-import + 缺包优雅回退）
+    "anthropic",
 ]
 ignore_missing_imports = true
 

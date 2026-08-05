@@ -39,6 +39,7 @@ from src.mcp.desktop_mcp_client import (
     DesktopMCPClient,
     DesktopMCPConnectionError,
 )
+from src.orchestration.state import append_step
 
 # ── 测试辅助 ───────────────────────────────────────────────────────────────────
 
@@ -90,8 +91,8 @@ def _make_text_block(text: str, block_id: str = "blk-0") -> TextBlock:
 class TestScreenPerceptionAgentHappyPath:
     """正常路径：mock client 正常返回 ScreenSnapshot。"""
 
-    async def test_perceive_returns_three_increment_fields(self) -> None:
-        """正常路径：返回的 dict 恰好含 snapshot_ref / perception_summary / perception_error。"""
+    async def test_perceive_returns_five_increment_fields(self) -> None:
+        """正常路径：增量恰好五字段（K4 适配：旧「恰好三字段」+ uia_hollow + step_history）。"""
         client = _make_mock_client()
         snapshot = _make_snapshot(uia_hollow=True)
         client.screen_snapshot.return_value = snapshot
@@ -99,7 +100,32 @@ class TestScreenPerceptionAgentHappyPath:
         agent = ScreenPerceptionAgent(client=client)
         result = await agent.perceive(PerceptionRequest())
 
-        assert set(result.keys()) == {"snapshot_ref", "perception_summary", "perception_error"}
+        assert set(result.keys()) == {
+            "snapshot_ref",
+            "perception_summary",
+            "perception_error",
+            "uia_hollow",
+            "step_history",
+        }
+
+    async def test_perceive_failure_increment_omits_uia_hollow(self) -> None:
+        """失败路径：增量恰好四字段——**不含 uia_hollow**（失败时空洞与否未知，
+        不覆写 state 现值）。"""
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = DesktopMCPCallError(
+            tool="screen_snapshot",
+            message="失败",
+        )
+
+        agent = ScreenPerceptionAgent(client=client)
+        result = await agent.perceive(PerceptionRequest())
+
+        assert set(result.keys()) == {
+            "snapshot_ref",
+            "perception_summary",
+            "perception_error",
+            "step_history",
+        }
 
     async def test_perceive_snapshot_ref_non_none(self) -> None:
         """正常路径：snapshot_ref 为非 None 字符串（快照 ID）。"""
@@ -146,7 +172,11 @@ class TestScreenPerceptionAgentHappyPath:
         assert "uia_hollow=True" in result["perception_summary"]
 
     async def test_perceive_calls_screen_snapshot_with_correct_mode(self) -> None:
-        """perceive 将 PerceptionRequest.mode 正确传给 client.screen_snapshot。"""
+        """perceive 将 PerceptionRequest.mode 正确传给 client.screen_snapshot。
+
+        K6 回归守卫：默认（未指定 window_handle）时 window_handle=None——
+        与现状「前台窗口」口径逐字段一致。
+        """
         client = _make_mock_client()
         client.screen_snapshot.return_value = _make_snapshot()
 
@@ -157,6 +187,7 @@ class TestScreenPerceptionAgentHappyPath:
         client.screen_snapshot.assert_called_once_with(
             mode="uia_only",
             capture_screenshot=True,
+            window_handle=None,
         )
 
     async def test_perceive_text_blocks_sanitized(self) -> None:
@@ -288,7 +319,7 @@ class TestMakePerceiveNode:
     """make_perceive_node 生成的节点函数测试。"""
 
     async def test_perceive_node_returns_increment_dict(self) -> None:
-        """perceive_node(state)->dict，只返回三个增量字段。"""
+        """perceive_node(state)->dict，只返回增量字段（K4 适配：五字段）。"""
         client = _make_mock_client()
         client.screen_snapshot.return_value = _make_snapshot(uia_hollow=True)
 
@@ -298,7 +329,13 @@ class TestMakePerceiveNode:
         state: dict[str, Any] = {}
         result = await node_fn(state)
 
-        assert set(result.keys()) == {"snapshot_ref", "perception_summary", "perception_error"}
+        assert set(result.keys()) == {
+            "snapshot_ref",
+            "perception_summary",
+            "perception_error",
+            "uia_hollow",
+            "step_history",
+        }
 
     async def test_perceive_node_uses_state_perception_mode(self) -> None:
         """state 有 perception_mode 属性时，节点优先使用 state 中的模式。"""
@@ -313,8 +350,12 @@ class TestMakePerceiveNode:
             perception_mode: str = "full"
 
         result = await node_fn(FakeState())
-        # client.screen_snapshot 应以 "full" 被调用
-        client.screen_snapshot.assert_called_once_with(mode="full", capture_screenshot=False)
+        # client.screen_snapshot 应以 "full" 被调用（无 target_window_handle → None）
+        client.screen_snapshot.assert_called_once_with(
+            mode="full",
+            capture_screenshot=False,
+            window_handle=None,
+        )
         assert isinstance(result, dict)
 
     async def test_perceive_node_uses_default_mode_when_state_lacks_attribute(self) -> None:
@@ -326,7 +367,11 @@ class TestMakePerceiveNode:
         node_fn = make_perceive_node(agent, request=PerceptionRequest(mode="uia_only"))
 
         result = await node_fn({})  # dict 无 perception_mode 属性
-        client.screen_snapshot.assert_called_once_with(mode="uia_only", capture_screenshot=False)
+        client.screen_snapshot.assert_called_once_with(
+            mode="uia_only",
+            capture_screenshot=False,
+            window_handle=None,
+        )
         assert isinstance(result, dict)
 
     async def test_perceive_node_error_path_returns_dict(self) -> None:
@@ -523,3 +568,167 @@ class TestPerceptionSummaryInjectionFiltering:
         snapshot = _snapshot_with(visual_objects=[_visual_object("图标")])
         summary = _build_perception_summary(snapshot, [])
         assert "opencv_template" in summary
+
+
+# ── K2：摘要降级警示行 + window_captured 口径 ─────────────────────────────────
+
+
+class TestPerceptionSummaryDegradationWarning:
+    """K2：desktop_locked / degradations 非空时摘要**首行**输出结构化警示。"""
+
+    def test_desktop_locked_warning_is_first_line(self) -> None:
+        """desktop_locked=True → 首行为警示行，含 desktop_locked 机读值。"""
+        snapshot = _make_snapshot().model_copy(update={"desktop_locked": True})
+        summary = _build_perception_summary(snapshot, [])
+        first_line = summary.splitlines()[0]
+        assert first_line.startswith("⚠ 感知降级:")
+        assert "desktop_locked" in first_line
+
+    def test_degradations_warning_lists_machine_readable_values(self) -> None:
+        """degradations 非空 → 首行警示逐项列出机读枚举值。"""
+        snapshot = _make_snapshot().model_copy(
+            update={"degradations": ["ocr_error", "window_capture_failed"]}
+        )
+        summary = _build_perception_summary(snapshot, [])
+        first_line = summary.splitlines()[0]
+        assert first_line.startswith("⚠ 感知降级:")
+        assert "ocr_error" in first_line
+        assert "window_capture_failed" in first_line
+        assert "本快照文本可能不完整或过期" in first_line
+
+    def test_locked_and_degradations_not_duplicated(self) -> None:
+        """desktop_locked 同时出现在 flag 与 degradations 里 → 警示行只列一次。"""
+        snapshot = _make_snapshot().model_copy(
+            update={"desktop_locked": True, "degradations": ["desktop_locked", "ocr_error"]}
+        )
+        summary = _build_perception_summary(snapshot, [])
+        first_line = summary.splitlines()[0]
+        assert first_line.count("desktop_locked") == 1
+        assert "ocr_error" in first_line
+
+    def test_no_warning_when_healthy(self) -> None:
+        """无锁定、无降级 → 摘要不含警示行（负对照，防警示恒真）。"""
+        snapshot = _make_snapshot()
+        summary = _build_perception_summary(snapshot, [])
+        assert "⚠ 感知降级" not in summary
+        assert summary.splitlines()[0].startswith("[感知摘要]")
+
+    def test_window_captured_in_header_status_line(self) -> None:
+        """window_captured 口径写进摘要头部既有状态行（两态都可见）。"""
+        summary_full = _build_perception_summary(_make_snapshot(), [])
+        assert "window_captured=False" in summary_full
+
+        snapshot_direct = _make_snapshot().model_copy(update={"window_captured": True})
+        summary_direct = _build_perception_summary(snapshot_direct, [])
+        assert "window_captured=True" in summary_direct
+
+
+# ── K6：定向感知透传 ──────────────────────────────────────────────────────────
+
+
+class TestTargetedPerception:
+    """K6：PerceptionRequest.window_handle → client.screen_snapshot 透传链路。"""
+
+    async def test_perceive_passes_window_handle_to_client(self) -> None:
+        """request.window_handle 非 None → 原值透传给 client.screen_snapshot。"""
+        client = _make_mock_client()
+        client.screen_snapshot.return_value = _make_snapshot()
+
+        agent = ScreenPerceptionAgent(client=client)
+        await agent.perceive(PerceptionRequest(window_handle=777))
+
+        client.screen_snapshot.assert_called_once_with(
+            mode="uia_ocr",
+            capture_screenshot=False,
+            window_handle=777,
+        )
+
+    async def test_perceive_node_extracts_target_window_handle_from_state(self) -> None:
+        """state.target_window_handle 为 int → 节点提取并注入请求。"""
+        client = _make_mock_client()
+        client.screen_snapshot.return_value = _make_snapshot()
+
+        agent = ScreenPerceptionAgent(client=client)
+        node_fn = make_perceive_node(agent)
+
+        class FakeState:
+            target_window_handle: int = 24680
+
+        await node_fn(FakeState())
+        assert client.screen_snapshot.call_args.kwargs["window_handle"] == 24680
+
+    async def test_perceive_node_rejects_non_int_handle(self) -> None:
+        """state.target_window_handle 非 int（含 bool）→ 回退 None（防脏值入 MCP）。"""
+        client = _make_mock_client()
+        client.screen_snapshot.return_value = _make_snapshot()
+
+        agent = ScreenPerceptionAgent(client=client)
+        node_fn = make_perceive_node(agent)
+
+        class BadState:
+            target_window_handle: object = True  # bool 是 int 子类，须显式拒绝
+
+        await node_fn(BadState())
+        assert client.screen_snapshot.call_args.kwargs["window_handle"] is None
+
+    def test_perception_request_default_window_handle_is_none(self) -> None:
+        """默认 window_handle=None（前台窗口现状口径，零回归守卫）。"""
+        assert PerceptionRequest().window_handle is None
+
+
+# ── K4：step_history 追加（perceive 增量）─────────────────────────────────────
+
+
+class TestPerceiveStepHistoryAppend:
+    """K4 ②：perceive 增量带回追加后的 step_history（纯函数 append，不 mutate）。"""
+
+    async def test_success_appends_step_without_mutating_prev(self) -> None:
+        """成功路径：返回新 list（len+1），prev 不被修改（interrupt 重放确定性）。"""
+        client = _make_mock_client()
+        client.screen_snapshot.return_value = _make_snapshot(snapshot_id="snap-hist")
+
+        agent = ScreenPerceptionAgent(client=client)
+        prev = append_step(
+            [],
+            agent="control",
+            instruction="先前步骤",
+            increment={},
+            task_status="RUNNING",
+        )
+        result = await agent.perceive(
+            PerceptionRequest(),
+            prev_steps=prev,
+            instruction="感知当前屏幕",
+            task_status="RUNNING",
+        )
+
+        history = result["step_history"]
+        assert len(history) == 2
+        assert len(prev) == 1, "prev 不得被原地 mutate"
+        assert history is not prev
+        record = history[-1]
+        assert record.agent == "perceive"
+        assert record.instruction == "感知当前屏幕"
+        assert record.snapshot_ref == "snap-hist"
+        assert record.perception_error is None
+
+    async def test_failure_appends_step_with_error(self) -> None:
+        """失败路径：本步同样入史，perception_error 记录在 StepRecord 上。"""
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = DesktopMCPCallError(
+            tool="screen_snapshot",
+            message="连接失败",
+        )
+
+        agent = ScreenPerceptionAgent(client=client)
+        result = await agent.perceive(
+            PerceptionRequest(),
+            prev_steps=[],
+            instruction="感知",
+            task_status="RUNNING",
+        )
+
+        history = result["step_history"]
+        assert len(history) == 1
+        assert history[0].perception_error is not None
+        assert history[0].snapshot_ref is None

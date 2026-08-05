@@ -8,14 +8,19 @@
 - Agent 不直连图谱/向量库（SnapshotStore 走 Protocol 打桩）。
 - 节点签名 (state) -> dict，只返回增量字段。
 - 异常 catch 返回 perception_error 非 None，不崩溃、不静默 retry。
-- 增量只含 snapshot_ref / perception_summary / perception_error。
+- 增量字段（K4 起）：成功含 snapshot_ref / perception_summary / perception_error /
+  uia_hollow / step_history；失败不含 uia_hollow（详见 perceive docstring）。
 
 依赖：
 - src.agents.text_filter.sanitize_screen_text（agents 层共享工具，纯函数）
 - src.mcp.desktop_mcp_client.DesktopMCPClient（Task 6）
 - src.agents.models.screen_snapshot.ScreenSnapshot
+- src.agents.models.step_record.append_step / StepRecord（共享契约层，见下）
 
-层依赖校验：agents → mcp client（允许）；不反向调 orchestration/memory。
+层依赖校验：agents → mcp client（允许）；不反向调 memory/storage、不反向调
+orchestration（code-review F2 根治：StepRecord/append_step 权威定义已挪到
+src.agents.models.step_record——agents 与 orchestration 共同下调的契约层，
+本文件只下调 agents.models，不 import src.orchestration.state，无反向依赖。
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 from src.agents.models.screen_snapshot import ScreenSnapshot
+from src.agents.models.step_record import StepRecord, append_step
 from src.agents.protocols import SnapshotStore
 from src.agents.text_filter import sanitize_screen_text
 from src.mcp.desktop_mcp_client import (
@@ -61,13 +67,16 @@ class InMemorySnapshotStore:
 
 
 class PerceptionRequest(BaseModel):
-    """感知请求参数（感知模式 + 是否截图）。
+    """感知请求参数（感知模式 + 是否截图 + 定向窗口）。
 
     节点从 state 提取或使用默认值构造本对象，不直接暴露 MCP 参数到 state。
     """
 
     mode: Literal["uia_only", "uia_ocr", "full"] = "uia_ocr"
     capture_screenshot: bool = False
+    # K6：定向感知目标窗口 HWND；None=前台窗口（现状口径，零回归）。
+    # HWND 生命周期风险见 DesktopTaskState.target_window_handle 注释。
+    window_handle: int | None = None
 
 
 # ── ScreenPerceptionAgent ─────────────────────────────────────────────────────
@@ -97,44 +106,78 @@ class ScreenPerceptionAgent:
         self.client = client
         self.snapshot_store: SnapshotStore = snapshot_store or InMemorySnapshotStore()
 
-    async def perceive(self, request: PerceptionRequest) -> dict[str, Any]:
+    async def perceive(
+        self,
+        request: PerceptionRequest,
+        prev_steps: list[StepRecord] | None = None,
+        instruction: str = "",
+        task_status: str = "RUNNING",
+    ) -> dict[str, Any]:
         """执行一次屏幕感知，返回 state 增量字段。
 
         流程：
-          1. 调 client.screen_snapshot 获取 ScreenSnapshot。
+          1. 调 client.screen_snapshot 获取 ScreenSnapshot（K6：透传 window_handle）。
           2. 对 text_blocks 的每个 text 执行 sanitize_screen_text（注入过滤）。
           3. 组装 perception_summary（原始摘要，截断在 Task 11 prompt_loader 层）。
           4. 调 snapshot_store.save 打桩存储，获取 snapshot_ref。
-          5. 返回 {"snapshot_ref": ..., "perception_summary": ..., "perception_error": None}。
+          5. 经 append_step 把本步追加进 step_history（K4，纯函数不 mutate）。
 
         异常：DesktopMCPCallError / DesktopMCPConnectionError / 其他异常均 catch，
               返回 perception_error 非 None，不抛出、不静默 retry。
 
+        增量字段（K4 起不再只含三字段）：
+          成功 — snapshot_ref / perception_summary / perception_error(None) /
+                 uia_hollow（随快照刷新）/ step_history（追加后完整 list）。
+          失败 — snapshot_ref(None) / perception_summary(None) / perception_error /
+                 step_history；**不含 uia_hollow**（感知失败时窗口空洞与否未知，
+                 保留 state 现值不覆写）。
+
         Args:
-            request: 感知请求参数（mode / capture_screenshot）。
+            request: 感知请求参数（mode / capture_screenshot / window_handle）。
+            prev_steps: 追加前的 step_history（None 视为空历史）。
+            instruction: 本步执行的指令摘要（记入 StepRecord）。
+            task_status: 当前任务状态快照（感知不改状态，原样记入 StepRecord）。
 
         Returns:
-            state 增量字典，只含三个字段：snapshot_ref / perception_summary / perception_error。
+            state 增量字典（字段见上）。
         """
+        steps: list[StepRecord] = prev_steps if prev_steps is not None else []
         try:
             snapshot = await self.client.screen_snapshot(
                 mode=request.mode,
                 capture_screenshot=request.capture_screenshot,
+                window_handle=request.window_handle,
             )
         except (DesktopMCPCallError, DesktopMCPConnectionError) as exc:
             logger.warning("ScreenPerceptionAgent.perceive: MCP 调用失败：%s", exc)
-            return {
+            increment: dict[str, Any] = {
                 "snapshot_ref": None,
                 "perception_summary": None,
                 "perception_error": str(exc),
             }
+            increment["step_history"] = append_step(
+                steps,
+                agent="perceive",
+                instruction=instruction,
+                increment=increment,
+                task_status=task_status,
+            )
+            return increment
         except Exception as exc:
             logger.warning("ScreenPerceptionAgent.perceive: 意外异常：%s", exc)
-            return {
+            increment = {
                 "snapshot_ref": None,
                 "perception_summary": None,
                 "perception_error": f"unexpected: {exc}",
             }
+            increment["step_history"] = append_step(
+                steps,
+                agent="perceive",
+                instruction=instruction,
+                increment=increment,
+                task_status=task_status,
+            )
+            return increment
 
         # 对 text_blocks 每个 text 执行注入过滤
         sanitized_texts: list[str] = []
@@ -164,11 +207,22 @@ class ScreenPerceptionAgent:
             len(snapshot.text_blocks),
         )
 
-        return {
+        increment = {
             "snapshot_ref": snapshot_ref,
             "perception_summary": perception_summary,
             "perception_error": None,
+            # K4 ②：uia_hollow 随快照刷新——否则 state 里的空洞标记停留在初值，
+            # supervisor 的坐标点击引导块（jinja 模板 uia_hollow 分支）永远不渲染
+            "uia_hollow": snapshot.uia_hollow,
         }
+        increment["step_history"] = append_step(
+            steps,
+            agent="perceive",
+            instruction=instruction,
+            increment=increment,
+            task_status=task_status,
+        )
+        return increment
 
 
 def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[str]) -> str:
@@ -204,6 +258,17 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
     """
     lines: list[str] = []
 
+    # K2：降级警示行（摘要**首行**，LLM-agnostic 纯文本）。desktop_locked 标记与
+    # degradations 机读枚举（契约见 ScreenSnapshot 类 docstring）合并列出——
+    # 锁屏/截图失败/OCR 异常下快照文本可能不完整或过期，Supervisor 须先看到警示
+    # 再消费下方内容。枚举值由本仓自产（Literal 语义），不过 sanitize。
+    degraded_items: list[str] = []
+    if snapshot.desktop_locked:
+        degraded_items.append("desktop_locked")
+    degraded_items.extend(d for d in snapshot.degradations if d not in degraded_items)
+    if degraded_items:
+        lines.append("⚠ 感知降级: " + ",".join(degraded_items) + "——本快照文本可能不完整或过期")
+
     # 基本元信息（窗口标题由外部进程提供 → 与 text_blocks 同为不可信文本，须过滤）
     window_title = (
         sanitize_screen_text(snapshot.active_window_title)
@@ -211,7 +276,12 @@ def _build_perception_summary(snapshot: ScreenSnapshot, sanitized_texts: list[st
         else "(无活跃窗口)"
     )
     lines.append(f"[感知摘要] 窗口={window_title}")
-    lines.append(f"模式={snapshot.perception_mode}  uia_hollow={snapshot.uia_hollow}")
+    # K2：window_captured 口径入既有状态行——True=PrintWindow 窗口直取（含被
+    # 遮挡/后台部分），False=全屏截图口径，消费方据此判断坐标换算与遮挡假设
+    lines.append(
+        f"模式={snapshot.perception_mode}  uia_hollow={snapshot.uia_hollow}"
+        f"  window_captured={snapshot.window_captured}"
+    )
     lines.append(f"屏幕={snapshot.screen_width}x{snapshot.screen_height}")
 
     # UIA 元素摘要（uia_hollow=True 时元素可能为空）
@@ -271,7 +341,8 @@ def make_perceive_node(
         """LangGraph 感知节点（只读感知，不写记忆/存储）。
 
         从 state 提取感知请求参数（若有），否则使用默认请求。
-        返回只含增量字段的 dict：snapshot_ref / perception_summary / perception_error。
+        增量字段见 ScreenPerceptionAgent.perceive docstring（K4：含 step_history，
+        成功另含 uia_hollow）。
 
         Args:
             state: 编排 state（DesktopTaskState 或兼容 dict）。
@@ -289,11 +360,48 @@ def make_perceive_node(
             if mode_val in ("uia_only", "uia_ocr", "full"):
                 perception_mode = mode_val
 
+        # K6：定向感知目标窗口（仿 perception_mode 模式：hasattr + 非 None + int 校验；
+        # bool 是 int 子类，显式排除防 True/False 混入 HWND）
+        target_window_handle: int | None = default_request.window_handle
+        if hasattr(state, "target_window_handle"):
+            handle_val = state.target_window_handle
+            if (
+                handle_val is not None
+                and isinstance(handle_val, int)
+                and not isinstance(handle_val, bool)
+            ):
+                target_window_handle = handle_val
+
+        # K4：step_history 追加所需上下文（最小 state / dict 不带这些字段时用默认值）
+        prev_steps: list[StepRecord] = []
+        if hasattr(state, "step_history") and isinstance(state.step_history, list):
+            prev_steps = state.step_history
+        elif isinstance(state, dict) and isinstance(state.get("step_history"), list):
+            prev_steps = state["step_history"]
+
+        instruction = ""
+        if hasattr(state, "current_instruction") and isinstance(state.current_instruction, str):
+            instruction = state.current_instruction
+        elif isinstance(state, dict) and isinstance(state.get("current_instruction"), str):
+            instruction = state["current_instruction"]
+
+        task_status = "RUNNING"
+        if hasattr(state, "task_status") and state.task_status:
+            task_status = str(state.task_status)
+        elif isinstance(state, dict) and state.get("task_status"):
+            task_status = str(state["task_status"])
+
         req = PerceptionRequest(
             mode=perception_mode,
             capture_screenshot=capture_screenshot,
+            window_handle=target_window_handle,
         )
-        return await agent.perceive(req)
+        return await agent.perceive(
+            req,
+            prev_steps=prev_steps,
+            instruction=instruction,
+            task_status=task_status,
+        )
 
     return perceive_node
 
