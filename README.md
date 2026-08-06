@@ -141,6 +141,66 @@ ruff check . && mypy
 cd mcp-server && npm install && npm run typecheck
 ```
 
-配置与密钥走 `.env`（复制 `.env.example` 填值，已 gitignore 不入库）。所有能力默认关零回归：屏幕能力 `SCREEN_CAPABILITY_ENABLED=false`、Zero 对接 `ZERO_LINK_ENABLED=false`、三感知通道 `ZERO_{PHYSIO,AUDIO,VISION}_CHANNEL_ENABLED=false`、本仓持久化 `ZERO_MCP_PERSISTENCE_DB` 不设即关（设了则 `ZERO_MCP_MEMORY_SCOPE_KEY` 必填、缺失启动 fail-fast）；zero-link 传输/模型/精度旋钮全走 `.env`（见 `.env.example` 注释）。
+配置与密钥走 `.env`（复制 `.env.example` 填值，已 gitignore 不入库）。所有能力默认关零回归：屏幕能力 `SCREEN_CAPABILITY_ENABLED=false`、Zero 对接 `ZERO_LINK_ENABLED=false`、三感知通道 `ZERO_{PHYSIO,AUDIO,VISION}_CHANNEL_ENABLED=false`、本仓持久化 `ZERO_MCP_PERSISTENCE_DB` 不设即关（设了则 `ZERO_MCP_MEMORY_SCOPE_KEY` 必填、缺失启动 fail-fast）；zero-link 传输/模型/精度旋钮全走 `.env`，各键语义与调参陷阱见下节「配置详解」。
+
+## 配置详解
+
+`.env.example` 只保留一行式速览，本节是各配置键的完整口径（语义、默认值依据、调参陷阱）。
+
+### 通用：生效方式
+
+- **本仓不调用 `load_dotenv`**：`.env.example` 是给人看的口径清单，写进 `.env` 不会自动生效——真正生效靠**进程环境**（自行 export / 由外部加载器注入）。stdio 模式下本仓 client 整份透传 `os.environ` 给 spawn 的子进程（desktop 与 zero 两侧同构），子进程同样生效；外部 host 按 MCP SDK 默认最小 env spawn 本仓 server 时**不继承**，回默认值。
+
+### 编排层状态窗口
+
+- `STATE_STEP_KEEP` / `STALL_MAX_STEPS` / `STALL_THRESHOLD` 已接线（`src/orchestration/state.py` 与 `desktop_graph.py` 读 `os.environ`）。
+- **`CONTEXT_STEP_WINDOW` 未接线**：值写死在 `src/orchestration/prompt_loader.py`（该模块不 import os），在 `.env` 里设它无效；唯一可调路径是 `PromptLoader(step_window=...)` 入参。
+
+### 安全门 TOCTOU 与锚点验证
+
+- `TOCTOU_WAIT_MS=200`：实测单快照延迟 ~1.2s，200ms 是安全下限。
+- `TOCTOU_HASH_THRESHOLD=0.1`：实测（钉钉）现代应用窗口自身有持续动效（动画/红点/时钟），全窗口 phash 无静止基线（delta 在 0/0.47 间跳）；故坐标动作按 `TOCTOU_CROP_HALF_PX` 邻域**局部裁剪**比对，0.1 在该口径下成立。**不要为容忍动画调高此值**——会失去对真实劫持的敏感度。
+- `TOCTOU_CROP_HALF_PX=150`：以点击点为中心 2N×2N 邻域取 hash。工程假设初值：覆盖常见按钮/菜单目标、小于动画区典型距离；动效恰在目标上时 abort 是正确行为（目标不稳定不该点）。
+- `TOCTOU_SNAPSHOT_MAX_AGE_MS=5000`：control 节点复用感知快照作 TOCTOU 基线的新鲜度上界，超龄丢弃重拍（重拍更安全）。工程假设初值，未实测标定；DESTRUCTIVE 人工确认耗时远超此值，重放必然走重拍——行为正确，只是享受不到省 RPC 优化。
+- `ANCHOR_EDIT_DISTANCE_RATIO=0.34`（`src/agents/anchor_verify.py`）：允许编辑数 = `int(len(锚点)*ratio)`；默认下长度 ≤2 → 0（短锚点零容错，防「消息/消费」单字替换假命中）、3–5 → 1、6–8 → 2。工程假设，待真实 OCR 语料标定；两字锚点命中率偏低时优先调此参。**模块导入时读取，运行中改 env 需重启进程。**
+- `PHASH_UNCHANGED_THRESHOLD=10`（停滞检测信号 A）：同受应用动画影响（窗口级 hash 局限，待与 TOCTOU 一并评估元素级裁剪口径）。
+
+### 模型接入
+
+- `ANTHROPIC_API_KEY`：已设且 anthropic 包可用时 `get_graph` 默认装配自动构造 AsyncAnthropic 注入默认 Supervisor；缺失/包不可用时 `llm_client=None`——「优雅回退」＝**不崩溃且有终态**（plan 返回 FAILED 经 error_report → memory_flush 收口），不是任务可继续执行。
+
+### zero-link · external_priors 多模态先验
+
+- `ZERO_EXTERNAL_PRIOR_PRECISION_CAP`（默认 0.8）/ `ZERO_MAX_EXTERNAL_STREAMS`（默认 5）：MCP 侧 `build_external_priors_override()` 客户端 fail-fast 阈值，与 Zero 侧**同名旋钮同值**（两仓同步）。
+- **`EXTERNAL_PHYSIO_PRECISION_V` 是无效旋钮**：physio Πv 在本仓侧钉死 `MIN_PRECISION`(1e-3)（`external_priors.py::recommended_precision` 的 PHYSIO 分支，连 getenv 都不做），Zero M2 侧另有同向覆写。设任何值都不生效，仅记录语义（生理对效价盲）。
+- **`EXTERNAL_PHYSIO_PRECISION_A` 在 EDA 与 HRV 同时在场时（即默认路径）不生效**：二者先经 ω=0.5 协方差交叉（CI）预合并为单条 physio 流，合并精度取子源可靠度分层常量 `PHYSIO_SUBSOURCE_PRECISION_A={eda:0.15, hrv:0.20}` → Πa=0.175；只有「单独只有 EDA 或只有 HRV」的非合并支路才读本 env。要改线上生理精度须改那张分层表。预合并依据：Zero 科学家议会 2026-07-28 终裁（EDA/HRV 相关，朴素双流会虚增精度 2 倍）。
+- **调参预警：physio Πa 有一条比 M3 cap(0.8) 低得多的硬顶 ≈0.359**——单流（env）或合并后（分层表）的出线 Πa 一旦 ≥ 该值，`build_external_priors_override` 的 M8 守卫直接 raise，载荷发不出去。因为该 Πa 已使 physio 流不经任何开门动作即可越过 Zero 点燃门 `SALIENCE_THRESHOLD=0.18`（最坏情形 |μa|=1），绕过 Zero 应我方「EDA 反号宁可门掉」之请所落的 D7 排除承诺（D7 只写在门开分支，门关这条默认路径它管不到）。0.359 是「出线 μv=0」特例下的闭式解，M8 实际按 `hypot(μv,1)` 现算：μv 非零时硬顶自动收紧到 ≈0.2536。真要抬顶须先跨仓与 Zero 确认——契约级语义变更，非本仓可单方面调的参数。
+- **`ZERO_PHYSIO_MERGE_OMEGA=0.5` 终裁值，生产勿改**：它是唯一不重复计可靠度的取值（ω=0.5 时 μ 与「不合并双流」逐位相同、Π 精确减半，只调保守度一个维度）；任何 ω≠0.5 会同时扰动 μ。0.571 / 0.4286 两档是「同一个错误的两个方向」，均已作废，仅供实验对照。
+
+### zero-link · 感知模型通道
+
+- **EDA 唤醒度量无 env 开关**（2026-07-29 起）：EdaChannel 只有一条路径 = `scl_baseline_delta`。旧 `ZERO_EDA_AROUSAL_METRIC` 与 `scr_amplitude` 实现已删除——后者经 WESAD 真被试实测与唤醒**系统性反相关**（「stress>baseline」正确率 1/5，经典 SCL 4/5）。运行期须知：冷启动约 4.5 分钟返回 None（有意的诚实降级，期间退裸 hrv/rmssd）；`baseline_horizon` 默认 1800s，45 分钟以上持续唤醒是否击穿该值 WESAD 无法验证。
+- `ZERO_AUDIO_MODEL_PATH`：audeering w2v2 维度 SER（Wav2Small 蒸馏 ONNX 在 HF 无可下载权重，落回文献门已核验的 audeering）。输出字段序 `[arousal, dominance, valence]`，μv/μa 不反转（已现场核验）。~630MB torch 权重，首次 `from_pretrained` 下载到 HF 缓存。
+- `ZERO_VISION_MODEL_NAME`：EmotiEffLib ONNX 多任务模型，**须为 `*_va_mtl` 才有 VA 输出**；ONNX 后端零 timm 依赖，不碰共用 conda 环境（绝不 `conda prune`）。
+
+### zero-link · Zero MCP Client
+
+- **Bearer 鉴权**：本仓 `ZERO_HTTP_TOKEN` 须与 Zero server 侧 `ZERO_MCP_HTTP_TOKEN` **同值**（两仓命名空间不同），否则 401。Zero 鉴权三态（口径同步自 Zero `src/mcp_server/auth.py::resolve_enforced_token`）：① 设了 token → 强制鉴权，即便 loopback（token 须纯 ASCII，否则 fail-fast）；② 未设 + loopback → 免鉴权（loopback 含 127.0.0.0/8 与 ::1）；③ 未设 + 非 loopback → 启动 fail-fast（拒绝对外开无鉴权裸端口）。鉴权失败=传输层 HTTP 401 → client 走连接错误（`ZeroLinkConnectionError`），不走 graceful_step；⚠ 该性质**仅连接期**成立——会话中途轮换 token 导致的 401 会被 `graceful_step` 降级为 None（有 warning 日志），表现为情感通道悄悄失效，轮换 token 须重连。
+- **能力门控透传**（`ZERO_FACS_*` / `ZERO_PROSODY_*` / `ZERO_PHYSIOLOGY_*`）：本仓不读，stdio 模式经 client 整份 `os.environ` 带给子进程；http 模式须在 Zero server 侧自设。前四项不设 → Zero 走**占位路径**（prosody 出 'ratio' 方言、facs_au 只出象限相关子集、physiology 出 legacy 形状）：mapper 能正常消费，风险不是空数据而是**量纲/标度降级**——legacy sc 须配 `skin_conductance_max_us=1.0`（见「能力二」W6 说明）。`ZERO_MCP_WORKSPACE_ENABLED` 例外：Zero 侧默认即开，关掉会让观测量不漂移。名称与取值口径见 `tests/mcp/test_zero_client_e2e.py`。
+- **`ZERO_CHECKPOINT_BACKEND` / `ZERO_CHECKPOINT_DB`**：透传给 Zero server 的会话运行态持久化，与本仓 `ZERO_MCP_PERSISTENCE_*` 无关（那是本仓自己的长期记忆与快照存储；运行态与长期记忆分离）。不设=memory 后端，同一 session_id 重开也是全新会话，跨重启 resume 不生效；sqlite 跨重启持久；postgres Zero 侧未实现（构造期 NotImplementedError）。⚠ `ZERO_CHECKPOINT_DB` 相对路径按 **Zero server 的 cwd**（`ZERO_SERVER_CWD`）解析，建议绝对路径。
+
+### 日志
+
+- `ZERO_MCP_LOG_LEVEL` / `ZERO_MCP_LOG_FILE` 由 `src/logging_config.py` 读取，只在进程入口统一配置（`desktop_mcp_server` 的 `__main__` 块，**接管语义**——摘掉 FastMCP 抢注的 RichHandler）；库模块不读。console 恒 stderr（stdio 模式 stdout 是 JSON-RPC 线路不可写）。
+- 非法级别启动即 ValueError fail-fast（不静默回落）。⚠ DEBUG 下第三方 httpx/httpcore/mcp 命名空间被钉在 INFO——防请求头含 Bearer token 倾倒进日志。
+- `ZERO_MCP_` 前缀**非本仓独占**：Zero 侧也把 `ZERO_MCP_*` 用作其 MCP 面配置域（其通用日志走 `ZERO_LOG_LEVEL`）；已核验（2026-07-30）对方现有键与这两个名字无同名冲突。
+
+### VTube Studio 渲染终端与离散行为层
+
+- `VTS_TOKEN_FILE`：首次接入会在 VTS 内弹窗要求允许，之后复用落盘 token。
+- `VTS_SINK_MODEL` 用 VTS **列表显示名**（如 Hiyori_A），与 CurrentModelRequest 的内部名可以不同，核对以 modelID 为准。
+- `VTS_SINK_EXPRESSIVENESS`：1.0=忠实 AU 幅度；实测产品幅度叠 VTS 参数平滑后肉眼偏淡，演示/直播观感建议 1.5~2.0（只放大幅度，不改表情结构）。
+- `VTS_BEHAVIOR_ENABLED` 与 `VTS_SINK_ENABLED` **语义不同**：行为层工具**始终注册**，flag 关时运行时拒绝（ToolError 带 `[vtsb:disabled]` 令牌）。连接复用同一套 `VTS_API_URL` / `VTS_TOKEN_FILE` / `VTS_SINK_MODEL` / `VTS_SINK_AMBIENT_MOTION`，不另设键。
+- ⚠ **跨进程双插件冲突**：勿同时跑 standalone 行为 server 与另一进程的表情流 sink——两个插件 set 同一参数会触发 VTS 454 独占错误；同进程共享一个 sink 实例才安全。
 
 > 说明：本仓库仅跟踪 Zero_MCP 工程代码（`src/` · `tests/` · `docs/` · 配置）。项目自用的 Claude Code harness（`.claude/` · `CLAUDE.md`）、知识库（`ai-docs/`）、设计纪要（`notes/`）、PRP 工作区（`PRP/` · `ai-shared/`）、行为 evals（`evals/`）与交接文档（`HANDOFF.md`）经 `.git/info/exclude` 本地排除，不随本仓库提交，仅在本地开发环境维护——README 中引用它们的实测数字（FP=0/159、7/7、conf 0.954 等）因此无法从克隆件回溯。
