@@ -141,6 +141,57 @@ def test_warmup_is_gated_by_feature_flag(path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
+def test_flag_off_tools_gate_before_any_lazy_import(path: Path) -> None:
+    """每个 ``@mcp.tool`` 体里 ``_require_enabled()`` 严格早于任何惰性 import。
+
+    这条守的是**上面三条守不到的那一半**：预热在 ``if enabled:`` 内 ⇒ flag 关的
+    部署**没有**预热保护，那时唯一挡住「事件循环内首次 import numpy」的，就是
+    工具一进来先在门上抛 ToolError、根本走不到下面那行延迟 import。
+
+    ⚠ 它为什么必须单独钉：把 ``flags = _get_flags()`` / ``import ... perception``
+    提到门之前，读起来完全无害，而**全部现有测试照绿**——flag 关的用例只断言
+    「抛 ToolError」，提前 import 之后那个 ToolError 照样抛，只是在真 wire 上
+    先无限期卡在 numpy 扩展加载里（Zero 2026-08-11 §3.5 就此发问）。
+    也就是说这条性质一旦破，症状只在 flag 关的真部署上出现，测试面全盲。
+
+    惰性入口按 AST 取两类：函数体内的 ``import`` 语句，以及两 server 各自的
+    惰性服务/能力获取器（它们内部再做 import）。
+    """
+    lazy_getters = {"_get_service", "_get_flags"}
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tools = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "tool"
+            for d in node.decorator_list
+        )
+    ]
+    assert tools, f"{path}：没解析出任何 @mcp.tool——本守卫已失去锚点"
+
+    for tool in tools:
+        gates = [
+            n.lineno
+            for n in ast.walk(tool)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_require_enabled"
+        ]
+        lazies = [
+            n.lineno
+            for n in ast.walk(tool)
+            if isinstance(n, (ast.Import, ast.ImportFrom))
+            or (isinstance(n, ast.Call) and getattr(n.func, "id", None) in lazy_getters)
+        ]
+        assert gates, f"{path}::{tool.name} 未调 _require_enabled()——flag 关时该工具不设防"
+        if not lazies:
+            continue
+        assert min(gates) < min(lazies), (
+            f"{path}::{tool.name}：惰性 import 在第 {min(lazies)} 行、门在第 {min(gates)} 行——"
+            "flag 关的部署没有预热保护，门之前的 import 会在事件循环内首次触达 numpy 而死锁。"
+        )
+
+
+@pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
 def test_enabled_comes_from_feature_flag_helper(path: Path) -> None:
     """``enabled`` 确由 ``_is_enabled()`` 赋值——否则上一条守卫盯的是个空壳名字。
 
