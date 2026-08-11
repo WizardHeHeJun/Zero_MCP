@@ -815,12 +815,14 @@ def test_optional_keys_are_absent_from_v1_payload_without_being_reported_missing
 
     判别力：若把可选键并进必需集，本用例第二条断言立刻红（missing 会变成那两个键）。
     """
-    cfg = _cfg_ok()  # v1 形态载荷：21 键，5 个可选键一个都没有
+    cfg = _cfg_ok()  # v1 形态载荷：21 键，7 个可选键一个都没有
     assert cfg.available is True
     assert cfg.missing_keys == ()  # 必需键齐全 ⇒ 不报缺
-    assert cfg.absent_optional_keys == (  # 但如实记账（v3 的两键 + v4 的三键）
+    assert cfg.absent_optional_keys == (  # 但如实记账（v3 两键 + v4 三键 + v5 两键）
         "checkpointer_impl",
         "memory_store_impl",
+        "motion_backend",
+        "motion_enabled",
         "semantic_store_impl",
         "stateless_http",
         "transport",
@@ -840,15 +842,17 @@ def test_v3_payload_reports_neither_missing_nor_unexpected() -> None:
     assert cfg.absent_optional_keys == (
         "checkpointer_impl",
         "memory_store_impl",
+        "motion_backend",
+        "motion_enabled",
         "semantic_store_impl",
     )
     assert cfg.unexpected_keys == ()
 
 
-def test_v4_payload_reports_nothing_absent() -> None:
-    """v4 形态（26 键，= 今天所连部署）三个方向全空 —— 我方已认全对方现役键集。
+def test_v4_payload_reports_only_v5_keys_absent() -> None:
+    """v4 形态（26 键）只缺 v5 的动作通道两键——分层按代际逐档记账，不是「有/没有」两态。
 
-    值取对方真实语义：不传 sid 时三键回 `null`（不可知），`semantic_store_impl`
+    值取对方真实语义：不传 sid 时后端三键回 `null`（不可知），`semantic_store_impl`
     另有 `"disabled"` 态；本用例只管键集，值语义的判别见
     `test_semantic_store_disabled_is_distinguishable_from_unknown`。
     """
@@ -860,8 +864,32 @@ def test_v4_payload_reports_nothing_absent() -> None:
         semantic_store_impl=None,
     )
     assert cfg.missing_keys == ()
+    assert cfg.absent_optional_keys == ("motion_backend", "motion_enabled")
+    assert cfg.unexpected_keys == ()
+
+
+def test_v5_payload_reports_nothing_absent() -> None:
+    """v5 形态（28 键，= 今天所连部署 Zero `e70787a`）三个方向全空 —— 已认全对方现役键集。
+
+    `motion_enabled` 取 `False`（对方默认关）：本键的价值恰在「关」这一态——它是我方将来
+    接动作通道时的**调用前判据**，免得靠先调一次吃 `[zero:motion-disabled]` 来探能力
+    （那等于把正常分支建成错误分支）。
+    """
+    cfg = _cfg_ok(
+        transport="stdio",
+        stateless_http=False,
+        checkpointer_impl=None,
+        memory_store_impl=None,
+        semantic_store_impl=None,
+        motion_enabled=False,
+        motion_backend="synth",
+    )
+    assert cfg.missing_keys == ()
     assert cfg.absent_optional_keys == ()
     assert cfg.unexpected_keys == ()
+    # 值原样透传可读（OPTIONAL 分层只影响记账，不吞值）——将来接动作通道即读这一位。
+    assert cfg.fields.get("motion_enabled") is False
+    assert cfg.fields.get("motion_backend") == "synth"
 
 
 def test_semantic_store_disabled_is_distinguishable_from_unknown() -> None:
