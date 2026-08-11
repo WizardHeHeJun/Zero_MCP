@@ -767,6 +767,11 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
         "checkpointer_impl",
         "memory_store_impl",
         "semantic_store_impl",
+        # v5 起（Zero `e70787a`）新增的动作通道回读两键。**由我方 2026-08-11 §五.3 提请**，
+        # 对方按我方版本轴口径主动建议登记进本可选集（而非必需集）——那次「EXPECTED 两侧
+        # 不同轴」的对齐已被对方收下并复用。
+        "motion_enabled",
+        "motion_backend",
     }
 )
 """**已登记但按版本可缺**的键：对方 v3 起新增，v1/v2 部署上不存在。
@@ -787,6 +792,17 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
 - **后端回读三键**（下详）⇒ 可用于判「对方到底跑在什么后端上」（内存态 vs 落盘态直接影响
   我方对 resume 的预期）。⚠ 未消费**不等于信息被扔掉**：三键的值经 `ZeroDeployConfig.fields`
   原样透传，随时可读；`OPTIONAL` 分层只影响 `missing_keys`/`absent_optional_keys` 的记账。
+- **`motion_enabled`（v5）⇒ 接动作通道时的「调用前判据」，届时应当真消费**：没有它，我方
+  唯一的知情方式是先调一次 `zero.motion` 吃个 `[zero:motion-disabled]` ——而该码已被判为
+  **不可降级**（「认命并停止再调」），**拿它当能力探针等于把正常分支建成错误分支**。
+  ⚠ 它的边界方向与 `transport` **相反、是更强**：`transport` 消不掉「启动时起传输、调用时
+  读 env」的时序漂移；而 `motion_enabled` 与 `zero.motion` 的门判**同一个符号**
+  `_motion_enabled()`（我方 AST 现场核过其值表达式，非另抄一份 env 解析），门判本身也是
+  每次调用现读 env ⇒ 本键回的就是「**下一次 `zero.motion` 会看到的那个值**」，可直接当
+  调用前判据用，不需要加「本进程事实、非连接级事实」那类限定。
+- **`motion_backend`（v5）⇒ 答「拉到的轨迹是**谁**算的」**（`synth` 拉取侧现算 / `directive`
+  图内 MotionAgent / `efference` directive+指令级副本）。三档 `keyframes` 形状一致 ⇒ 非消费
+  必需项，但「同一段轨迹换没换决策源」只有这一位能答，env 名同样证明不了它。
 
 ━━ 后端回读三键（v4 起）：`checkpointer_impl` / `memory_store_impl` / `semantic_store_impl` ━━
 
@@ -816,7 +832,7 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
     『全内存』」）。
 """
 
-KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3, 4})
+KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3, 4, 5})
 """本仓**已逐键核验过**的 `describe_config_version`。不在此集合 ⇒ 只报告不强制（见下）。
 
 现场核验（2026-07-30，只读 D:\\Zero；两版逐键比对经 AST 取 `describe_config` 的 return 字面量）：
@@ -850,7 +866,21 @@ KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3, 4})
   工作树不同（见下方那条「同一个坑的第二次」）。此处记一笔，是为了将来能看出哪几版当时
   只活在对方工作树里、哪几版是主干固化的。
 
-  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v4），
+- **v5** = Zero **main** `e70787a`（`DESCRIBE_CONFIG_VERSION = 5`；现场核于其 HEAD `e70787a`、
+  **工作树 clean**，2026-08-11 16:35）：返回体 26 → **28 键**，新增 `motion_enabled` /
+  `motion_backend`（动作通道回读两键，登记进 `DESCRIBE_CONFIG_OPTIONAL_KEYS`，语义见该处）。
+  **核验方法**：AST 取 `describe_config` 的 return 字面量 —— 相对 v4 只增不减；且
+  `motion_enabled` 的**值表达式**是 `_motion_enabled()`（与 `zero.motion` 门判同一符号，
+  非另抄 env 解析）、`motion_backend` 是 `cfg.motion_backend`。⇒ 对方「本键回的就是下一次
+  `zero.motion` 会看到的那个值」这条**结构上成立**，可当调用前判据。
+  📌 本键由**我方 2026-08-11 §五.3 提请**、对方同日落码；对方并按我方版本轴口径**主动**建议
+  登记进可选集——即「EXPECTED 两侧不同轴」那次对齐已被对方复用，不必我方再解释一次。
+  ⚠ **这一版我方一度决定「不跟随」**：首次看到时它还在对方**未提交工作树**里（HEAD
+  `c0c12c5` + 2 个未提交文件，16:16），我方按「每次跟随都在把守卫从提醒变成追认」的自省
+  留守卫红着当提醒；对方 16:23 提交并合 main 后，跟随条件才满足。此处记一笔是想说明：
+  **红着不跟随与跟随，差的只是对方一次 commit，而不是我方判断反复。**
+
+  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v5），
   不是 main（v1）。三版都得认，否则今天的 live 调用会全程降级。
   ⚠ **这是同一个坑的第二次**：v2 与 v3 都是从对方**未提交工作树**读到的。我方每次「跟随」
   都在把守卫从「提醒」变成「追认」。缓解不是不跟随（不跟随则 live 全程降级），而是

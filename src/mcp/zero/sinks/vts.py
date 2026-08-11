@@ -243,7 +243,27 @@ class BlinkMachine:
 
 
 class VtsApiError(RuntimeError):
-    """VTS Public API 返回 APIError 或协议异常。"""
+    """VTS Public API 返回 APIError 或协议异常。
+
+    ``error_id`` 携带 VTS 的机读 ``errorID``（协议异常/无该字段时为 None）——
+    判定一律走本字段，**不要回头从 message 文本里正则抠**：那份文案里既有 VTS 的
+    英文原文也有我方中文，是给人读的，不是判据。
+    """
+
+    def __init__(self, message: str, *, error_id: int | None = None) -> None:
+        super().__init__(message)
+        self.error_id = error_id
+
+
+VTS_ERROR_AUTH_IN_PROGRESS = 51
+"""VTS ``errorID`` 51：授权流程已在进行中（VTS 里有一个挂起的授权窗）。
+
+⚠ 这个态**极易由我方自己制造**：一次被中途放弃的 ``vts_connect``（客户端超时/取消）
+会在 VTS 里留下挂起授权窗，而 VTS **不随请求方断开而收掉它** ⇒ 此后每次连接都撞 51，
+直到有人手动点掉。且它与「上一个进程没退干净占着连接」**不是同一种残留态**——
+后者 ``Get-NetTCPConnection -LocalPort 8001`` 查得出，本条查不出（连接确已断，
+挂起的是 VTS 进程里的 UI 状态）。见 ``ai-docs/pitfalls.md`` 同名条目。
+"""
 
 
 _UNSET: Any = object()
@@ -295,8 +315,19 @@ class VtsApiClient:
                     if resp.get("requestID") != req_id:
                         continue
                     if resp.get("messageType") == "APIError":
-                        raise VtsApiError(f"{message_type} -> APIError: {resp.get('data')}")
-                    return resp.get("data", {})
+                        # ⚠ 变量名不得叫 payload：那会把外层闭包变量变成本函数局部变量，
+                        # 上面 send(json.dumps(payload)) 当场 UnboundLocalError。
+                        err_data = resp.get("data")
+                        raw_id = err_data.get("errorID") if isinstance(err_data, dict) else None
+                        raise VtsApiError(
+                            f"{message_type} -> APIError: {err_data}",
+                            error_id=raw_id if isinstance(raw_id, int) else None,
+                        )
+                    # 显式标注：resp 来自 json.loads ⇒ Any，直接 return 会让
+                    # strict mypy 判 [no-any-return]（本行是 main 上既有的唯一
+                    # mypy 红点，顺手清掉——同 `_dump_model` 的类型安全包装惯例）。
+                    result: dict[str, Any] = resp.get("data", {})
+                    return result
 
         wait = self.timeout if timeout is _UNSET else timeout
         if wait is None:
@@ -569,7 +600,21 @@ class VtsExpressionSink:
         assert self.api is not None
         logger.info("VTS 首次接入：等待用户在 VTube Studio 弹窗中允许插件……")
         # timeout=None：这一步在等人点弹窗，不设上限。
-        data = await self.api.request("AuthenticationTokenRequest", dict(plugin), timeout=None)
+        try:
+            data = await self.api.request("AuthenticationTokenRequest", dict(plugin), timeout=None)
+        except VtsApiError as exc:
+            if exc.error_id != VTS_ERROR_AUTH_IN_PROGRESS:
+                raise
+            # 单列这一支：它与其它 APIError 的差别不在「失败」而在**留下了什么**——
+            # VTS 里正挂着一个授权窗等人处置。混在通用文案里等于把这条线索丢掉，
+            # 而调用方（含跨仓消费方）拿到原始英文 errorID 51 未必知道要去点它。
+            raise VtsApiError(
+                f"{VTS_ERROR_AUTH_IN_PROGRESS} 授权流程已在进行中：VTube Studio 里有一个"
+                "挂起的授权窗未处置（多半是上一次被中途放弃的连接留下的——VTS 不会随"
+                "请求方断开而收掉它）。处置：到 VTS 界面点掉/允许那个弹窗后重试。"
+                f"⚠ 该残留态用 Get-NetTCPConnection 查不出（连接确已断）。原文：{exc}",
+                error_id=exc.error_id,
+            ) from exc
         token = str(data["authenticationToken"])
         if self.token_path is not None:
             await asyncio.to_thread(self.token_path.write_text, token, encoding="utf-8")
