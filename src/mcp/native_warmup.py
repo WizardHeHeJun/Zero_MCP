@@ -32,8 +32,20 @@ Windows loader 层面的确切成因未查到底（不臆断）；上述边界�
 
 约束同 ``src/logging_config.py``：本模块位于依赖图最底端（无业务逻辑、无上层
 依赖），任何层 import 它都是向下依赖；只在进程入口调用，不在 import 路径上
-产生副作用。预热失败**不拦启动**（缺包场景仍应能起 server，由工具体自行
-优雅回退），只记 warning。
+产生副作用。
+
+## ⚠ 「预热失败只 warn 不拦启动」为何在本场景成立——别当通用降级模板照抄
+
+numpy 是硬依赖（pyproject 无条件必装），失败即代表环境已损坏，按常理该
+fail-fast。这里仍然只 warn，理由是**本模块防的死锁判据是「是否首次触达」而
+非「是否 import 成功」**：预热阶段只要那次 import 真正跑过一遍，事件循环里
+后续的同名 import 便不会再触发该死锁（成功则命中 ``sys.modules``，失败则
+命中 Python 的失败缓存/立即重抛，两者都不会再进扩展模块加载）。也就是说
+**预热失败时本模块的职责已经尽到**，真正的环境问题留给工具体自己按缺依赖
+报错——那里的错误信息离用户更近、也更具体。
+
+反过来说：若某处的降级判据是「依赖可用与否」而不是「是否首次触达」，就
+**不该**照抄这里的吞异常写法，该 fail-fast 就 fail-fast。
 """
 
 from __future__ import annotations
@@ -60,14 +72,20 @@ def warm_native_extensions(modules: Sequence[str]) -> list[str]:
         实际预热成功的模块名列表（失败项不在内，只记 warning 不抛）。
     """
     warmed: list[str] = []
+    started = time.monotonic()
     for name in modules:
         start = time.monotonic()
         try:
             importlib.import_module(name)
         except Exception as exc:
-            # 缺包/环境不全不应拦住 server 启动：工具体各自有优雅回退路径。
+            # 缺包/环境不全不应拦住 server 启动（模块 docstring「为何成立」一节）：
+            # 工具体各自有优雅回退路径，那里的报错离用户更近。
             logger.warning("原生扩展预热失败（%s）：%s——相关工具将按缺依赖回退。", name, exc)
             continue
         warmed.append(name)
         logger.debug("原生扩展预热完成：%s（%.2fs）", name, time.monotonic() - start)
+    if warmed:
+        # INFO 而非 DEBUG：这份耗时直接计入 server 启动（spawn→initialize）预算，
+        # 是排查「MCP 握手变慢」时的第一现场——不该要求先重启加 DEBUG 才看得到。
+        logger.info("原生扩展预热合计 %.2fs：%s", time.monotonic() - started, ", ".join(warmed))
     return warmed

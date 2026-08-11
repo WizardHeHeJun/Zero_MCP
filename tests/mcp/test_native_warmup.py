@@ -112,7 +112,14 @@ def test_warmup_precedes_event_loop(path: Path) -> None:
 
 @pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
 def test_warmup_is_gated_by_feature_flag(path: Path) -> None:
-    """预热在 flag 分支内——flag 关时不得拉业务/原生依赖（零回归不变式）。"""
+    """预热在 **``enabled`` 那个** flag 分支内——flag 关时不拉依赖（零回归不变式）。
+
+    断言绑到 ``if enabled:`` 这个具体条件，而非「被某个 ``if`` 包住」：后者在
+    ``if 1 == 2:`` 这类与 flag 毫无关系、甚至恒假的包裹下照样判绿（审查门
+    2026-08-11 现场变异实证），兜不住「条件被换成看似合理但错的判断」——
+    而那正是这条守卫存在的全部理由。``enabled`` 由两 server 各自的
+    ``_is_enabled()`` 赋值，是它们唯一的 feature flag 出口。
+    """
     block = _main_block(path)
     warm_line = _call_line(block, "warm_native_extensions")
     gated = [
@@ -120,9 +127,33 @@ def test_warmup_is_gated_by_feature_flag(path: Path) -> None:
         for inner in ast.walk(block)
         if isinstance(inner, ast.If)
         and inner is not block
+        and isinstance(inner.test, ast.Name)
+        and inner.test.id == "enabled"
         and any(
             isinstance(n, ast.Call) and getattr(n.func, "id", None) == "warm_native_extensions"
             for n in ast.walk(inner)
         )
     ]
-    assert gated, f"{path}：第 {warm_line} 行的预热不在任何 feature flag 分支内"
+    assert gated, (
+        f"{path}：第 {warm_line} 行的预热不在 `if enabled:` 分支内——"
+        "flag 关时不得拉业务/原生依赖（零回归不变式）。"
+    )
+
+
+@pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
+def test_enabled_comes_from_feature_flag_helper(path: Path) -> None:
+    """``enabled`` 确由 ``_is_enabled()`` 赋值——否则上一条守卫盯的是个空壳名字。
+
+    上一条把语义绑在 ``enabled`` 这个**名字**上；若有人把它改成别处来的值
+    （或删掉赋值），那条断言就退化成「名字对得上」而不再代表 feature flag。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assigned = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "enabled" for t in node.targets)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "_is_enabled"
+    ]
+    assert assigned, f"{path}：`enabled` 不是由 `_is_enabled()` 赋值——flag 守卫已失去语义锚点"
