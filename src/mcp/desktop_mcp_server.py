@@ -432,6 +432,7 @@ async def close_window(window_handle: int) -> str:
 
 if __name__ == "__main__":
     from src.logging_config import configure_logging  # noqa: PLC0415
+    from src.mcp.native_warmup import warm_native_extensions  # noqa: PLC0415
 
     # 接管 root：FastMCP 构造时 SDK 已抢注 RichHandler(stderr)，此前的内联
     # basicConfig 因此实为 no-op 死码。configure_logging 摘掉抢注 handler，
@@ -446,6 +447,13 @@ if __name__ == "__main__":
     )
 
     if enabled:
+        # 原生扩展预热（必须在 mcp.run() 之前）：OCR 路径（perception → numpy /
+        # RapidOCR）在事件循环起来之后首次 import numpy 会无限期死锁，判据与最小
+        # 复现见 src/mcp/native_warmup.py。⚠ 此前本 server 只是被下面的能力探测
+        # **偶然**挡住了（probe_capabilities 会 import onnxruntime，连带拉起
+        # numpy）——那是副作用不是保障，探测一旦改懒/改序即失守，故显式预热。
+        warm_native_extensions(("numpy",))
+
         # 启动时探测能力并缓存（幂等）
         startup_flags = _get_flags()
         logger.info(

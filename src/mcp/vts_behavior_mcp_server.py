@@ -396,6 +396,7 @@ async def vts_disconnect() -> str:
 
 if __name__ == "__main__":
     from src.logging_config import configure_logging  # noqa: PLC0415
+    from src.mcp.native_warmup import warm_native_extensions  # noqa: PLC0415
 
     # 接管 root：FastMCP 构造时 SDK 已抢注 RichHandler(stderr)——configure_logging
     # 摘掉抢注 handler，统一为 LOG_FORMAT + stderr（stdout 是 JSON-RPC 线路，绝不可写；
@@ -407,6 +408,13 @@ if __name__ == "__main__":
     logger.info("vts_behavior_mcp_server 启动：VTS_BEHAVIOR_ENABLED=%s", enabled)
 
     if enabled:
+        # 原生扩展预热（必须在 mcp.run() 之前）：_get_service() 的延迟 import 会
+        # 经 src.mcp.zero 链路首次拉起 numpy，而事件循环起来之后再首次 import
+        # numpy 会无限期死锁——Zero 2026-08-11 通报的 vts_connect 挂起即此。
+        # 判据与最小复现见 src/mcp/native_warmup.py 模块 docstring。
+        # 仍在 flag 内：VTS_BEHAVIOR_ENABLED=false 时不拉业务依赖（零回归不变）。
+        warm_native_extensions(("src.mcp.behavior.service",))
+
         # 惰性持有 sink（AD-9）：不在启动时连 VTS——VTS 未启动/未开 API 也能起
         # server，连接由 vts_connect 工具显式建立（连接失败只在该工具报错）。
         logger.info("行为层就绪：经 vts_connect 显式建立 VTS 连接（惰性持有 sink）。")
