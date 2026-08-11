@@ -800,6 +800,13 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
   `_motion_enabled()`（我方 AST 现场核过其值表达式，非另抄一份 env 解析），门判本身也是
   每次调用现读 env ⇒ 本键回的就是「**下一次 `zero.motion` 会看到的那个值**」，可直接当
   调用前判据用，不需要加「本进程事实、非连接级事实」那类限定。
+  📌 **该同源性质自 Zero `2e60c12` 起由对方的 AST 守卫钉住**（两条：值表达式必须是
+  `_motion_enabled()` 调用；`ZERO_MOTION_ENABLED` 在其 `src/mcp_server/` 内只允许被
+  `_motion_enabled` 读）——即我方依赖的不再只是一次点验，而是对方的常驻守卫。
+  ⚠ **但那道守卫住在对方仓里：它若被删，我方不会知道。** 故**我方真接动作通道、把这一位
+  当装配判据时，须同时在 `tests/mcp/test_zero_contract_crosscheck.py` 补一条我方自己的
+  同源 crosscheck**，不要只靠对方那道。今天不补是因为我方尚未消费这一位，提前加只会增加
+  跨仓守卫的假红噪音（它读的是对方工作副本）。
 - **`motion_backend`（v5）⇒ 答「拉到的轨迹是**谁**算的」**（`synth` 拉取侧现算 / `directive`
   图内 MotionAgent / `efference` directive+指令级副本）。三档 `keyframes` 形状一致 ⇒ 非消费
   必需项，但「同一段轨迹换没换决策源」只有这一位能答，env 名同样证明不了它。
