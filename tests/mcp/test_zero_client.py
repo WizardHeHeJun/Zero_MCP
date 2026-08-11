@@ -61,6 +61,7 @@ from src.mcp.zero.client import (
     ZeroLinkDeployEnvError,
     ZeroLinkDisabledError,
     ZeroLinkLockTimeoutError,
+    ZeroLinkMotionDisabledError,
     ZeroLinkNonDegradableError,
     ZeroLinkStepTimeoutError,
     ZeroLinkUnknownSessionError,
@@ -648,7 +649,11 @@ def test_wire_fixture_defeats_old_startswith_judgement() -> None:
 
 
 def test_classify_zero_error_extracts_token_anywhere() -> None:
-    """令牌提取**位置无关**：开头/中部/末尾都能取到，且六个码全覆盖。"""
+    """令牌提取**位置无关**：开头/中部/末尾都能取到，且**全表**逐码覆盖。
+
+    覆盖面遍历 `ZERO_ERROR_CODES` 而非写死码数——写死会在每次跟随对方加码时
+    变成需要手改的噪音，且改漏了也只是数字不符、不指向真问题。
+    """
     assert classify_zero_error("[zero:payload-invalid] 开头") == ZERO_ERROR_CODE_PAYLOAD_INVALID
     # ⑤ 令牌出现在**中间**（真 wire 形态即如此）
     assert classify_zero_error(_wire("zero.open_session", "[zero:config-invalid] x")) == (
@@ -658,7 +663,7 @@ def test_classify_zero_error_extracts_token_anywhere() -> None:
     assert classify_zero_error("something failed [zero:deploy-env-invalid]") == (
         ZERO_ERROR_CODE_DEPLOY_ENV_INVALID
     )
-    # 六码全表逐个可提取（不是只有 unknown-session 一条通路）
+    # 全表逐个可提取（不是只有 unknown-session 一条通路）
     for code in ZERO_ERROR_CODES:
         assert classify_zero_error(_wire("zero.step", f"[zero:{code}] 文案")) == code
 
@@ -751,12 +756,16 @@ async def test_step_config_incompatible_raises_non_degradable(
         ("external-prior-invalid", ZeroLinkCallerFaultError),
         ("config-invalid", ZeroLinkCallerFaultError),
         ("deploy-env-invalid", ZeroLinkDeployEnvError),
+        # 动作通道未开：与 deploy-env-invalid **分类**（前者=env 值不合法该报警，
+        # 后者=合法的默认关闭态，调用方该停止再调而非每轮报警），但同属不可降级。
+        ("motion-disabled", ZeroLinkMotionDisabledError),
     ],
 )
 async def test_step_other_codes_map_to_expected_class(
     monkeypatch: pytest.MonkeyPatch, code: str, expected: type[ZeroLinkCallError]
 ) -> None:
-    """其余四码的归类：调用方传参错 → CallerFault；部署端 env 错 → DeployEnv；均不可降级。"""
+    """其余五码的归类：调用方传参错 → CallerFault；部署端 env 错 → DeployEnv；
+    动作通道未开 → MotionDisabled；均不可降级。"""
     client, mock_session = _build_client_with_session(monkeypatch)
     _set_tool_return(mock_session, _wire("zero.step", f"[zero:{code}] 文案"), is_error=True)
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)

@@ -700,6 +700,10 @@ _EXPECTED_ZERO_ERROR_CODE_SYMBOLS: frozenset[str] = frozenset(
         # timeout-step Zero 侧只登记不产出（执行超时未实现），消费侧分类先一次到位。
         "ZERO_ERROR_CODE_TIMEOUT_LOCK",
         "ZERO_ERROR_CODE_TIMEOUT_STEP",
+        # 动作通道总开关未开（Zero 2026-08-11 回件 §3.1：新失效模式、不接管旧码支线；
+        # AST 现场核过对方产出点唯一，在 `motion` 工具体内）。本仓当前不调 zero.motion，
+        # 属预登记——守卫要求每个码留下书面族归属判断，不得靠一条警告挂账。
+        "ZERO_ERROR_CODE_MOTION_DISABLED",
     }
 )
 # 每个已消费码的**族归属期望**：True = 不可降级（`graceful_step` 上抛不吞）、
@@ -723,6 +727,9 @@ _EXPECTED_CODE_DEGRADABILITY: dict[str, bool] = {
     "ZERO_ERROR_CODE_CONFIG_INVALID": True,
     # 不可降级：部署端 env 错 —— 改 client 传参永远改不好
     "ZERO_ERROR_CODE_DEPLOY_ENV_INVALID": True,
+    # 不可降级：动作通道总开关未开 —— 唯一解法是部署端开 env 并重启 server，
+    # 归可降级会让 graceful_step 每轮静默 return None，而它一次也不会自愈
+    "ZERO_ERROR_CODE_MOTION_DISABLED": True,
 }
 
 # 令牌构造前缀：本仓消费正则 `\[zero:([a-z][a-z0-9-]*)\]` 的依据。

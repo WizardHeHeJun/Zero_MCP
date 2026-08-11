@@ -84,6 +84,12 @@ ZERO_ERROR_CODE_DEPLOY_ENV_INVALID = "deploy-env-invalid"
 # 二者可否原样重试**相反**，单码会把判别推回人读文案。语义见各自异常类 docstring。
 ZERO_ERROR_CODE_TIMEOUT_LOCK = "timeout-lock"
 ZERO_ERROR_CODE_TIMEOUT_STEP = "timeout-step"
+# ── 动作通道总开关未开（Zero 2026-08-11 回件 §3.1 确认：**新失效模式，不接管任何旧码支线**）。
+# 现场核验（AST，剥 docstring/注释后按 Name 节点数）：对方全仓该常量恰 3 处——定义、
+# describe_config 的 error_codes 集合、以及 `motion` 工具体内的唯一 raise 点。⇒ 只有调
+# `zero.motion` 才可能遇到；本仓当前**不调该工具**，此处为**预登记**（守卫要求每个码留下
+# 书面族归属判断，不得靠一条警告挂账）。
+ZERO_ERROR_CODE_MOTION_DISABLED = "motion-disabled"
 
 ZERO_ERROR_CODES: frozenset[str] = frozenset(
     {
@@ -95,6 +101,7 @@ ZERO_ERROR_CODES: frozenset[str] = frozenset(
         ZERO_ERROR_CODE_DEPLOY_ENV_INVALID,
         ZERO_ERROR_CODE_TIMEOUT_LOCK,
         ZERO_ERROR_CODE_TIMEOUT_STEP,
+        ZERO_ERROR_CODE_MOTION_DISABLED,
     }
 )
 
@@ -233,6 +240,25 @@ class ZeroLinkDeployEnvError(ZeroLinkNonDegradableError):
     """
 
 
+class ZeroLinkMotionDisabledError(ZeroLinkNonDegradableError):
+    """所连部署的**动作通道总开关未开**（Zero `[zero:motion-disabled]`，`ZERO_MOTION_ENABLED`
+    默认关）——只有部署端开 env 并**重启 server** 才能好。
+
+    🛑 **为什么不复用 `ZeroLinkDeployEnvError`**（两者都是「改 client 传参永远改不好」）：
+    那一条的语义是部署端 env 值**不合法**＝配置坏了，该报警；本条是一个**合法的、有意
+    的默认关闭态**——部署方没打算开这个能力。二者的正确处置不同：前者要惊动人去修，
+    后者调用方应当**认命并停止再调 `zero.motion`**（记一次 INFO 即可，不该每轮报警）。
+    混进同一个类会让「能力没开」和「部署坏了」在观测上不可区分，正是本仓分码的初衷。
+
+    ⚠ 仍归 `ZeroLinkNonDegradableError`（Zero 2026-08-11 回件 §3.1 的建议，本仓采纳）：
+    它**每轮必复现且 client 无法自愈**——归可降级会让 `graceful_step` 每轮静默
+    `return None`，与「偶发抖动」在看板上不可区分，而它一次也不会自愈。
+
+    ⚠ 触发面：仅在调用 `zero.motion` 时可能遇到。**本仓当前不调该工具**，故这是预登记；
+    将来接入动作通道时，调用点应当把本异常当「能力未开」的正常分支处理，而非故障。
+    """
+
+
 class ZeroLinkSchemaIncompatibleError(ZeroLinkNonDegradableError):
     """**所连部署**的 `external_prior_schema_version` 与本仓不一致 —— 跨语言契约不兼容。
 
@@ -266,6 +292,7 @@ _CODE_TO_EXCEPTION: dict[str, type[ZeroLinkCallError]] = {
     ZERO_ERROR_CODE_DEPLOY_ENV_INVALID: ZeroLinkDeployEnvError,
     ZERO_ERROR_CODE_TIMEOUT_LOCK: ZeroLinkLockTimeoutError,
     ZERO_ERROR_CODE_TIMEOUT_STEP: ZeroLinkStepTimeoutError,
+    ZERO_ERROR_CODE_MOTION_DISABLED: ZeroLinkMotionDisabledError,
 }
 
 
@@ -732,7 +759,16 @@ TestDescribeConfigCrosscheck` 静态判红，运行期不符只降级+warn（见
 那会让我方对旧部署误报缺键。
 """
 
-DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset({"transport", "stateless_http"})
+DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
+    {
+        "transport",
+        "stateless_http",
+        # v4 起（Zero `0effea7`，即 bump 3→4 那一次提交本身）新增的后端回读三键。
+        "checkpointer_impl",
+        "memory_store_impl",
+        "semantic_store_impl",
+    }
+)
 """**已登记但按版本可缺**的键：对方 v3 起新增，v1/v2 部署上不存在。
 
 为什么需要这一层（2026-07-30 实测踩到）：字段集守卫的判据是「我方期望集与对方返回体**逐键相等**」，
@@ -748,9 +784,36 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset({"transport", "statele
 - `transport` = 对方**实际起的**传输（不是我方以为的那个）⇒ 可用于校验我方配置与对方实况一致；
 - `stateless_http` ⇒ 若对方是 stateless，**每次请求独立、session 语义完全不同**，
   我方的 resume / session 管理前提可能整体不成立。这条影响面比 `transport` 大得多，须专门评估。
+
+━━ 后端回读三键（v4 起）：`checkpointer_impl` / `memory_store_impl` / `semantic_store_impl` ━━
+
+🛑 **为什么登记进「可选」而不是「必需」——尽管 Zero 明确建议了 EXPECTED**（2026-08-11 回件
+§3.2）：两侧的「EXPECTED」不是同一件事，对方的建议在**它自己的轴上完全成立**，只是与本集合
+的语义不同轴：
+  · 对方说的是**门控轴**：「键恒出现、不随 feature flag 增删」——这一点现场核过，属实
+    （返回体是字面量三键恒在，值走 `... if session else None`）。
+  · 本集合说的是**版本轴**：「我方支持的**每一个代际**上都有」。而这三键是 v4 才新增的
+    （Zero `0effea7` 同一次提交引入三键并 bump 3→4；`git log -S` 逐个核过），v1/v2/v3 上
+    **不存在**。放进必需集会让我方对旧部署反向误报「缺 3 键」——把「对方版本旧」误报成
+    「契约漂移」，正是本可选层被造出来要避免的那个方向。
+⇒ 结论：**门控恒在 ≠ 各代际恒在**。已就此回复对方（同分支回件 §2）。分层不削弱守卫：
+对方若再加第 27 个键，它仍落进 `extra` 判红。
+
+**值的语义（现场核自 Zero `aa531b2`，消费前必读——三者都不是「有/没有」两态）**：
+  · 传了 `session_id` ⇒ 值是**该会话实际构造出的类名**；
+  · 不传 sid（部署端默认面）⇒ 值恒为 `null`，含义是「**不可知**」而**不是**「没有」。
+    对方有意为之：那一面没有会话实例可读，现构造一次会有副作用（sqlite 建目录开连接 /
+    graphiti 连 Neo4j），故按「不可知项显式回 null」处置，不拿 env 字面量充数。
+  · ⚠ `semantic_store_impl` 是**三态**：`null`（无 sid ⇒ 不可知）/ `"disabled"`（已解析且
+    语义后端关闭，这是默认）/ 实际类名（开启）。**把「关闭」与「不可知」都读成 null 就丢了
+    判别力**，消费时必须分开。
+  · ⚠ 回的是**实际构造出的类名、不是 env 字面量**：两个后端工厂在依赖缺失时会**静默回退**
+    （`neo4j` 缺驱动 → InMemory；`sqlite_vec` 缺依赖 → None）⇒ 拿这三键判「对方到底跑在
+    什么后端上」可靠，拿 env 猜不可靠。这正是对方 `0effea7` 的提交题意（「env 名证明不了
+    『全内存』」）。
 """
 
-KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3})
+KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3, 4})
 """本仓**已逐键核验过**的 `describe_config_version`。不在此集合 ⇒ 只报告不强制（见下）。
 
 现场核验（2026-07-30，只读 D:\\Zero；两版逐键比对经 AST 取 `describe_config` 的 return 字面量）：
@@ -769,7 +832,17 @@ KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3})
   就在于回的值与真正起传输的那段代码同源」）。属**增删键** ⇒ 按其纪律 ① 必须 bump。
   ⇒ v3 与 v1/v2 **不是逐键相同**，故那两键登记进 `DESCRIBE_CONFIG_OPTIONAL_KEYS` 而非必需集。
 
-  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v3），
+- **v4** = Zero **main** `0effea7`（`DESCRIBE_CONFIG_VERSION = 4`；现场核于其 HEAD `aa531b2`、
+  工作树 clean，2026-08-11）：返回体从 23 键增到 **26 键**，新增 `checkpointer_impl` /
+  `memory_store_impl` / `semantic_store_impl`（后端回读三键，登记进
+  `DESCRIBE_CONFIG_OPTIONAL_KEYS`，值语义见该处）。三键与 bump 由**同一次提交**引入
+  （`git log -S` 逐键核过）⇒ 符合对方 bump 纪律 ①（增删键）。对 v1–v3 的 23/21 键**逐键
+  向后兼容**（只增不改），我方读的那 21 必需键语义未动。
+  ✅ **这一版首次是从对方 `main` 且工作树 clean 的状态读到的**——与 v2/v3 都读自未提交
+  工作树不同（见下方那条「同一个坑的第二次」）。此处记一笔，是为了将来能看出哪几版当时
+  只活在对方工作树里、哪几版是主干固化的。
+
+  ⚠ 我方 stdio 传输默认 `ZERO_SERVER_CWD=D:\\Zero`，即真正连的是对方**工作树**（今天 = v4），
   不是 main（v1）。三版都得认，否则今天的 live 调用会全程降级。
   ⚠ **这是同一个坑的第二次**：v2 与 v3 都是从对方**未提交工作树**读到的。我方每次「跟随」
   都在把守卫从「提醒」变成「追认」。缓解不是不跟随（不跟随则 live 全程降级），而是

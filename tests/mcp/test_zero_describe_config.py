@@ -815,19 +815,72 @@ def test_optional_keys_are_absent_from_v1_payload_without_being_reported_missing
 
     判别力：若把可选键并进必需集，本用例第二条断言立刻红（missing 会变成那两个键）。
     """
-    cfg = _cfg_ok()  # v1 形态载荷，不含 transport / stateless_http
+    cfg = _cfg_ok()  # v1 形态载荷：21 键，5 个可选键一个都没有
     assert cfg.available is True
     assert cfg.missing_keys == ()  # 必需键齐全 ⇒ 不报缺
-    assert cfg.absent_optional_keys == ("stateless_http", "transport")  # 但如实记账
+    assert cfg.absent_optional_keys == (  # 但如实记账（v3 的两键 + v4 的三键）
+        "checkpointer_impl",
+        "memory_store_impl",
+        "semantic_store_impl",
+        "stateless_http",
+        "transport",
+    )
     assert cfg.unexpected_keys == ()  # 且不会反过来被当成「多了键」
 
 
 def test_v3_payload_reports_neither_missing_nor_unexpected() -> None:
-    """v3 形态（23 键）两个方向都不报 —— 对方正常演进不该触发任何告警。"""
+    """v3 形态（23 键）**必需/多余**两个方向都不报 —— 对方正常演进不该触发告警。
+
+    ⚠ `absent_optional_keys` 这一栏**有意非空**：v3 确实没有 v4 才引入的后端回读三键，
+    如实记账正是分层的职责（「对方版本旧」≠「契约漂移」）。把它断言成空等于要求
+    v3 部署长出 v4 的键。
+    """
     cfg = _cfg_ok(transport="stdio", stateless_http=False)
+    assert cfg.missing_keys == ()
+    assert cfg.absent_optional_keys == (
+        "checkpointer_impl",
+        "memory_store_impl",
+        "semantic_store_impl",
+    )
+    assert cfg.unexpected_keys == ()
+
+
+def test_v4_payload_reports_nothing_absent() -> None:
+    """v4 形态（26 键，= 今天所连部署）三个方向全空 —— 我方已认全对方现役键集。
+
+    值取对方真实语义：不传 sid 时三键回 `null`（不可知），`semantic_store_impl`
+    另有 `"disabled"` 态；本用例只管键集，值语义的判别见
+    `test_semantic_store_disabled_is_distinguishable_from_unknown`。
+    """
+    cfg = _cfg_ok(
+        transport="stdio",
+        stateless_http=False,
+        checkpointer_impl=None,
+        memory_store_impl=None,
+        semantic_store_impl=None,
+    )
     assert cfg.missing_keys == ()
     assert cfg.absent_optional_keys == ()
     assert cfg.unexpected_keys == ()
+
+
+def test_semantic_store_disabled_is_distinguishable_from_unknown() -> None:
+    """`semantic_store_impl` 三态可分：`null`(不可知) / `"disabled"`(关) / 类名(开)。
+
+    🛑 这一格盯的是**判别力本身**：Zero 2026-08-11 回件 §3.2 明确「『关闭』与『不可知』
+    若都回 null 就不可区分」。我方任何把这两态并成一态的读法（如 `or ""`、`if not v`）
+    都会让「语义后端到底开没开」这个事实在消费侧丢失。
+    """
+    unknown = _cfg_ok(semantic_store_impl=None)
+    disabled = _cfg_ok(semantic_store_impl="disabled")
+    enabled = _cfg_ok(semantic_store_impl="SqliteVecSemanticStore")
+    values = [
+        unknown.fields.get("semantic_store_impl"),
+        disabled.fields.get("semantic_store_impl"),
+        enabled.fields.get("semantic_store_impl"),
+    ]
+    assert values == [None, "disabled", "SqliteVecSemanticStore"]
+    assert len({repr(v) for v in values}) == 3, "三态必须两两可分"
 
 
 def test_genuinely_unknown_key_still_surfaces_as_unexpected() -> None:
