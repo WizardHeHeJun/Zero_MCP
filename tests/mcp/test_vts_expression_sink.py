@@ -24,6 +24,7 @@ from src.mcp.zero.sinks.vts import (
     GOVERNED_PARAMS,
     LEAK_PARAMS,
     SEMANTIC_REST,
+    VTS_ERROR_AUTH_IN_PROGRESS,
     BlinkMachine,
     OuNoise,
     VtsApiClient,
@@ -31,6 +32,17 @@ from src.mcp.zero.sinks.vts import (
     VtsExpressionSink,
     head_to_params,
 )
+
+
+class _ApiStub:
+    """只为 `_request_new_token` 造一个必抛指定异常的 api 替身。"""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise self.error
+
 
 # ---------------------------------------------------------------------------
 # 辅助构造
@@ -259,8 +271,62 @@ class TestVtsApiClient:
         await asyncio.sleep(0)
         req_id = ws.sent[0]["requestID"]
         ws.to_recv = [{"requestID": req_id, "messageType": "APIError", "data": {"errorID": 1}}]
-        with pytest.raises(VtsApiError):
+        with pytest.raises(VtsApiError) as exc_info:
             await t
+        # errorID 结构化携带：判定走字段，不回头从人读文案里正则抠
+        assert exc_info.value.error_id == 1
+
+    async def test_api_error_without_error_id_keeps_none(self) -> None:
+        """畸形/无 errorID 的 APIError ⇒ error_id 回落 None，不炸也不硬套一个数。"""
+        ws = FakeWs()
+        client = VtsApiClient(ws)  # type: ignore[arg-type]
+        import asyncio
+
+        t = asyncio.ensure_future(client.request("APIStateRequest"))
+        await asyncio.sleep(0)
+        req_id = ws.sent[0]["requestID"]
+        ws.to_recv = [{"requestID": req_id, "messageType": "APIError", "data": "不是 dict"}]
+        with pytest.raises(VtsApiError) as exc_info:
+            await t
+        assert exc_info.value.error_id is None
+
+
+class TestAuthPendingWindowHint:
+    """errorID 51（授权流程已在进行中）单列一支，文案直接给出处置。
+
+    为什么值得单列：这一支与其它 APIError 的差别不在「失败」而在**留下了什么**——
+    VTS 里正挂着一个授权窗等人点。2026-08-11 排查时三小时内撞了三次，每次都以为
+    是新问题；且它与「上一个进程占着连接」不同，`Get-NetTCPConnection` 查不出来。
+    """
+
+    async def test_error_51_message_tells_operator_what_to_do(self) -> None:
+        sink = VtsExpressionSink(token_path=None)
+        sink.api = _ApiStub(VtsApiError("原始英文", error_id=VTS_ERROR_AUTH_IN_PROGRESS))
+
+        with pytest.raises(VtsApiError) as exc_info:
+            await sink._request_new_token({"pluginName": "p", "pluginDeveloper": "d"})
+
+        text = str(exc_info.value)
+        assert "VTube Studio" in text and "点掉" in text, "须点名到哪去做什么"
+        assert "Get-NetTCPConnection" in text, "须点破「端口检查查不出这一种」"
+        assert "原始英文" in text, "原文须保留，便于按 VTS 官方文档回查"
+        assert exc_info.value.error_id == VTS_ERROR_AUTH_IN_PROGRESS
+
+    async def test_other_api_errors_pass_through_untouched(self) -> None:
+        """判别力：非 51 的 APIError **原样上抛**，不被这支加壳。
+
+        没有这一条，「把所有 APIError 都换成授权窗文案」也会让上一条全绿——
+        那会把真正的失败原因（如模型不存在）改写成一句误导。
+        """
+        original = VtsApiError("ModelLoadRequest -> APIError: {'errorID': 8}", error_id=8)
+        sink = VtsExpressionSink(token_path=None)
+        sink.api = _ApiStub(original)
+
+        with pytest.raises(VtsApiError) as exc_info:
+            await sink._request_new_token({"pluginName": "p", "pluginDeveloper": "d"})
+
+        assert exc_info.value is original, "非 51 必须是原对象上抛，不重新包装"
+        assert "点掉" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
