@@ -140,6 +140,100 @@ def test_warmup_is_gated_by_feature_flag(path: Path) -> None:
     )
 
 
+def _tool_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    """取模块里所有 ``@mcp.tool`` / ``@mcp.tool(...)`` 装饰的函数。
+
+    两种装饰器形态都收（带括号是 ``ast.Call``、不带是 ``ast.Attribute``）：只认
+    其中一种的话，另一种形态的工具会被**静默排除**——而"少收了一个"不会让任何
+    断言失败，等于该工具从此不设防且无人知道。
+    """
+    tools: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if isinstance(target, ast.Attribute) and target.attr == "tool":
+                tools.append(node)
+                break
+    return tools
+
+
+def _first_executable(body: list[ast.stmt]) -> ast.stmt | None:
+    """返回函数体里第一条**可执行**语句（跳过 docstring）。"""
+    stmts = list(body)
+    if (
+        stmts
+        and isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, ast.Constant)
+        and isinstance(stmts[0].value.value, str)
+    ):
+        stmts = stmts[1:]
+    return stmts[0] if stmts else None
+
+
+@pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
+def test_flag_off_tools_gate_is_first_executable_statement(path: Path) -> None:
+    """每个 ``@mcp.tool`` 体的**第一条可执行语句**必须是裸的 ``_require_enabled()``。
+
+    这条守的是**上面三条守不到的那一半**：预热在 ``if enabled:`` 内 ⇒ flag 关的
+    部署**没有**预热保护，那时唯一挡住「事件循环内首次 import numpy」的，就是
+    工具一进来先在门上抛 ToolError、根本走不到下面那行延迟 import。
+
+    ⚠ 它为什么必须单独钉：把 ``flags = _get_flags()`` / ``import ... perception``
+    提到门之前，读起来完全无害，而**全部现有测试照绿**——flag 关的用例只断言
+    「抛 ToolError」，提前 import 之后那个 ToolError 照样抛，只是在真 wire 上
+    先无限期卡在 numpy 扩展加载里（Zero 2026-08-11 §3.5 就此发问）。
+    也就是说这条性质一旦破，症状只在 flag 关的真部署上出现，测试面全盲。
+
+    ⚠ 判据取「**位置**：是不是第一条」而非「行号：门是否排在 import 之前」，理由是
+    行号只是**可达性的代理**，而代理会被绕开——审查门 2026-08-11 用最小 AST 复现
+    击穿过行号版：``if False: _require_enabled()`` 后接无条件 import、以及把门塞进
+    ``try`` 并在 ``except Exception`` 里吞掉后接无条件 import，两者行号都"门在前"
+    却都判绿，而真实执行序里门根本没生效（同 ``test_warmup_is_gated_by_feature_flag``
+    docstring 记的「结构嵌套 ≠ 语义绑定」同族，`ai-docs/pitfalls.md` ⑥⑦）。
+    要求它是**裸调用且排第一**，则：被 ``if`` / ``try`` 包住 ⇒ 那条语句不是
+    ``Expr(Call)`` ⇒ 红；前面插任何东西 ⇒ 它不再是第一条 ⇒ 红。
+
+    连带覆盖两类行号版兜不住的情形：``importlib.import_module("numpy")`` 这类
+    **不是 import 语句**的间接触发（行号版按节点类型识别，看不见它），以及嵌套函数
+    里 ``def _f(): import numpy`` 的定义行早于门所造成的**假阳性**（行号版会误报）。
+
+    ⚠ 它**比必要范围更严**，且这是故意的：第一条哪怕是一句毫无 import 风险的
+    ``logger.debug(...)`` 也判红。别当 bug 去"放宽成只要排在 import 前面就行"——
+    那正是上面被击穿的行号版，放宽即重新打开那个洞。要在门前做事，改守卫前先想清楚
+    怎么在**不退回行号代理**的前提下表达它。
+
+    已知限界（不是本守卫能保证的）：① ``SERVER_PATHS`` 是人工清单，新增第四个
+    stdio server 不会自动纳入；② 若有人把 ``mcp.tool`` 取别名后用 ``@别名`` 注册，
+    ``_tool_functions`` 认不出该工具（两者都属"新增东西时要同步这里"，无语法特征可兜）；
+    ③ **本守卫只认标识符的词法位置，不验它绑定的是不是那个会 raise 的门**——模块内
+    把 ``_require_enabled`` 重绑成 no-op，这条照样绿。那一层由 ``test_server_registration``
+    与 ``test_vts_behavior_mcp_server`` 里直接 import 该函数、断言 flag 关时抛 ToolError
+    的功能测试兜底。**别把本条当成"门被换成假门也能发现"**：两者合起来才完整。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tools = _tool_functions(tree)
+    assert tools, f"{path}：没解析出任何 @mcp.tool——本守卫已失去锚点"
+
+    for tool in tools:
+        first = _first_executable(tool.body)
+        assert first is not None, f"{path}::{tool.name} 函数体为空——不可能设防"
+        ok = (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Call)
+            and getattr(first.value.func, "id", None) == "_require_enabled"
+            and not first.value.args
+            and not first.value.keywords
+        )
+        assert ok, (
+            f"{path}::{tool.name}：第 {first.lineno} 行不是裸的 `_require_enabled()`——"
+            "工具体的第一条可执行语句必须是这道门。flag 关的部署没有预热保护，"
+            "门之前（或门被条件/try 包住而未生效时）的任何 import 都会在事件循环内"
+            "首次触达 numpy 而无限期死锁。"
+        )
+
+
 @pytest.mark.parametrize("path", SERVER_PATHS, ids=lambda p: p.stem)
 def test_enabled_comes_from_feature_flag_helper(path: Path) -> None:
     """``enabled`` 确由 ``_is_enabled()`` 赋值——否则上一条守卫盯的是个空壳名字。
