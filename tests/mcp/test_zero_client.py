@@ -1012,12 +1012,21 @@ async def test_graceful_step_config_incompatible_raises_not_none(
 
 @pytest.mark.parametrize(
     "code",
-    ["payload-invalid", "external-prior-invalid", "config-invalid", "deploy-env-invalid"],
+    [
+        "payload-invalid",
+        "external-prior-invalid",
+        "config-invalid",
+        "deploy-env-invalid",
+        # 动作通道未开：归类测试之外还要有这条**端到端**覆盖——归类对不代表
+        # graceful_step 的 except 排序也对（新子类可能被更早的通用分支抢先兜住，
+        # 那样就退回「每轮静默 return None」，正是本码归不可降级要防的形态）。
+        "motion-disabled",
+    ],
 )
 async def test_graceful_step_other_non_degradable_codes_raise(
     monkeypatch: pytest.MonkeyPatch, code: str
 ) -> None:
-    """调用方传参错 / 部署端 env 错同样上抛——静默每轮丢帧会把根因埋掉。"""
+    """调用方传参错 / 部署端 env 错 / 动作通道未开同样上抛——静默每轮丢帧会把根因埋掉。"""
     client, mock_session = _build_client_with_session(monkeypatch)
     _set_tool_return(mock_session, _wire("zero.step", f"[zero:{code}] 文案"), is_error=True)
     stimulus = AffectStimulus(valence=0.1, arousal=0.2)

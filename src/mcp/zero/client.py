@@ -784,6 +784,9 @@ DESCRIBE_CONFIG_OPTIONAL_KEYS: frozenset[str] = frozenset(
 - `transport` = 对方**实际起的**传输（不是我方以为的那个）⇒ 可用于校验我方配置与对方实况一致；
 - `stateless_http` ⇒ 若对方是 stateless，**每次请求独立、session 语义完全不同**，
   我方的 resume / session 管理前提可能整体不成立。这条影响面比 `transport` 大得多，须专门评估。
+- **后端回读三键**（下详）⇒ 可用于判「对方到底跑在什么后端上」（内存态 vs 落盘态直接影响
+  我方对 resume 的预期）。⚠ 未消费**不等于信息被扔掉**：三键的值经 `ZeroDeployConfig.fields`
+  原样透传，随时可读；`OPTIONAL` 分层只影响 `missing_keys`/`absent_optional_keys` 的记账。
 
 ━━ 后端回读三键（v4 起）：`checkpointer_impl` / `memory_store_impl` / `semantic_store_impl` ━━
 
@@ -838,6 +841,11 @@ KNOWN_DESCRIBE_CONFIG_VERSIONS: frozenset[int] = frozenset({1, 2, 3, 4})
   `DESCRIBE_CONFIG_OPTIONAL_KEYS`，值语义见该处）。三键与 bump 由**同一次提交**引入
   （`git log -S` 逐键核过）⇒ 符合对方 bump 纪律 ①（增删键）。对 v1–v3 的 23/21 键**逐键
   向后兼容**（只增不改），我方读的那 21 必需键语义未动。
+  **核验方法**（写明是为了下一个审查者不必重做这趟）：`git show 0effea7 -- src/mcp_server/
+  server.py` 对 `describe_config` 函数体只有两处改动——版本号常量与其注释、返回字典**末尾
+  追加**三键；既有 21 键对应的代码行**一行未动**。⇒ 对方 bump 纪律 ③（某键语义变化）在本
+  次未被触发。⚠ 这是**代码行未动**的举证，不等于「语义在别处未被间接改变」（如某键的值
+  来源函数被改），后者只能靠对方遵守自己的 bump 纪律。
   ✅ **这一版首次是从对方 `main` 且工作树 clean 的状态读到的**——与 v2/v3 都读自未提交
   工作树不同（见下方那条「同一个坑的第二次」）。此处记一笔，是为了将来能看出哪几版当时
   只活在对方工作树里、哪几版是主干固化的。
