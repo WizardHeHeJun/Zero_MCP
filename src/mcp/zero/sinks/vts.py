@@ -426,6 +426,11 @@ class VtsExpressionSink:
         self.trajectory: TrajectoryPlayer | None = None
         # 行为叠加引擎（蓝图 AD-4）：由行为 service 连接后挂上；None=无手势叠加（零回归）
         self.behavior_overlay: BehaviorOverlayEngine | None = None
+        # 语音口型独占层（speech-play 蓝图 2026-08-14 AD-5）：由行为 service 连接后
+        # 挂上（与 self.trajectory 是不同实例的同类对象）；None=无语音播放（零回归）。
+        # 混合顺序上它排在 self.trajectory 之后，对播放期 mouth_track 涉及的键有
+        # 最终话语权——"最后应用者赢"是既有排序规则天然给出的独占语义。
+        self.speech_mouth: TrajectoryPlayer | None = None
         self.render_task: asyncio.Task[None] | None = None
         self.running = False
         self.last_error: BaseException | None = None
@@ -698,13 +703,23 @@ class VtsExpressionSink:
         APIError——如用户中途换模型致参数不存在、畸形响应）都置 running=False
         并记入 last_error，使故障对 render() 与 ``healthy`` 可见；不自动重连。
 
-        行为叠加（蓝图 AD-4）：ambient 块之后、逐参 clamp 之前把
-        ``behavior_overlay`` 的手势帧合入——offsets 加性合入（可选参数以
-        defaultValue 为基线、仅活跃期按需注入，AD-5），eye_gate 乘到
-        EyeOpenLeft/Right（与 ambient 眨眼同为乘法链）。该段**单独兜
-        Exception**：引擎异常只整帧丢弃手势叠加 + warning 一次，不杀 sink——
-        否则引擎 bug 会沿本循环的广谱兜底杀死整条表情通道且不自动重连
-        （故障隔离/可观测性理由，对齐模块 docstring 的失败可观测性约定）。
+        混合顺序（ambient → behavior_overlay → trajectory → speech_mouth）：
+
+        - 行为叠加（蓝图 AD-4）：ambient 块之后、逐参 clamp 之前把
+          ``behavior_overlay`` 的手势帧合入——offsets 加性合入（可选参数以
+          defaultValue 为基线、仅活跃期按需注入，AD-5），eye_gate 乘到
+          EyeOpenLeft/Right（与 ambient 眨眼同为乘法链）；
+        - 轨迹回放（2026-07-31 二期）合于 behavior_overlay 之后；
+        - 语音口型独占层（speech-play 蓝图 2026-08-14 AD-5）合于 trajectory
+          **之后**——结构与 trajectory 段完全同构（absolute 按 strength 混合、
+          offset 加性叠加；speech 只用 absolute，代码保持同构简单）。这一
+          排序即嘴部独占的结构性保证：``speech_mouth`` 涉及的键是本帧最后
+          被写入的，不被 ambient/overlay/trajectory 的同键取值覆盖。
+
+        该段**单独兜 Exception**：引擎/回放器异常只整帧丢弃对应层叠加 +
+        warning 一次，不杀 sink——否则 bug 会沿本循环的广谱兜底杀死整条
+        表情通道且不自动重连（故障隔离/可观测性理由，对齐模块 docstring
+        的失败可观测性约定）。
         """
         assert self.api is not None
         dt = 1.0 / self.render_hz
@@ -734,7 +749,11 @@ class VtsExpressionSink:
                     bf = blink.factor(now, self.arousal)
                     frame["EyeOpenLeft"] *= bf
                     frame["EyeOpenRight"] *= bf
-                if self.behavior_overlay is not None or self.trajectory is not None:
+                if (
+                    self.behavior_overlay is not None
+                    or self.trajectory is not None
+                    or self.speech_mouth is not None
+                ):
                     # 局部防御（AD-4 故障面）：先在副本上合成，成功才替换 frame
                     # ——引擎/回放器异常时整帧丢弃叠加（无半应用态），表情注入照常。
                     try:
@@ -763,6 +782,22 @@ class VtsExpressionSink:
                                         merged[k] = base + v * tf.strength
                                     else:
                                         merged[k] = base + (v - base) * tf.strength
+                        if self.speech_mouth is not None:
+                            # 语音口型独占层（speech-play 蓝图 AD-5）：结构与上面
+                            # trajectory 段完全同构，但**排在其后**——对 mouth_track
+                            # 涉及的键有最终话语权（嘴部独占的结构性保证，见类
+                            # docstring 混合顺序说明）。
+                            sf = self.speech_mouth.apply(now)
+                            if sf is not None:
+                                for k, v in sf.values.items():
+                                    table = self.ranges.get(k) or self.all_params.get(k)
+                                    if table is None:
+                                        continue
+                                    base = merged.get(k, table[2])
+                                    if sf.mode == "offset":
+                                        merged[k] = base + v * sf.strength
+                                    else:
+                                        merged[k] = base + (v - base) * sf.strength
                         frame = merged
                     except Exception as exc:
                         if not self.warned_overlay_failure:

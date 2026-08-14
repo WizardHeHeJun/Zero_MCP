@@ -251,3 +251,119 @@ def test_enabled_comes_from_feature_flag_helper(path: Path) -> None:
         and getattr(node.value.func, "id", None) == "_is_enabled"
     ]
     assert assigned, f"{path}：`enabled` 不是由 `_is_enabled()` 赋值——flag 守卫已失去语义锚点"
+
+
+# ── speech_play 双门平行守卫（speech-play 蓝图 2026-08-14 AD-9，只新增用例） ──
+
+
+_VTS_BEHAVIOR_SERVER_PATH = Path("src/mcp/vts_behavior_mcp_server.py")
+"""唯一带 ``speech_play`` 工具的 stdio server——本节两条守卫只对它生效
+（``desktop_mcp_server.py`` 无此工具，不纳入本节）。"""
+
+
+def test_speech_play_second_statement_is_bare_require_speech_enabled() -> None:
+    """speech_play 工具体的第二条可执行语句必须是裸的 ``_require_speech_enabled()``。
+
+    这是既有 ``test_flag_off_tools_gate_is_first_executable_statement`` 守不到的
+    那一半：该守卫只钉死"第一条语句是裸 ``_require_enabled()``"，没有约束第二条——
+    而 speech_play 的双 flag 复合门（AD-9）要求 ``VTS_SPEECH_ENABLED`` 检查排在
+    **第二**条、紧跟第一句、前面不可插入任何其它可执行语句（否则可能在门生效前
+    触发懒加载，重演 native_warmup 死锁判据）。手法对齐既有守卫：判据取"位置"
+    （是不是第二条）而非"行号"，理由同上——行号是可达性的代理，代理会被绕开
+    （见 ``test_flag_off_tools_gate_is_first_executable_statement`` docstring）。
+    """
+    tools = [
+        t
+        for t in _tool_functions(ast.parse(_VTS_BEHAVIOR_SERVER_PATH.read_text(encoding="utf-8")))
+        if t.name == "speech_play"
+    ]
+    assert tools, f"{_VTS_BEHAVIOR_SERVER_PATH}：未解析出 speech_play 工具——本守卫已失去锚点"
+    (tool,) = tools
+    stmts = list(tool.body)
+    if (
+        stmts
+        and isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, ast.Constant)
+        and isinstance(stmts[0].value.value, str)
+    ):
+        stmts = stmts[1:]  # 跳过 docstring
+    assert len(stmts) >= 2, (
+        f"{_VTS_BEHAVIOR_SERVER_PATH}::speech_play 函数体不足两条可执行语句——不可能设防"
+    )
+    first, second = stmts[0], stmts[1]
+
+    def _is_bare_call(stmt: ast.stmt, func_name: str) -> bool:
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and getattr(stmt.value.func, "id", None) == func_name
+            and not stmt.value.args
+            and not stmt.value.keywords
+        )
+
+    assert _is_bare_call(first, "_require_enabled"), (
+        f"{_VTS_BEHAVIOR_SERVER_PATH}::speech_play：第一条语句不是裸 `_require_enabled()`"
+        "——双门的第一句不得被挪走/包住。"
+    )
+    assert _is_bare_call(second, "_require_speech_enabled"), (
+        f"{_VTS_BEHAVIOR_SERVER_PATH}::speech_play：第 {second.lineno} 行不是裸的 "
+        "`_require_speech_enabled()`——双门复合门要求第二条可执行语句就是这道门，"
+        "紧跟第一句 `_require_enabled()`，中间不得插入任何其它语句。"
+    )
+
+
+def _warm_calls_for_module(block: ast.If, module_name: str) -> list[ast.Call]:
+    """块内全部 ``warm_native_extensions(...)`` 调用中，实参元组含
+    ``module_name`` 字面量的那些（`test_warmup_is_gated_by_feature_flag` 的
+    `_call_line` 只取「最靠前」一条，看不见 vts_behavior_mcp_server.py 里
+    第二条预热 speech_playback 的调用——本函数按模块名精确定位）。"""
+    calls: list[ast.Call] = []
+    for node in ast.walk(block):
+        if not (
+            isinstance(node, ast.Call)
+            and (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else getattr(node.func, "id", None)
+            )
+            == "warm_native_extensions"
+        ):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Tuple) and any(
+                isinstance(elt, ast.Constant) and elt.value == module_name for elt in arg.elts
+            ):
+                calls.append(node)
+                break
+    return calls
+
+
+def test_speech_playback_warmup_nested_in_speech_flag_branch() -> None:
+    """``warm_native_extensions(("src.mcp.behavior.speech_playback",))`` 必须存在，
+    且嵌套在 ``if speech_enabled:`` 分支内（speech-play 蓝图 AD-11）。
+
+    既有 ``test_warmup_is_gated_by_feature_flag`` 只验证「**最靠前**那条预热
+    调用」在 ``if enabled:`` 内（即预热 ``src.mcp.behavior.service`` 的那条，
+    T5 二期沿用）——它看不见 vts_behavior_mcp_server.py 里第二条按模块名不同
+    的预热调用，故需要一条平行守卫按模块名精确定位并验证其嵌套分支。
+    """
+    block = _main_block(_VTS_BEHAVIOR_SERVER_PATH)
+    calls = _warm_calls_for_module(block, "src.mcp.behavior.speech_playback")
+    assert calls, (
+        f"{_VTS_BEHAVIOR_SERVER_PATH}：未找到预热 "
+        "`src.mcp.behavior.speech_playback` 的 `warm_native_extensions` 调用。"
+    )
+    gated = [
+        inner
+        for inner in ast.walk(block)
+        if isinstance(inner, ast.If)
+        and inner is not block
+        and isinstance(inner.test, ast.Name)
+        and inner.test.id == "speech_enabled"
+        and any(call in list(ast.walk(inner)) for call in calls)
+    ]
+    assert gated, (
+        f"{_VTS_BEHAVIOR_SERVER_PATH}：speech_playback 预热调用不在 "
+        "`if speech_enabled:` 分支内——VTS_SPEECH_ENABLED=false 时不得拉 "
+        "sounddevice 系依赖（零回归不变式）。"
+    )
