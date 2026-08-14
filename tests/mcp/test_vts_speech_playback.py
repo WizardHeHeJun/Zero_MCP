@@ -29,7 +29,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from src.agents.models.vts_behavior import (
-    TRAJECTORY_MAX_KEYFRAMES,
+    SPEECH_TRACK_MAX_KEYFRAMES,
+    SPEECH_TRACK_MAX_SEGMENT_MS,
     TRAJECTORY_MAX_SEGMENT_MS,
     VTSB_SPEECH_DEVICE_ERROR,
     VTSB_SPEECH_FILE_ERROR,
@@ -76,19 +77,33 @@ class TestSpeechRequestContract:
             SpeechRequest(wav_path="/abs/path.wav", mouth_track=[_kf(0), _kf(0)])
 
     def test_over_max_keyframes_raises(self) -> None:
-        track = [_kf(i) for i in range(TRAJECTORY_MAX_KEYFRAMES + 1)]
+        track = [_kf(i) for i in range(SPEECH_TRACK_MAX_KEYFRAMES + 1)]
         with pytest.raises(ValidationError):
             SpeechRequest(wav_path="/abs/path.wav", mouth_track=track)
 
     def test_at_max_keyframes_passes(self) -> None:
-        track = [_kf(i) for i in range(TRAJECTORY_MAX_KEYFRAMES)]
+        track = [_kf(i) for i in range(SPEECH_TRACK_MAX_KEYFRAMES)]
         req = SpeechRequest(wav_path="/abs/path.wav", mouth_track=track)
-        assert len(req.mouth_track) == TRAJECTORY_MAX_KEYFRAMES
+        assert len(req.mouth_track) == SPEECH_TRACK_MAX_KEYFRAMES
 
     def test_over_max_duration_raises(self) -> None:
-        track = [_kf(0), _kf(TRAJECTORY_MAX_SEGMENT_MS + 1)]
+        track = [_kf(0), _kf(SPEECH_TRACK_MAX_SEGMENT_MS + 1)]
         with pytest.raises(ValidationError):
             SpeechRequest(wav_path="/abs/path.wav", mouth_track=track)
+
+    def test_chat_length_track_over_old_10s_limit_passes(self) -> None:
+        """2026-08-14 放宽的判别性钉子：25s 轨迹（Zero 实测 chat 回复 8.5–25.5s
+        的上界）必须通过——旧实现（scratch 复用 TrajectoryRequest 继承 10s 限）
+        下本用例必红。同时钉住 params_animate 自身上限未被顺手放宽。"""
+        track = [_kf(t) for t in range(0, 25_001, 50)]  # 25s @ 20fps = 501 帧
+        assert track[-1]["t_ms"] > TRAJECTORY_MAX_SEGMENT_MS  # 前提自证：确超旧限
+        req = SpeechRequest(wav_path="/abs/path.wav", mouth_track=track)
+        assert req.mouth_track[-1].t_ms == 25_000
+        # params_animate 的通用轨迹契约不随 speech 放宽（零回归）
+        from src.agents.models.vts_behavior import TrajectoryRequest
+
+        with pytest.raises(ValidationError):
+            TrajectoryRequest(keyframes=[_kf(0), _kf(25_000)], mode="absolute", append=False)
 
     @pytest.mark.parametrize("fps", [0.0, -1.0, float("inf"), float("nan")])
     def test_invalid_fps_raises(self, fps: float) -> None:

@@ -149,6 +149,17 @@ SPEECH_MAX_QUEUE: int = 5
 """语音播放队列限深（我方自加防御，Zero 规范未提）——满时 ToolError
 `VTSB_THROTTLED`（speech-play 蓝图 AD-4：本工具无 rejected 回执容器容纳它）。"""
 
+SPEECH_TRACK_MAX_SEGMENT_MS: int = 60_000
+"""mouth_track 单段时长上限（speech 专属，2026-08-14 应 Zero 回件放宽）：
+Zero 实测 0.17s/字、chat 回复 50–150 字 ⇒ 8.5–25.5s 常态超原 10s 继承限
+（`TRAJECTORY_MAX_SEGMENT_MS` 只管 params_animate，不变）。取定值 60s 而非
+「wav 时长派生」：后者把校验拖进 I/O 层且令 fps 从纯提示字段变语义量——
+Zero 二选一里两者皆可（其回件明示定值 ≥60s 可接受）。"""
+
+SPEECH_TRACK_MAX_KEYFRAMES: int = 1200
+"""mouth_track 单段帧数上限（speech 专属）：20Hz × 60s，与时长上限同源配比
+（Zero 回件同款算术）。防超大 payload 的职责不变，只是量程换成语音整句。"""
+
 
 # ---------------------------------------------------------------------------
 # 触发方向（Zero 侧 LLM → MCP）
@@ -460,11 +471,12 @@ class SpeechRequest(BaseModel):
     - fps: 轨迹采样率提示（默认 20，与现行 `params_animate` 投递一致）；
       仅供参考不强制校验帧间隔，实际回放仍按各帧 `t_ms` 插值。
 
-    聚合校验（升序/非空/单段上限）**复用 `TrajectoryRequest` 的 validator**
-    （speech-play 蓝图 AD-2）：构造一个 scratch `TrajectoryRequest(mode="absolute",
-    append=False)` 仅为触发其校验，异常转 `ValueError`——零重复校验代码；
-    副作用是 mouth_track 隐性继承 `TRAJECTORY_MAX_SEGMENT_MS`/
-    `TRAJECTORY_MAX_KEYFRAMES`（10s/600 帧）上限。
+    聚合校验（升序/非空/单段上限）用 **speech 专属上限**直接实现（2026-08-14
+    应 Zero 回件放宽，替代蓝图 AD-2 的 scratch `TrajectoryRequest` 复用——那正是
+    10s/600 帧继承限的来源，语音整句常态超 10s）：上限走
+    `SPEECH_TRACK_MAX_SEGMENT_MS`/`SPEECH_TRACK_MAX_KEYFRAMES`（60s/1200 帧），
+    逐帧校验（t_ms≥0/params 非空/有限值）仍由 `TrajectoryKeyframe` 自身承担；
+    `params_animate` 的 `TRAJECTORY_MAX_*` 一字不动（零回归）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -479,10 +491,20 @@ class SpeechRequest(BaseModel):
             raise ValueError("wav_path 不得为空")
         if not math.isfinite(self.fps) or self.fps <= 0.0:
             raise ValueError(f"fps={self.fps} 必须为正的有限值")
-        try:
-            TrajectoryRequest(keyframes=self.mouth_track, mode="absolute", append=False)
-        except ValueError as exc:
-            raise ValueError(f"mouth_track 不合法：{exc}") from exc
+        if not self.mouth_track:
+            raise ValueError("mouth_track 不合法：keyframes 不得为空")
+        if len(self.mouth_track) > SPEECH_TRACK_MAX_KEYFRAMES:
+            raise ValueError(
+                f"mouth_track 不合法：keyframes 数 {len(self.mouth_track)} "
+                f"超上限 {SPEECH_TRACK_MAX_KEYFRAMES}"
+            )
+        times = [kf.t_ms for kf in self.mouth_track]
+        if any(b <= a for a, b in zip(times, times[1:], strict=False)):
+            raise ValueError("mouth_track 不合法：keyframes 的 t_ms 必须严格升序")
+        if times[-1] > SPEECH_TRACK_MAX_SEGMENT_MS:
+            raise ValueError(
+                f"mouth_track 不合法：单段时长 {times[-1]}ms 超上限 {SPEECH_TRACK_MAX_SEGMENT_MS}ms"
+            )
         return self
 
 
