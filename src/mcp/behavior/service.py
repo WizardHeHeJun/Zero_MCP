@@ -1,4 +1,5 @@
-"""VTS 离散行为业务层——BehaviorService（蓝图 2026-07-31 §4/§5/§6 · T4）。
+"""VTS 离散行为业务层——BehaviorService（蓝图 2026-07-31 §4/§5/§6 · T4；
+语音播放 speech-play 蓝图 2026-08-14 §T4）。
 
 server（`src/mcp/vts_behavior_mcp_server.py`）薄转发本类；sink 生命周期、
 热键 catalog、触发分发与状态聚合全在此层（AD-9）——传输层零业务逻辑
@@ -40,6 +41,16 @@ AD-10 的请求锁保护不到这里。防御对象与 AD-10（``VtsApiClient`` 
 ``interrupt``/``status`` 等其余方法与渲染循环运行在同一事件循环，engine
 调用单步完成天然原子、无需锁；对 VTS 的请求经 ``VtsApiClient`` 内置串行锁
 （AD-10）与渲染循环互不撕响应。
+
+## 语音播放（speech-play 蓝图 2026-08-14 §T4）
+
+``speech_mouth_player`` 是与 ``trajectory_player`` 同类但**不同实例**的
+``TrajectoryPlayer``，挂到 ``sink.speech_mouth``（AD-5 独占层，见 vts.py
+``_render_loop`` 混合顺序）。``speech_queue``（``SpeechQueue``）**懒构造**——
+首次 ``speech_play()`` 才 `import speech_playback` 并建队（对齐
+``_get_service()`` 的既有懒加载惯例：flag 关/未调用时零依赖，不拉
+``sounddevice``）。``disconnect()`` 时若已构造则 `aclose()`——断开即停止播放
+调度，正在播的音频线程尽力收尾（worker 取消传播见 ``SpeechQueue.aclose``）。
 """
 
 from __future__ import annotations
@@ -49,6 +60,7 @@ import logging
 import re
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -66,6 +78,8 @@ from src.agents.models.vts_behavior import (
     HotkeyInfo,
     ParamCatalog,
     ParamInfo,
+    SpeechReceipt,
+    SpeechRequest,
     TrajectoryReceipt,
     TrajectoryRequest,
 )
@@ -84,6 +98,11 @@ from src.mcp.zero.sinks.vts import (
     bool_env,
     kwargs_from_env,
 )
+
+if TYPE_CHECKING:  # 仅类型标注用——运行时经 speech_play() 的延迟 import 才拉起
+    # speech_playback（AD-6/AD-11：flag 关/未调用 speech_play 时零依赖，对齐
+    # server 层 _get_service() 的既有懒加载惯例）。
+    from src.mcp.behavior.speech_playback import SpeechQueue
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +230,8 @@ def _behavior_info(spec: BehaviorSpec, ranges: Ranges | None) -> BehaviorInfo:
 
 
 class BehaviorService:
-    """行为层业务门面：sink 生命周期 · 热键 catalog · 触发分发 · 状态聚合。
+    """行为层业务门面：sink 生命周期 · 热键 catalog · 触发分发 · 状态聚合 ·
+    语音播放调度。
 
     用法（server 薄转发）::
 
@@ -228,6 +248,11 @@ class BehaviorService:
         self.sink = sink
         self.engine = BehaviorOverlayEngine()
         self.trajectory_player = TrajectoryPlayer()
+        # 语音口型独占层（speech-play 蓝图 AD-5）：与 trajectory_player 同类但
+        # **不同实例**的 TrajectoryPlayer，即时构造（构造本身零 I/O、零依赖，
+        # 与 sounddevice 的懒加载解耦——见 self.speech_queue）。
+        self.speech_mouth_player = TrajectoryPlayer()
+        self.speech_queue: SpeechQueue | None = None
         self.connected = False
         self.hotkeys: list[HotkeyInfo] | None = None
         self.hotkey_cooldown_until: dict[str, float] = {}
@@ -252,8 +277,10 @@ class BehaviorService:
         - 已连接但渲染循环故障（``healthy=False``）：先收尾旧连接再重连
           （显式重连路径——sink 不自动重连）；
         - standalone（构造未注入 sink）：首连时经 ``kwargs_from_env()`` 自建；
-        - ``behavior_overlay`` 在 ``__aenter__`` **之前**挂上（vts.py
-          ``_read_ranges`` 按其是否已挂选择告警级别——INFO2 修订）；
+        - ``behavior_overlay``/``speech_mouth`` 均在 ``__aenter__`` **之前**挂上
+          （vts.py ``_read_ranges`` 按 behavior_overlay 是否已挂选择告警级别——
+          INFO2 修订；speech_mouth 无此依赖但同样趁早挂，理由一致：连接建立后
+          渲染循环立即需要读到它）；
         - 热键枚举（``VTS_BEHAVIOR_HOTKEYS``，默认开）与 model_id 读取失败
           不拖垮连接——均为可选增强，优雅回退（AD-7）。
         """
@@ -270,6 +297,7 @@ class BehaviorService:
                 self.sink = VtsExpressionSink(**kwargs_from_env())
             self.sink.behavior_overlay = self.engine
             self.sink.trajectory = self.trajectory_player
+            self.sink.speech_mouth = self.speech_mouth_player
             if not self.sink.running:
                 await self.sink.__aenter__()
             self.connected = True
@@ -294,8 +322,14 @@ class BehaviorService:
 
         引擎的活跃包络/冷却表保留（按时间自然过期，不随连接清零）；
         hotkeys/model_id 回到未连接态（None，契约语义：尚未枚举）。
+
+        语音播放队列（若已构造）同步关闭（speech-play 蓝图 AD-6）：断开即停止
+        播放调度，正在播的音频线程尽力收尾（`SpeechQueue.aclose` 语义）。
         """
         async with self.lifecycle_lock:
+            if self.speech_queue is not None:
+                await self.speech_queue.aclose()
+                self.speech_queue = None
             sink = self.sink
             if sink is not None and (self.connected or sink.running):
                 await sink.__aexit__(None, None, None)
@@ -372,6 +406,42 @@ class BehaviorService:
         ]
         return ParamCatalog(params=params, connected=True)
 
+    # ── 语音播放（speech-play 蓝图 2026-08-14 §T4） ─────────────────────────
+
+    async def speech_play(self, request: SpeechRequest) -> SpeechReceipt:
+        """语音播放：读 wav → 懒建播放队列 → 入队调度，**完成调度即返**（不等
+        播完，Zero 据 ``duration_ms`` 节流下一次调用）。
+
+        - 未连接/循环故障走 ``_require_connected`` 抛 ``ToolError``（同轨迹通道）；
+        - ``speech_queue`` **首调才懒构造**（延迟 import
+          ``src.mcp.behavior.speech_playback``）——flag 关/未调用本方法时零
+          依赖，不拉 ``sounddevice``（对齐 ``vts_behavior_mcp_server._get_service()``
+          的懒加载惯例）；
+        - ``known_params`` 取 ``frozenset(sink.ranges) | frozenset(sink.all_params)``
+          （对齐 ``animate()`` 的既有口径），在入队那一刻算好、随 job 携带；
+        - 全部失败路径（wav 读取失败/队列满）走 ``ToolError``（AD-4：本工具
+          没有 rejected 回执容器）——`read_wav_meta`/`SpeechQueue.enqueue`
+          抛出的 ``ToolError`` 原样透传，不在此处二次包壳。
+        """
+        sink = self._require_connected()
+        if self.speech_queue is None:
+            from src.mcp.behavior.speech_playback import SpeechQueue  # noqa: PLC0415
+
+            self.speech_queue = SpeechQueue(self.speech_mouth_player)
+        from src.mcp.behavior.speech_playback import SpeechJob, read_wav_meta  # noqa: PLC0415
+
+        frames, duration_ms = await asyncio.to_thread(read_wav_meta, request.wav_path)
+        known = frozenset(sink.ranges) | frozenset(sink.all_params)
+        job = SpeechJob(
+            frames=frames,
+            duration_ms=duration_ms,
+            mouth_keyframes=[(kf.t_ms / 1000.0, kf.params) for kf in request.mouth_track],
+            known_params=known,
+            fps=request.fps,
+        )
+        await self.speech_queue.enqueue(job)
+        return SpeechReceipt(accepted=True, duration_ms=duration_ms)
+
     # ── 清单 / 状态（AD-7 / §5） ─────────────────────────────────────────────
 
     async def list_catalog(self, refresh: bool = False) -> BehaviorCatalog:
@@ -395,11 +465,17 @@ class BehaviorService:
         )
 
     def status(self) -> BehaviorStatus:
-        """聚合状态快照：连接/健康态 + 活跃行为 + 全部冷却（引擎词 + 热键）。
+        """聚合状态快照：连接/健康态 + 活跃行为 + 全部冷却（引擎词 + 热键）+
+        语音播放可观测性（speech-play 蓝图 AD-12）。
 
         sink 的失败面在后台渲染循环（异常即停、不自动重连）——本方法即
         显式探测点：``healthy=False`` 时 ``last_error`` 带循环最后错误，
         恢复路径 = 再次 ``connect()``。纯状态读取，无 I/O（sync）。
+
+        ``speech_active``/``speech_queue_depth``/``speech_last_error``：
+        ``speech_queue`` 为 None（从未调用过 `speech_play`）时全取默认值
+        （False/0/None）；已构造时取其 `snapshot()`（含在播 job 与队列深度，
+        口径对齐 `TrajectoryReceipt.queue_depth`「含当前播放段」）。
         """
         now = time.monotonic()
         snap = self.engine.snapshot(now)
@@ -421,6 +497,11 @@ class BehaviorService:
                 last_error = repr(sink.last_error)
             unavailable = list(sink.unavailable_params)
         traj_active, traj_remaining = self.trajectory_player.snapshot(now)
+        speech_active = False
+        speech_queue_depth = 0
+        speech_last_error: str | None = None
+        if self.speech_queue is not None:
+            speech_active, speech_queue_depth, speech_last_error = self.speech_queue.snapshot()
         return BehaviorStatus(
             connected=connected,
             healthy=healthy,
@@ -432,6 +513,9 @@ class BehaviorService:
             model_id=self.model_id,
             trajectory_active=traj_active,
             trajectory_remaining_ms=traj_remaining,
+            speech_active=speech_active,
+            speech_queue_depth=speech_queue_depth,
+            speech_last_error=speech_last_error,
         )
 
     # ── 内部 ─────────────────────────────────────────────────────────────────

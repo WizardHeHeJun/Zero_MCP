@@ -44,6 +44,14 @@ sinks-vts = [
     # 依赖随惯例走 extra——默认关的能力默认不装（vts.py 内延迟 import）
     "websockets>=13.0",
 ]
+speech = [
+    # speech_play 语音播放（src/mcp/behavior/speech_playback.py）；VTS_SPEECH_ENABLED
+    # 默认关，延迟 import。⚠ 与下方 hardware-audio 是**同一个包但不同能力开关**：
+    # hardware-audio 语义是"麦克风采集"（ZERO_AUDIO_CHANNEL_ENABLED 等感知通道用），
+    # speech 语义是"语音播放"（VTS_SPEECH_ENABLED）——两者互不隐含，仓内惯例一
+    # extra 对一能力，故不复用（speech-play 蓝图 2026-08-14 AD-10）。
+    "sounddevice>=0.4",
+]
 # GPU 为可选加速（硬前提 3）：EP 自适应 CUDA>DirectML>CPU
 gpu-cuda = [
     "onnxruntime-gpu>=1.18",

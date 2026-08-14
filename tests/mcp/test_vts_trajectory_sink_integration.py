@@ -244,3 +244,147 @@ class TestZeroRegressionGuard:
         assert frames, "渲染循环应至少注入一帧"
         for frame in frames:
             assert _frame_ids(frame) == set(GOVERNED_PARAMS)
+
+
+# ---------------------------------------------------------------------------
+# 6. 语音口型独占层（speech-play 蓝图 2026-08-14 §T2）
+# ---------------------------------------------------------------------------
+
+
+class TestSpeechMouthExclusiveOverride:
+    """``speech_mouth`` 合于 ``trajectory`` **之后**——对其涉及的键有最终话语权
+    （AD-5「最后应用者赢」的结构性独占语义），非涉及键不受影响。"""
+
+    async def test_speech_mouth_wins_over_trajectory_and_behavior_overlay_on_shared_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from src.agents.models.vts_behavior import BehaviorRequest  # noqa: PLC0415
+        from src.mcp.zero.sinks.behavior_overlay import BehaviorOverlayEngine  # noqa: PLC0415
+
+        fake = _install(monkeypatch, TrajectoryFakeVtsServer(dict(RANGES)))
+        sink = VtsExpressionSink(token_path=tmp_path / "tok", render_hz=100.0, ambient_motion=False)
+        engine = BehaviorOverlayEngine()
+        trajectory = TrajectoryPlayer()
+        speech_mouth = TrajectoryPlayer()
+        async with sink:
+            sink.behavior_overlay = engine
+            sink.trajectory = trajectory
+            sink.speech_mouth = speech_mouth
+            known = frozenset(sink.ranges) | frozenset(sink.all_params)
+            receipt = engine.trigger(
+                BehaviorRequest(name="nod"), now=time.monotonic(), ranges=sink.ranges
+            )
+            assert receipt.status == "accepted"
+            trajectory.feed(
+                [(0.0, {"MouthSmile": 0.2}), (1.0, {"MouthSmile": 0.2})],
+                mode="absolute",
+                append=True,
+                now=time.monotonic(),
+                known_params=known,
+            )
+            speech_mouth.feed(
+                [(0.0, {"MouthSmile": 0.9}), (1.0, {"MouthSmile": 0.9})],
+                mode="absolute",
+                append=False,
+                now=time.monotonic(),
+                known_params=known,
+            )
+            await asyncio.sleep(0.2)  # 越过各自 ATTACK_S(0.12s)，strength 均已满
+        frames = _inject_frames(fake)
+        mouth_values = [_frame_value(f, "MouthSmile") for f in frames]
+        face_y_values = [_frame_value(f, "FaceAngleY") for f in frames]
+        assert mouth_values
+        assert mouth_values[-1] == pytest.approx(0.9, abs=0.02), (
+            "共享键 MouthSmile 应由 speech_mouth 最终覆盖（trajectory=0.2 被压过）"
+        )
+        assert any(v < -0.5 for v in face_y_values), (
+            "非嘴键 FaceAngleY 不受 speech_mouth 影响，behavior_overlay 的手势偏移仍在"
+        )
+
+    async def test_non_mouth_key_untouched_by_speech_mouth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """speech_mouth 只声明 MouthOpen 键——trajectory 驱动的 Brows 不受牵连。"""
+        fake = _install(monkeypatch, TrajectoryFakeVtsServer(dict(RANGES)))
+        sink = VtsExpressionSink(token_path=tmp_path / "tok", render_hz=100.0, ambient_motion=False)
+        trajectory = TrajectoryPlayer()
+        speech_mouth = TrajectoryPlayer()
+        async with sink:
+            sink.trajectory = trajectory
+            sink.speech_mouth = speech_mouth
+            known = frozenset(sink.ranges) | frozenset(sink.all_params)
+            trajectory.feed(
+                [(0.0, {"Brows": 0.8}), (1.0, {"Brows": 0.8})],
+                mode="absolute",
+                append=True,
+                now=time.monotonic(),
+                known_params=known,
+            )
+            speech_mouth.feed(
+                [(0.0, {"MouthOpen": 0.6}), (1.0, {"MouthOpen": 0.6})],
+                mode="absolute",
+                append=False,
+                now=time.monotonic(),
+                known_params=known,
+            )
+            await asyncio.sleep(0.2)
+        frames = _inject_frames(fake)
+        brows_values = [_frame_value(f, "Brows") for f in frames]
+        mouth_open_values = [_frame_value(f, "MouthOpen") for f in frames]
+        assert brows_values[-1] == pytest.approx(0.8, abs=0.02), (
+            "speech_mouth 未声明 Brows——trajectory 对它仍有最终话语权"
+        )
+        assert mouth_open_values[-1] == pytest.approx(0.6, abs=0.02)
+
+
+class TestSpeechMouthNoneRegression:
+    async def test_speech_mouth_none_trajectory_still_has_final_say_on_shared_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """正对照：``sink.speech_mouth`` 保持默认 None 时，trajectory 对共享键
+        仍有最终话语权——本次改动新增覆盖层后，未使用该层的既有路径逐帧行为
+        不变（零回归的显式落点，非仅靠"未测到"佐证）。"""
+        fake = _install(monkeypatch, TrajectoryFakeVtsServer(dict(RANGES)))
+        sink = VtsExpressionSink(token_path=tmp_path / "tok", render_hz=100.0, ambient_motion=False)
+        trajectory = TrajectoryPlayer()
+        async with sink:
+            assert sink.speech_mouth is None
+            sink.trajectory = trajectory
+            trajectory.feed(
+                [(0.0, {"MouthSmile": 0.2}), (1.0, {"MouthSmile": 0.2})],
+                mode="absolute",
+                append=True,
+                now=time.monotonic(),
+                known_params=frozenset(sink.ranges) | frozenset(sink.all_params),
+            )
+            await asyncio.sleep(0.2)
+        values = [_frame_value(f, "MouthSmile") for f in _inject_frames(fake)]
+        assert values
+        assert values[-1] == pytest.approx(0.2, abs=0.02)
+
+
+class BrokenSpeechMouth:
+    """apply 恒抛的假回放器——验证 speech_mouth 层 bug 只丢本帧叠加、不杀 sink
+    （同 ``BrokenTrajectoryPlayer``/``behavior_overlay.BrokenEngine`` 先例）。"""
+
+    def apply(self, now: float) -> Any:
+        raise RuntimeError("boom-speech-mouth")
+
+
+class TestSpeechMouthFailureIsolation:
+    async def test_apply_exception_drops_frame_keeps_sink_healthy_warns_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = _install(monkeypatch, TrajectoryFakeVtsServer(dict(RANGES)))
+        sink = VtsExpressionSink(token_path=tmp_path / "tok", render_hz=100.0)
+        async with sink:
+            with caplog.at_level("WARNING"):
+                sink.speech_mouth = BrokenSpeechMouth()  # type: ignore[assignment]
+                await asyncio.sleep(0.05)  # 每帧 apply 都抛——应只告警一次
+            assert sink.healthy, "speech_mouth 异常不得沿渲染循环广谱兜底杀死 sink"
+        frames = _inject_frames(fake)
+        assert frames and all(_frame_ids(f) == set(GOVERNED_PARAMS) for f in frames), (
+            "speech_mouth 叠加丢弃后表情注入应照常（无半应用态）"
+        )
+        warnings = [r for r in caplog.records if "丢弃本帧叠加" in r.getMessage()]
+        assert len(warnings) == 1

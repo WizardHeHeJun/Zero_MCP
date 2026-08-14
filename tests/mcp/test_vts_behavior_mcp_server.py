@@ -1,11 +1,13 @@
-"""VTS 行为 MCP server 工具层测试（蓝图 2026-07-31 §8.4 · T10）。
+"""VTS 行为 MCP server 工具层测试（蓝图 2026-07-31 §8.4 · T10；
+speech_play 见 speech-play 蓝图 2026-08-14 §T5）。
 
 被测：``src/mcp/vts_behavior_mcp_server.py``（薄工具层）+ 其对
 ``src/mcp/behavior/service.py`` 的转发/错误映射契约（AD-8 / AD-11）。
 
 覆盖：
-  1. 注册面：六工具全注册、readOnlyHint 集合正确、无 destructiveHint。
-  2. feature flag 关（默认）→ 六工具全 ToolError，且 ``[vtsb:disabled]`` 令牌在
+  1. 注册面：十工具全注册（九工具 + speech_play）、readOnlyHint 集合正确、
+     无 destructiveHint、speech_play description 非空。
+  2. feature flag 关（默认）→ 十工具全 ToolError，且 ``[vtsb:disabled]`` 令牌在
      **FastMCP 加壳后的真 wire 形态**（``"Error executing tool <name>: ..."``）上
      经 ``re.search`` 可提取——夹具经 ``Tool.run`` 走 SDK 真实加壳分支，不手拼
      未加壳原文（`rules/mcp-integration.md`「绿灯从没能红」教训）。
@@ -16,6 +18,10 @@
      正常返回不抛异常）、逐码透传、参数转发、connect 幂等、catalog 含热键。
   5. 错误映射逐码：解析层 ValidationError → ``[vtsb:invalid_params]``；服务层
      ToolError 原样透传；其余异常 → ``[vtsb:vts_error]``。
+  6. speech_play 双门（AD-9）：两 flag 全关/只开 behavior/只开 speech（behavior
+     关）分别报 ``[vtsb:disabled]``/``[vtsb:speech_disabled]``，且门未过时
+     ``speech_playback``/``sounddevice`` 不进 ``sys.modules``（零导入）；
+     畸形 mouth_track → ``[vtsb:invalid_params]``。
 
 不标 ``zerorepo``（无关 D:\\Zero）；无真 VTS 依赖（假 service / 未连接路径）。
 """
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any
 
 import pytest
@@ -38,6 +45,7 @@ from src.agents.models.vts_behavior import (
     VTSB_HOTKEY_UNAVAILABLE,
     VTSB_INVALID_PARAMS,
     VTSB_NOT_CONNECTED,
+    VTSB_SPEECH_DISABLED,
     VTSB_THROTTLED,
     VTSB_UNKNOWN_BEHAVIOR,
     VTSB_VTS_ERROR,
@@ -49,6 +57,8 @@ from src.agents.models.vts_behavior import (
     HotkeyInfo,
     ParamCatalog,
     ParamInfo,
+    SpeechReceipt,
+    SpeechRequest,
     TrajectoryReceipt,
     TrajectoryRequest,
     extract_vtsb_code,
@@ -57,6 +67,7 @@ from src.mcp.behavior.service import BehaviorService
 from src.mcp.vts_behavior_mcp_server import _is_enabled, _require_enabled, mcp
 
 FLAG_ENV = "VTS_BEHAVIOR_ENABLED"
+SPEECH_FLAG_ENV = "VTS_SPEECH_ENABLED"
 
 EXPECTED_TOOLS = {
     "behavior_list",
@@ -68,9 +79,15 @@ EXPECTED_TOOLS = {
     "params_clear",
     "vts_connect",
     "vts_disconnect",
+    "speech_play",
 }
 
 READ_ONLY_TOOLS = {"behavior_list", "behavior_status", "params_list"}
+
+VALID_SPEECH_ARGS: dict[str, Any] = {
+    "wav_path": "/abs/x.wav",
+    "mouth_track": [{"t_ms": 0, "params": {"MouthOpen": 0.5}}],
+}
 
 # 各工具经 `Tool.run` 调用时的最小合法入参（缺省全走默认值）。
 MINIMAL_ARGS: dict[str, dict[str, Any]] = {
@@ -83,7 +100,12 @@ MINIMAL_ARGS: dict[str, dict[str, Any]] = {
     "params_clear": {},
     "vts_connect": {},
     "vts_disconnect": {},
+    "speech_play": VALID_SPEECH_ARGS,
 }
+
+# speech_play 双门涉及的模块名——门未过时不得进 sys.modules（零导入判据）。
+SPEECH_PLAYBACK_MODULE = "src.mcp.behavior.speech_playback"
+SOUNDDEVICE_MODULE = "sounddevice"
 
 
 def _get_tool(name: str) -> Any:
@@ -142,11 +164,13 @@ _RECEIPT_ACCEPTED = BehaviorReceipt(
     estimated_duration_ms=700,
 )
 
+_SPEECH_RECEIPT_ACCEPTED = SpeechReceipt(accepted=True, duration_ms=1234.0)
+
 
 class FakeBehaviorService:
     """回放型假 service：与 ``BehaviorService`` 同签名面，记录每次转发。
 
-    ``raise_exc`` 置异常时六方法统一改为抛出——用于逐工具验 server 层错误映射。
+    ``raise_exc`` 置异常时全部方法统一改为抛出——用于逐工具验 server 层错误映射。
     """
 
     def __init__(self) -> None:
@@ -170,6 +194,8 @@ class FakeBehaviorService:
         )
         self.animate_requests: list[TrajectoryRequest] = []
         self.clear_params_calls = 0
+        self.speech_receipt: SpeechReceipt = _SPEECH_RECEIPT_ACCEPTED
+        self.speech_play_requests: list[SpeechRequest] = []
 
     def _maybe_raise(self) -> None:
         if self.raise_exc is not None:
@@ -220,6 +246,13 @@ class FakeBehaviorService:
         self._maybe_raise()
         return self.param_catalog
 
+    # ── 语音播放（speech-play 蓝图 2026-08-14 §T5） ─────────────────────────
+
+    async def speech_play(self, request: SpeechRequest) -> SpeechReceipt:
+        self._maybe_raise()
+        self.speech_play_requests.append(request)
+        return self.speech_receipt
+
 
 # ---------------------------------------------------------------------------
 # 夹具
@@ -235,8 +268,15 @@ def flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def fake_service(monkeypatch: pytest.MonkeyPatch) -> FakeBehaviorService:
-    """flag 开 + 假 service（monkeypatch 单例，测后自动还原为 None）。"""
+    """两 flag 皆开 + 假 service（monkeypatch 单例，测后自动还原为 None）。
+
+    ``VTS_SPEECH_ENABLED`` 一并置真（speech-play 蓝图新增第二道门，AD-9）：
+    本夹具代表"全部能力可用"的假 service 场景，供转发/错误映射类测试统一
+    覆盖全部工具（含 speech_play）；双门本身的组合语义由
+    ``TestSpeechPlayDoubleGate`` 专门覆盖，不在本夹具重复。
+    """
     monkeypatch.setenv(FLAG_ENV, "true")
+    monkeypatch.setenv(SPEECH_FLAG_ENV, "true")
     fake = FakeBehaviorService()
     monkeypatch.setattr(server_mod, "_SERVICE", fake)
     return fake
@@ -258,11 +298,11 @@ def real_unconnected_service(monkeypatch: pytest.MonkeyPatch) -> BehaviorService
 
 class TestRegistration:
     def test_all_tools_registered(self) -> None:
-        """九工具全部注册，无多无少（六行为/连接 + 三轨迹通道，2026-07-31 二期）。"""
+        """十工具全部注册，无多无少（九工具 + speech_play，speech-play 蓝图）。"""
         assert set(mcp._tool_manager._tools.keys()) == EXPECTED_TOOLS
 
     def test_read_only_hints(self) -> None:
-        """behavior_list / behavior_status 为 readOnly，其余不得标 readOnly。"""
+        """behavior_list / behavior_status / params_list 为 readOnly，其余不得标 readOnly。"""
         for name in EXPECTED_TOOLS:
             ann = _get_tool(name).annotations
             assert ann is not None, f"{name} 缺 annotations"
@@ -278,6 +318,13 @@ class TestRegistration:
             assert ann is None or ann.destructiveHint is not True, (
                 f"{name} 不应为 destructiveHint=True"
             )
+
+    def test_speech_play_description_nonempty_and_mentions_receipt_shape(self) -> None:
+        """speech_play description 非空，且点名回执字面形状（AD-3 跨仓已锁定）。"""
+        tool = _get_tool("speech_play")
+        assert tool.description
+        assert "accepted" in tool.description
+        assert "duration_ms" in tool.description
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +360,7 @@ class TestFeatureFlag:
 
 
 class TestFlagOffAllToolsOnWire:
-    """flag 关 → 六工具全 ToolError，令牌在**加壳后的真 wire 形态**上可提取。"""
+    """flag 关 → 十工具全 ToolError，令牌在**加壳后的真 wire 形态**上可提取。"""
 
     @pytest.mark.parametrize("tool_name", sorted(EXPECTED_TOOLS))
     async def test_tool_rejected_with_disabled_token(self, flag_off: None, tool_name: str) -> None:
@@ -555,7 +602,7 @@ class TestErrorMapping:
     async def test_generic_exception_maps_to_vts_error(
         self, fake_service: FakeBehaviorService, tool_name: str
     ) -> None:
-        """服务层任意异常 → ``[vtsb:vts_error]``（六工具逐一，含原始错误文本）。"""
+        """服务层任意异常 → ``[vtsb:vts_error]``（十工具逐一，含原始错误文本）。"""
         fake_service.raise_exc = RuntimeError("ws 撕裂")
         with pytest.raises(ToolError) as excinfo:
             await _run_on_wire(tool_name, MINIMAL_ARGS[tool_name])
@@ -576,3 +623,115 @@ class TestErrorMapping:
         wire = str(excinfo.value)
         assert extract_vtsb_code(wire) == VTSB_NOT_CONNECTED
         assert VTSB_VTS_ERROR not in wire
+
+
+# ---------------------------------------------------------------------------
+# speech_play 双门（speech-play 蓝图 2026-08-14 AD-9）
+# ---------------------------------------------------------------------------
+
+
+def _pop_speech_modules() -> dict[str, Any]:
+    """从 ``sys.modules`` 快照剔除 speech 相关模块（模拟"进程内尚未触达过"）。
+
+    测试进程内其它用例（如 ``test_vts_speech_playback.py``）可能已 import 过
+    这些模块——先剔除再断言"门未过时不得进 sys.modules"才有判别力，测后原样
+    恢复（不泄漏给其它用例，见 `rules/mcp-integration.md` 消费纪律的姊妹手法）。
+    """
+    saved: dict[str, Any] = {}
+    for name in (SPEECH_PLAYBACK_MODULE, SOUNDDEVICE_MODULE):
+        if name in sys.modules:
+            saved[name] = sys.modules.pop(name)
+    return saved
+
+
+def _restore_modules(saved: dict[str, Any]) -> None:
+    for name, module in saved.items():
+        sys.modules[name] = module
+
+
+class TestSpeechPlayDoubleGate:
+    """两 flag 全关 / 只开 behavior / 只开 speech（behavior 关）——三种门未过
+    组合，逐一验证令牌与"门未过不得懒加载 speech 相关模块"。"""
+
+    @pytest.mark.parametrize(
+        ("behavior_enabled", "speech_enabled", "expected_code"),
+        [
+            (False, False, VTSB_DISABLED),
+            (False, True, VTSB_DISABLED),  # behavior 关先拦，speech 开也救不了
+            (True, False, VTSB_SPEECH_DISABLED),
+        ],
+        ids=["both-off", "only-speech-on", "only-behavior-on"],
+    )
+    async def test_gate_combination_rejects_with_zero_import(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        behavior_enabled: bool,
+        speech_enabled: bool,
+        expected_code: str,
+    ) -> None:
+        monkeypatch.setenv(FLAG_ENV, "true" if behavior_enabled else "false")
+        monkeypatch.setenv(SPEECH_FLAG_ENV, "true" if speech_enabled else "false")
+        monkeypatch.setattr(server_mod, "_SERVICE", None)
+        saved = _pop_speech_modules()
+        try:
+            with pytest.raises(ToolError) as excinfo:
+                await _run_on_wire("speech_play", VALID_SPEECH_ARGS)
+            wire = str(excinfo.value)
+            assert wire.startswith("Error executing tool speech_play: ")
+            assert extract_vtsb_code(wire) == expected_code
+            assert SPEECH_PLAYBACK_MODULE not in sys.modules, (
+                "门未过时不得懒加载 speech_playback（零导入判据）"
+            )
+            assert SOUNDDEVICE_MODULE not in sys.modules, "门未过时不得拉 sounddevice"
+        finally:
+            _restore_modules(saved)
+
+    async def test_both_flags_on_passes_gate_to_service(
+        self, fake_service: FakeBehaviorService
+    ) -> None:
+        """两门皆开（``fake_service`` 夹具态）——请求成功转发到假 service，
+        与门本身的拒绝路径形成正对照。"""
+        payload = json.loads(await server_mod.speech_play(**VALID_SPEECH_ARGS))
+        assert payload == {"accepted": True, "duration_ms": 1234.0}
+        assert len(fake_service.speech_play_requests) == 1
+
+
+class TestSpeechPlayValidation:
+    """畸形 mouth_track → ``[vtsb:invalid_params]``（经 SpeechRequest ValidationError
+    映射，手法对照 params_animate 的既有错误映射测试）。"""
+
+    async def test_empty_mouth_track_maps_to_invalid_params(
+        self, fake_service: FakeBehaviorService
+    ) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            await _run_on_wire("speech_play", {"wav_path": "/abs/x.wav", "mouth_track": []})
+        assert extract_vtsb_code(str(excinfo.value)) == VTSB_INVALID_PARAMS
+        assert fake_service.speech_play_requests == []
+
+    async def test_out_of_order_t_ms_maps_to_invalid_params(
+        self, fake_service: FakeBehaviorService
+    ) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            await _run_on_wire(
+                "speech_play",
+                {
+                    "wav_path": "/abs/x.wav",
+                    "mouth_track": [
+                        {"t_ms": 100, "params": {"MouthOpen": 0.5}},
+                        {"t_ms": 50, "params": {"MouthOpen": 0.5}},
+                    ],
+                },
+            )
+        assert extract_vtsb_code(str(excinfo.value)) == VTSB_INVALID_PARAMS
+        assert fake_service.speech_play_requests == []
+
+    async def test_empty_wav_path_maps_to_invalid_params(
+        self, fake_service: FakeBehaviorService
+    ) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            await _run_on_wire(
+                "speech_play",
+                {"wav_path": "", "mouth_track": VALID_SPEECH_ARGS["mouth_track"]},
+            )
+        assert extract_vtsb_code(str(excinfo.value)) == VTSB_INVALID_PARAMS
+        assert fake_service.speech_play_requests == []

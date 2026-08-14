@@ -22,6 +22,9 @@
   8. 裸参数轨迹通道面（2026-07-31 二期）：``animate``/``clear_params``/
      ``list_params``/``status`` 的未连接协议性拒绝、回执透传、幂等、全参数表
      governed 标注、trajectory_active/remaining 聚合。
+  9. 语音播放面（speech-play 蓝图 2026-08-14 §T4）：未连接协议性拒绝、
+     ``status`` 三新字段默认值、``speech_playback`` 首调前懒加载零回归、
+     成功路径回执透传。
 
 不标 ``zerorepo``（离线假 ws，无关 D:\\Zero）；无未标记的 skip。
 """
@@ -40,6 +43,7 @@ from src.agents.models.vts_behavior import (
     VTSB_HOTKEY_UNAVAILABLE,
     VTSB_NOT_CONNECTED,
     BehaviorRequest,
+    SpeechRequest,
     TrajectoryKeyframe,
     TrajectoryRequest,
     extract_vtsb_code,
@@ -552,5 +556,112 @@ class TestTrajectoryServiceFace:
             status = service.status()
             assert status.trajectory_active is True
             assert status.trajectory_remaining_ms > 0
+        finally:
+            await service.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# 9. 语音播放面（speech-play 蓝图 2026-08-14 §T4）
+# ---------------------------------------------------------------------------
+
+
+def _speech_request(wav_path: str = "/abs/x.wav") -> SpeechRequest:
+    return SpeechRequest(
+        wav_path=wav_path,
+        mouth_track=[TrajectoryKeyframe(t_ms=0, params={"MouthOpen": 0.5})],
+    )
+
+
+class TestSpeechPlayService:
+    """未连接协议性拒绝、``status`` 默认值、懒加载零回归、成功路径回执。"""
+
+    async def test_speech_play_not_connected_raises_tool_error(self) -> None:
+        service = BehaviorService()
+        with pytest.raises(ToolError) as exc_info:
+            await service.speech_play(_speech_request())
+        assert extract_vtsb_code(str(exc_info.value)) == VTSB_NOT_CONNECTED
+
+    async def test_status_speech_fields_default_before_any_speech_play(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, BehaviorFakeVtsServer())
+        service = BehaviorService()
+        await service.connect()
+        try:
+            status = service.status()
+            assert status.speech_active is False
+            assert status.speech_queue_depth == 0
+            assert status.speech_last_error is None
+        finally:
+            await service.disconnect()
+
+    async def test_speech_playback_module_not_imported_before_first_speech_play(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """懒加载零回归：``connect()`` 前后、首次 ``speech_play()`` 之前，
+        ``src.mcp.behavior.speech_playback`` 不得进 ``sys.modules``。
+
+        测试进程内其它用例（如 ``test_vts_speech_playback.py``）可能已 import
+        过该模块——先从 ``sys.modules`` 快照剔除，模拟"进程内尚未触达过"的
+        状态，测后原样恢复（不泄漏给其它用例）。
+        """
+        import sys
+
+        target = "src.mcp.behavior.speech_playback"
+        saved = sys.modules.pop(target, None)
+        try:
+            _install(monkeypatch, BehaviorFakeVtsServer())
+            service = BehaviorService()
+            await service.connect()
+            try:
+                assert target not in sys.modules, (
+                    "connect() 不得触发 speech_playback 懒加载（首次 speech_play() 才该拉起）"
+                )
+            finally:
+                await service.disconnect()
+        finally:
+            if saved is not None:
+                sys.modules[target] = saved
+
+    async def test_speech_play_success_returns_receipt_and_enqueues_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """成功路径：fake sink + monkeypatch ``read_wav_meta``/``SpeechQueue`` →
+        回执 ``accepted=True``、``duration_ms`` 与 wav 读取结果一致，且入队的
+        ``SpeechJob`` 携带同一 duration_ms（不是硬编码/巧合相等）。"""
+        import src.mcp.behavior.speech_playback as speech_playback_mod
+
+        _install(monkeypatch, BehaviorFakeVtsServer())
+        service = BehaviorService()
+        await service.connect()
+        try:
+            fake_duration_ms = 3210.0
+
+            def _fake_read_wav_meta(wav_path: str) -> tuple[bytes, float]:
+                assert wav_path == "/abs/x.wav"
+                return b"\x00" * 128, fake_duration_ms
+
+            monkeypatch.setattr(speech_playback_mod, "read_wav_meta", _fake_read_wav_meta)
+
+            enqueued: list[Any] = []
+
+            class _FakeSpeechQueue:
+                def __init__(self, speech_mouth: Any) -> None:
+                    self.speech_mouth = speech_mouth
+
+                async def enqueue(self, job: Any) -> None:
+                    enqueued.append(job)
+
+                async def aclose(self) -> None:
+                    return None
+
+            monkeypatch.setattr(speech_playback_mod, "SpeechQueue", _FakeSpeechQueue)
+
+            receipt = await service.speech_play(_speech_request())
+            assert receipt.accepted is True
+            assert receipt.duration_ms == fake_duration_ms
+            assert len(enqueued) == 1
+            assert enqueued[0].duration_ms == fake_duration_ms
+            assert enqueued[0].frames == b"\x00" * 128
         finally:
             await service.disconnect()

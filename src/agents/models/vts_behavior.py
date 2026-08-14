@@ -23,9 +23,19 @@
 | `VTSB_CHANNEL_BUSY` | 同通道被更高优先级行为占用 | 回执 rejected |
 | `VTSB_HOTKEY_UNAVAILABLE` | 热键失效 / 无此 ID / 热键开关关 | 回执 rejected |
 | `VTSB_VTS_ERROR` | VTS APIError 透传（detail 带原始错误） | ToolError |
+| `VTSB_SPEECH_DISABLED` | feature flag（`VTS_SPEECH_ENABLED`）未开 | ToolError |
+| `VTSB_SPEECH_FILE_ERROR` | wav 路径不存在 / 非绝对路径 / 不可读 | ToolError |
+| `VTSB_SPEECH_FORMAT_ERROR` | wav 非 PCM16/mono/44100，或文件损坏 | ToolError |
+| `VTSB_SPEECH_DEVICE_ERROR` | 播放设备探测/起播失败 | ToolError |
 
 **业务性拒绝进 `BehaviorReceipt.code` 字段而非 ToolError**（业务拒绝是正常回执不是
 协议错误，AD-11）；协议性失败（disabled / not_connected / vts_error）才抛 ToolError。
+
+`speech_play` 是本表的**例外**（speech-play 蓝图 2026-08-14 AD-4）：其全部失败路径
+（含队列满 `VTSB_THROTTLED`）统一走 ToolError——`SpeechReceipt` 的成功形状是
+Zero 已锁定的字面 `{accepted, duration_ms}`，没有 `code` 字段容纳业务性拒绝，
+四类失败（文件/格式/未连接/设备）与队列满同属"调用方需先改数据/等资源才可能
+重试"，与 `VTSB_INVALID_PARAMS` 数值越界走 ToolError 是同一原则的延伸而非违反。
 """
 
 from __future__ import annotations
@@ -78,6 +88,19 @@ VTSB_HOTKEY_UNAVAILABLE: str = "[vtsb:hotkey_unavailable]"
 VTSB_VTS_ERROR: str = "[vtsb:vts_error]"
 """VTS APIError 透传（ToolError 载体，detail 带原始错误）。"""
 
+VTSB_SPEECH_DISABLED: str = "[vtsb:speech_disabled]"
+"""feature flag（VTS_SPEECH_ENABLED）未开（ToolError 载体）——speech_play 独有的
+第二道门，见 vts_behavior_mcp_server._require_speech_enabled（speech-play 蓝图 AD-9）。"""
+
+VTSB_SPEECH_FILE_ERROR: str = "[vtsb:speech_file_error]"
+"""wav 路径不存在 / 非绝对路径 / 不可读（ToolError 载体）。"""
+
+VTSB_SPEECH_FORMAT_ERROR: str = "[vtsb:speech_format_error]"
+"""wav 非 PCM16/mono/44100Hz，或文件头/帧数据损坏（ToolError 载体）。"""
+
+VTSB_SPEECH_DEVICE_ERROR: str = "[vtsb:speech_device_error]"
+"""播放设备探测（check_output_settings）或起播失败（ToolError 载体）。"""
+
 VTSB_CODE_RE: re.Pattern[str] = re.compile(r"\[vtsb:[a-z_]+\]")
 """位置无关令牌判据的唯一真相——消费方/测试一律用它 search，不用 startswith。"""
 
@@ -108,6 +131,23 @@ DURATION_MS_MAX: int = 10_000
 
 RECEIPT_STATUSES: frozenset[str] = frozenset({"accepted", "replaced", "rejected"})
 """回执三态（AD-6）。本仓自产自校（非跨仓拒收面，加态是本仓同步改动，无部署错位风险）。"""
+
+# ---------------------------------------------------------------------------
+# 语音播放契约范围常量（speech-play 蓝图 2026-08-14 §T1）
+# ---------------------------------------------------------------------------
+
+SPEECH_WAV_SAMPLE_RATE: int = 44100
+"""wav 规格：采样率（Zero 侧 Bert-VITS2 原生输出，我方不重采样）。"""
+
+SPEECH_WAV_CHANNELS: int = 1
+"""wav 规格：声道数（mono）。"""
+
+SPEECH_WAV_SAMPLE_WIDTH: int = 2
+"""wav 规格：采样位宽（字节，2=PCM 16-bit）。"""
+
+SPEECH_MAX_QUEUE: int = 5
+"""语音播放队列限深（我方自加防御，Zero 规范未提）——满时 ToolError
+`VTSB_THROTTLED`（speech-play 蓝图 AD-4：本工具无 rejected 回执容器容纳它）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +317,8 @@ class BehaviorStatus(BaseModel):
     - cooldowns: 行为词 → 冷却剩余 ms（仅列冷却中的词）；
     - unavailable_params: 所连部署缺席的可选参数（对应行为已降级，AD-5）；
     - hotkey_count/model_id: 未连接时为 None。
+    - speech_active/speech_queue_depth/speech_last_error: 语音播放可观测性
+      （speech-play 蓝图 AD-12，向后兼容加法字段）——未播放过/未启用时全取默认值。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -291,6 +333,9 @@ class BehaviorStatus(BaseModel):
     model_id: str | None = None
     trajectory_active: bool = False
     trajectory_remaining_ms: int = 0
+    speech_active: bool = False
+    speech_queue_depth: int = 0
+    speech_last_error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +439,73 @@ class TrajectoryReceipt(BaseModel):
         if self.status not in RECEIPT_STATUSES:
             raise ValueError(f"status {self.status!r} 不在 {sorted(RECEIPT_STATUSES)} 内")
         return self
+
+
+# ---------------------------------------------------------------------------
+# 语音播放 + 口型同步（speech-play 蓝图 2026-08-14 §T1）——Zero 侧语音合成 →
+# 我方渲染端同步播放音频与注入口型轨迹
+# ---------------------------------------------------------------------------
+
+
+class SpeechRequest(BaseModel):
+    """语音播放请求（Zero 侧 → MCP，`speech_play` 工具输入）。
+
+    - wav_path: **同机绝对路径**（不传音频字节：stdio JSON 传兆级 base64 不现实，
+      跨仓拍板③无路径白名单约束）。契约层只校验非空字符串——存在性/可读性/
+      格式校验留 I/O 层（`speech_playback.read_wav_meta`），理由：那些校验本身
+      是阻塞 I/O，不属于纯校验的契约层职责。
+    - mouth_track: 口型关键帧轨迹（跨仓拍板①，沿用 `params_animate` 的
+      `TrajectoryKeyframe` 形状——Zero 按 `generate_dual` 输出同构生成，我方
+      零新解析代码）。`t_ms` 时基相对段起点，`t=0` 对齐音频首采样。
+    - fps: 轨迹采样率提示（默认 20，与现行 `params_animate` 投递一致）；
+      仅供参考不强制校验帧间隔，实际回放仍按各帧 `t_ms` 插值。
+
+    聚合校验（升序/非空/单段上限）**复用 `TrajectoryRequest` 的 validator**
+    （speech-play 蓝图 AD-2）：构造一个 scratch `TrajectoryRequest(mode="absolute",
+    append=False)` 仅为触发其校验，异常转 `ValueError`——零重复校验代码；
+    副作用是 mouth_track 隐性继承 `TRAJECTORY_MAX_SEGMENT_MS`/
+    `TRAJECTORY_MAX_KEYFRAMES`（10s/600 帧）上限。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    wav_path: str
+    mouth_track: list[TrajectoryKeyframe]
+    fps: float = 20.0
+
+    @model_validator(mode="after")
+    def _validate(self) -> SpeechRequest:
+        if not self.wav_path:
+            raise ValueError("wav_path 不得为空")
+        if not math.isfinite(self.fps) or self.fps <= 0.0:
+            raise ValueError(f"fps={self.fps} 必须为正的有限值")
+        try:
+            TrajectoryRequest(keyframes=self.mouth_track, mode="absolute", append=False)
+        except ValueError as exc:
+            raise ValueError(f"mouth_track 不合法：{exc}") from exc
+        return self
+
+
+class SpeechReceipt(BaseModel):
+    """语音播放回执（MCP → Zero 侧，`speech_play` 成功输出）。
+
+    ⚠ **恰好** `accepted` + `duration_ms` 两字段——**故意偏离**本模块
+    `BehaviorReceipt`/`TrajectoryReceipt` 的 `status`/`code` 三态惯例
+    （speech-play 蓝图 AD-3）：Zero 已按这个字面形状写了 fake-session 单测
+    （`{"accepted": true, "duration_ms": 3210.0}`），先于我方实现合入；改成
+    我方内部惯例会在对方毫不知情的情况下悄悄破坏其已合入的解析代码。
+    审查时**不要**把这处「不一致」当 bug 拉回统一。
+
+    - accepted: 恒为 True（本工具全部失败路径走 ToolError，见模块 docstring
+      码表 speech_play 例外条——没有 rejected 业务回执可容纳失败态，AD-4）。
+    - duration_ms: 音频时长（wav 帧数 / SPEECH_WAV_SAMPLE_RATE * 1000）；
+      **返回时机 = 完成调度即返，不等播完**——Zero 据此节流下一次调用。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    duration_ms: float
 
 
 class ParamInfo(BaseModel):

@@ -1,6 +1,8 @@
-"""VTS 离散行为 MCP Server（FastMCP stdio · 蓝图 2026-07-31 §5/§6 · T5）。
+"""VTS 离散行为 MCP Server（FastMCP stdio · 蓝图 2026-07-31 §5/§6 · T5；
+语音播放 speech_play 见 speech-play 蓝图 2026-08-14 §T5）。
 
-feature flag：VTS_BEHAVIOR_ENABLED（默认 false）。
+feature flag：VTS_BEHAVIOR_ENABLED（默认 false）；speech_play 额外要求
+VTS_SPEECH_ENABLED（默认 false）——双 flag 复合门，见 `_require_speech_enabled`。
 传输：stdio（供 Zero 侧经 MCP client spawn 子进程）。
 
 设计约束（AD-8，逐条对照 desktop_mcp_server.py 先例）：
@@ -10,7 +12,8 @@ feature flag：VTS_BEHAVIOR_ENABLED（默认 false）。
 - 机读错误码走位置无关令牌 [vtsb:*]（AD-11，符号唯一真相在
   src/agents/models/vts_behavior.py）：业务性拒绝在回执 code 字段（正常返回），
   协议性失败才抛 ToolError（服务层的 ToolError 原样透传，其余异常映射
-  [vtsb:vts_error]）。
+  [vtsb:vts_error]）。speech_play 是例外（AD-4）：全部失败路径统一走
+  ToolError，见 vts_behavior.py 模块 docstring 码表 speech_play 例外条。
 - ⚠ stdout 是 JSON-RPC 线路，绝不可写——日志一律 stderr（configure_logging）。
 """
 
@@ -29,8 +32,10 @@ from src.agents.models.vts_behavior import (
     INTENSITY_DEFAULT,
     VTSB_DISABLED,
     VTSB_INVALID_PARAMS,
+    VTSB_SPEECH_DISABLED,
     VTSB_VTS_ERROR,
     BehaviorRequest,
+    SpeechRequest,
     TrajectoryKeyframe,
     TrajectoryRequest,
 )
@@ -56,7 +61,14 @@ mcp = FastMCP(
         "触发）。③ behavior_trigger 触发行为并读回执：status=accepted/replaced 表示已"
         "执行，rejected 是正常业务回执（code 带 [vtsb:*] 机读令牌，如冷却/节流/通道"
         "占用），不是错误——行为不排队，被拒后不必立即重试。④ 话锋突转时用 "
-        "behavior_interrupt 打断活跃行为；behavior_status 探测连接/健康态。\n"
+        "behavior_interrupt 打断活跃行为；behavior_status 探测连接/健康态。"
+        "⑤ speech_play(wav_path, mouth_track, fps) 播放同机绝对路径的 wav"
+        "（PCM 16-bit / mono / 44100Hz）并同步注入口型（mouth_track 形状同 "
+        "params_animate 的 keyframes，只含嘴部参数键）：完成调度即返 "
+        "{accepted, duration_ms}（不等播完，按 duration_ms 节流下一次调用）；"
+        "重叠调用按 FIFO 排队顺序播放（不打断在播）；播放期嘴部参数独占，播完/失败"
+        "即释放。仅 VTS_BEHAVIOR_ENABLED 与 VTS_SPEECH_ENABLED 均为 true 时可用，"
+        "失败一律 ToolError（无 rejected 业务回执）。\n"
         "⚠ 跨进程共存警告：本 server 与另一进程的表情流 sink（VTS_SINK_ENABLED）"
         "同时连 VTS 会形成两个插件对同一参数的 set 模式独占冲突（VTS 454）——"
         "同一时刻只允许一个进程持有 VTS 注入连接；同进程共存请注入同一 sink 实例。"
@@ -79,6 +91,35 @@ def _require_enabled() -> None:
         raise ToolError(
             f"{VTSB_DISABLED} VTS 行为能力未启用（VTS_BEHAVIOR_ENABLED=false）。"
             "请在 .env 中设置 VTS_BEHAVIOR_ENABLED=true 后重启 server。"
+        )
+
+
+def _is_speech_enabled() -> bool:
+    """检查 VTS_SPEECH_ENABLED feature flag（真值集与仓内先例一致）。"""
+    return os.environ.get("VTS_SPEECH_ENABLED", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _require_speech_enabled() -> None:
+    """speech_play 专属第二道门：VTS_SPEECH_ENABLED 未开时 raise ToolError
+    （带 [vtsb:speech_disabled] 机读令牌）。
+
+    speech_play 需要 ``VTS_BEHAVIOR_ENABLED`` 与 ``VTS_SPEECH_ENABLED`` 两个
+    flag 皆开（speech-play 蓝图 AD-9：第一句既有 `_require_enabled()` 不变 +
+    第二句本函数，**顺序复合门**，不合并成一个新函数）——工具体里必须作为
+    **第二条**裸调用紧跟 `_require_enabled()`，前面不可插入任何其它可执行
+    语句：这是 `_require_enabled` 那道 AST 硬化守卫
+    （`test_flag_off_tools_gate_is_first_executable_statement`）覆盖不到的
+    那一半，需要一条平行守卫钉住"第二条也是裸门"（不修改既有守卫本身）。
+    """
+    if not _is_speech_enabled():
+        raise ToolError(
+            f"{VTSB_SPEECH_DISABLED} 语音播放能力未启用（VTS_SPEECH_ENABLED=false）。"
+            "请在 .env 中设置 VTS_SPEECH_ENABLED=true（并确保 VTS_BEHAVIOR_ENABLED=true）"
+            "后重启 server。"
         )
 
 
@@ -219,7 +260,8 @@ async def behavior_interrupt(channel: str | None = None) -> str:
     description=(
         "获取行为层健康/状态快照（BehaviorStatus JSON）：connected/healthy/last_error/"
         "活跃行为/冷却剩余/缺席可选参数/热键数/model_id/trajectory_active/"
-        "trajectory_remaining_ms（轨迹回放态，含交还缓出窗口）。healthy=false 表示"
+        "trajectory_remaining_ms（轨迹回放态，含交还缓出窗口）/speech_active/"
+        "speech_queue_depth/speech_last_error（语音播放态）。healthy=false 表示"
         "渲染循环已故障——恢复路径为再次 vts_connect（显式重连）。"
     ),
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
@@ -338,6 +380,57 @@ async def params_clear() -> str:
         raise ToolError(f"{VTSB_VTS_ERROR} params_clear 执行失败：{exc}") from exc
 
 
+# ── 语音播放工具（speech-play 蓝图 2026-08-14 §T5） ───────────────────────────
+
+
+@mcp.tool(
+    name="speech_play",
+    description=(
+        "播放一段语音并同步注入口型（Zero 侧语音合成 → 我方渲染端播放）。"
+        "wav_path 为同机绝对路径（PCM 16-bit / mono / 44100Hz，不重采样）；"
+        "mouth_track 形状同 params_animate 的 keyframes"
+        "（[{t_ms, params:{参数名:值}}]，t=0 对齐音频首采样，只含嘴部参数键）；"
+        "fps 为采样率提示（默认 20）。返回 {accepted, duration_ms}——完成调度即返，"
+        "不等播完，按 duration_ms 节流下一次调用；重叠调用按 FIFO 排队顺序播放"
+        "（不打断在播）。播放期间 mouth_track 涉及的键独占，不被行为/表情层覆盖，"
+        "播完/失败即释放。失败一律 ToolError（机读令牌区分文件/格式/设备/未连接"
+        "四类，本工具没有 rejected 业务回执态）；仅 VTS_BEHAVIOR_ENABLED 与 "
+        "VTS_SPEECH_ENABLED 均为 true 时可用。"
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def speech_play(
+    wav_path: str,
+    mouth_track: list[TrajectoryKeyframe],
+    fps: float = 20.0,
+) -> str:
+    """播放语音并注入口型。
+
+    Args:
+        wav_path: 同机绝对路径的 wav 文件（PCM 16-bit / mono / 44100Hz）。
+        mouth_track: 口型关键帧轨迹（形状同 params_animate 的 keyframes）。
+        fps: 轨迹采样率提示（默认 20，不强制校验帧间隔）。
+
+    Returns:
+        SpeechReceipt 序列化 JSON（``{"accepted": true, "duration_ms": <float>}``）。
+    """
+    _require_enabled()
+    _require_speech_enabled()
+    service = _get_service()
+    try:
+        request = SpeechRequest(wav_path=wav_path, mouth_track=mouth_track, fps=fps)
+    except ValidationError as exc:
+        raise ToolError(f"{VTSB_INVALID_PARAMS} 语音播放参数不合法：{exc}") from exc
+    try:
+        receipt = await service.speech_play(request)
+        return _dump_model(receipt)
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.error("speech_play 失败：%s", exc, exc_info=True)
+        raise ToolError(f"{VTSB_VTS_ERROR} speech_play 执行失败：{exc}") from exc
+
+
 # ── 连接管理工具 ──────────────────────────────────────────────────────────────
 
 
@@ -405,7 +498,12 @@ if __name__ == "__main__":
     configure_logging()
 
     enabled = _is_enabled()
-    logger.info("vts_behavior_mcp_server 启动：VTS_BEHAVIOR_ENABLED=%s", enabled)
+    speech_enabled = _is_speech_enabled()
+    logger.info(
+        "vts_behavior_mcp_server 启动：VTS_BEHAVIOR_ENABLED=%s，VTS_SPEECH_ENABLED=%s",
+        enabled,
+        speech_enabled,
+    )
 
     if enabled:
         # 原生扩展预热（必须在 mcp.run() 之前）：_get_service() 的延迟 import 会
@@ -414,6 +512,14 @@ if __name__ == "__main__":
         # 判据与最小复现见 src/mcp/native_warmup.py 模块 docstring。
         # 仍在 flag 内：VTS_BEHAVIOR_ENABLED=false 时不拉业务依赖（零回归不变）。
         warm_native_extensions(("src.mcp.behavior.service",))
+
+        if speech_enabled:
+            # speech_playback 整模块预热（speech-play 蓝图 AD-11）：sounddevice
+            # 延迟 import 于该模块内，同一死锁判据（"是否首次触达"而非"触达的是
+            # 谁"）。嵌套在 `if enabled:` 内层——ast.walk 递归找嵌套调用，既有
+            # test_warmup_is_gated_by_feature_flag 不需要改。VTS_SPEECH_ENABLED=false
+            # 时不拉 sounddevice（零回归不变）。
+            warm_native_extensions(("src.mcp.behavior.speech_playback",))
 
         # 惰性持有 sink（AD-9）：不在启动时连 VTS——VTS 未启动/未开 API 也能起
         # server，连接由 vts_connect 工具显式建立（连接失败只在该工具报错）。
