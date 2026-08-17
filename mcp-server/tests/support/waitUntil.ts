@@ -9,13 +9,13 @@ export interface WaitUntilOptions {
 }
 
 export async function waitUntil(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   options: WaitUntilOptions = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 8000;
   const intervalMs = options.intervalMs ?? 25;
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) {
       const suffix = options.description !== undefined ? `：${options.description}` : "";
       throw new Error(`waitUntil 超时（${timeoutMs}ms）${suffix}`);
