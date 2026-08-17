@@ -40,12 +40,15 @@ state 信号接线（``target_visible``）归 algo-team 拍板，本批不接。
 
 from __future__ import annotations
 
+import logging
 import os
 import unicodedata
 
 from pydantic import BaseModel, Field
 
 from src.agents.models.screen_snapshot import BBox, ScreenSnapshot, TextBlock
+
+logger = logging.getLogger(__name__)
 
 ANCHOR_EDIT_DISTANCE_RATIO: float = float(os.environ.get("ANCHOR_EDIT_DISTANCE_RATIO", "0.34"))
 """编辑距离容错阈值占锚点归一化长度的比例（工程假设，待真实 OCR 语料标定）。
@@ -125,6 +128,18 @@ def verify_pixel_anchor(
         anchor_hit=False 且 reason 带对应 ``[desk:<code>]`` 令牌写明原因；
         未命中时 reason 附最接近对的编辑距离与阈值（诊断用）。
     """
+    verdict = _verify_pixel_anchor(snapshot, anchor_texts, region)
+    # 留痕（桌面排障证据先行）：reason 自带 [desk:<code>] 机读令牌，整条直出。
+    logger.debug("像素锚点验证：%s", verdict.reason)
+    return verdict
+
+
+def _verify_pixel_anchor(
+    snapshot: ScreenSnapshot,
+    anchor_texts: list[str],
+    region: BBox | None = None,
+) -> AnchorVerdict:
+    """`verify_pixel_anchor` 的判定主体（结论统一在公开入口留痕）。"""
     if snapshot.desktop_locked:
         return AnchorVerdict(
             anchor_hit=False,
