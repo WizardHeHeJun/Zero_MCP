@@ -19,7 +19,7 @@
 
 <img src="docs/v2/desktop-pipeline.png" alt="桌面感知+操控管线：UIA/OCR 两层可用+视觉层预留，经注入过滤产出 ScreenSnapshot；操控侧三级白名单→TOCTOU 二次截图→interrupt 人工确认门才放行；停滞检测与 Checkpointer 断点续跑" width="900">
 
-> 图源 [`docs/v2/desktop-pipeline.mmd`](docs/v2/desktop-pipeline.mmd)（mermaid，飞书画板渲染）。
+> 图源 [`docs/v2/desktop-pipeline.mmd`](docs/v2/desktop-pipeline.mmd)。
 
 交付质量：单测 + 53 条行为 evals 全绿，ruff + mypy strict 通过，独立 code-reviewer 审查 PASS；真实钉钉 7 个功能界面端到端标定 **7/7** 全通过，OCR conf（各界面均值再平均）0.954，快照延迟 0.72–2.03s（均值 ≈1.2s）。⚠ 后三项是一次性标定记录（依据在本地 `notes/e2e-desktop-task-results.md`，不入库），**不是 CI 持续回归项**。
 
@@ -41,7 +41,7 @@ zero-link 一轮数据流（感知先验注入 → Zero 确定性计算 → 表�
 
 <img src="docs/v2/zero-link-dataflow.png" alt="zero-link 一轮数据流：EDA/HRV 经 ω=0.5 协方差交叉预合并 + audio/vision 独立先验 → PerceptionHub 多流独立 → external_priors 出境守卫 → ZeroLinkClient → Zero 确定性情感计算 → ExpressionRouter 双通路 → 三映射器 → RenderFrame" width="900">
 
-> 图源 [`docs/v2/zero-link-dataflow.mmd`](docs/v2/zero-link-dataflow.mmd)（mermaid，飞书画板渲染）。
+> 图源 [`docs/v2/zero-link-dataflow.mmd`](docs/v2/zero-link-dataflow.mmd)。
 
 ## 能力三：VTube Studio 渲染终端 + 离散行为层
 
@@ -57,7 +57,7 @@ Zero 情感内核的 `expression` 输出经 MCP 驱动 Live2D 数字人（VTube 
 
 <img src="docs/v2/vts-behavior-pipeline.png" alt="VTS 渲染终端+离散行为层管线：RenderFrame 表情流、params_animate keyframes 与 speech_play 三路输入；行为 server 双 flag 复合门→BehaviorService；渲染循环按 表情流+环境层→behavior_overlay→trajectory→speech 嘴部最终覆盖 的后应用者赢顺序混合（即独占语义）；音频线程 sounddevice 以 monotonic+latency 锚点经 call_soon_threadsafe 单向回交口型 feed" width="900">
 
-> 图源 [`docs/v2/vts-behavior-pipeline.mmd`](docs/v2/vts-behavior-pipeline.mmd)（mermaid，飞书画板渲染）。
+> 图源 [`docs/v2/vts-behavior-pipeline.mmd`](docs/v2/vts-behavior-pipeline.mmd)。
 
 ## 记忆层与存储层（持久化接线）
 
@@ -71,7 +71,7 @@ Zero 情感内核的 `expression` 输出经 MCP 驱动 Live2D 数字人（VTube 
 
 <img src="docs/v2/mcp-architecture.png" alt="三层单向依赖 + MCP 互操作边界：编排层→记忆层→存储层只能自上而下调用，组装根 persistence.py 注入真实后端；MCP 边界（src/mcp Python 内部封装 + zero-link，mcp-server/ TS 对外聚合）把 Zero 当外部服务经 MCP 调用，不 import 其代码库" width="760">
 
-> 图源 [`docs/v2/mcp-architecture.mmd`](docs/v2/mcp-architecture.mmd)（mermaid，飞书画板渲染）。
+> 图源 [`docs/v2/mcp-architecture.mmd`](docs/v2/mcp-architecture.mmd)。
 
 - **运行态**（LangGraph Checkpointer）与**长期记忆**分离存储——已在 SQLite 后端落为 `snapshots` / `memory_facts` 两张物理分表。
 - **MCP 传输层不塞业务逻辑**：server 只注册工具 + 转发原语，感知/agent 业务逻辑留在 Python `src/*`。
@@ -230,5 +230,3 @@ cd mcp-server && npm install && npm run typecheck
 - `VTS_BEHAVIOR_HOTKEYS=true`：热键枚举/触发开关；模型无热键时零影响。
 - `VTS_SPEECH_ENABLED=false`：`speech_play` 的**双 flag 复合门**——须与 `VTS_BEHAVIOR_ENABLED` **同时**为 true 才可用，单开无效；关时拒绝 `[vtsb:speech_disabled]`。依赖走 extra `speech`（sounddevice）。wav 硬要求 **44100Hz / 单声道 / 16bit**（不符 → `[vtsb:speech_format_error]`）；文件不存在/不可读 → `[vtsb:speech_file_error]`、播放设备不可用 → `[vtsb:speech_device_error]`、队列满（上限 5）→ 复用 `[vtsb:throttled]`。
 - ⚠ **跨进程双插件冲突**：勿同时跑 standalone 行为 server 与另一进程的表情流 sink——两个插件 set 同一参数会触发 VTS 454 独占错误；同进程共享一个 sink 实例才安全。
-
-> 说明：本仓库仅跟踪 Zero_MCP 工程代码（`src/` · `tests/` · `docs/` · 配置）。项目自用的 Claude Code harness（`.claude/` · `CLAUDE.md`）、知识库（`ai-docs/`）、设计纪要（`notes/`）、PRP 工作区（`PRP/` · `ai-shared/`）、行为 evals（`evals/`）与交接文档（`HANDOFF.md`）经 `.git/info/exclude` 本地排除，不随本仓库提交，仅在本地开发环境维护——README 中引用它们的实测数字（FP=0/159、7/7、conf 0.954 等）因此无法从克隆件回溯。
