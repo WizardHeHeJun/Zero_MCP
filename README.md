@@ -2,7 +2,7 @@
 
 经 **MCP（[Model Context Protocol](https://modelcontextprotocol.io)）**，给情感引擎驱动的 AI 数字人项目 **Zero** 扩展新的 **Agent 能力模块**。Zero_MCP 与 Zero 相对独立：把 Zero 当作**外部服务**经 MCP 调用，不直接耦合其代码库。
 
-已落地两条能力线：**「桌面屏幕感知 + 电脑操控」**（Task 1-14 收口，真实桌面端到端标定）与 **「Zero↔MCP 情感对接（zero-link）」**（第二阶段：契约层 + client 真连 + 三模态感知真接入 + 真采集 I/O 适配层 + 表达映射器 + physiology 消费门控 + EDA 唤醒度量 v2）。另已落地**记忆层 + 存储层与编排层的持久化接线**（ScopedMemoryAPI + SQLite 后端 + 组装根，默认关零回归）。后续能力沿同一架构扩展。
+已落地三条能力线：**「桌面屏幕感知 + 电脑操控」**（Task 1-14 收口 + K1-K8 加固，真实桌面端到端标定）、**「Zero↔MCP 情感对接（zero-link）」**（第二阶段：契约层 + client 真连 + 三模态感知真接入 + 真采集 I/O 适配层 + 表达映射器 + physiology 消费门控 + EDA 唤醒度量 v2）与 **「VTube Studio Live2D 渲染终端 + 离散行为层」**（expression 表情流直驱 + 裸参数轨迹通道 + `speech_play` 语音播放口型同步）。另已落地**记忆层 + 存储层与编排层的持久化接线**（ScopedMemoryAPI + SQLite 后端 + 组装根，默认关零回归）。后续能力沿同一架构扩展。
 
 ## 能力一：桌面屏幕感知 + 操控
 
@@ -13,6 +13,7 @@
 - **关键实证**：微信 4.1.11.24（mmui 自绘）与钉钉 7.x 的 UIA 内容树实测覆盖率均 **≈0%**（钉钉 7/7 界面 hollow）——故感知默认 OCR 主通道、操控主路径为坐标点击，逐窗口探测 `uia_hollow` 自动切 OCR。
 - **LangGraph 编排**：7 节点 StateGraph + 3 条件边，高危动作经 `interrupt` 人工确认门，三信号停滞检测 + 断点续跑（Checkpointer）。
 - **安全护栏在编排层**：三级白名单（不在表内一律升 DESTRUCTIVE）+ TOCTOU 二次截图比对（动作坐标 ±`TOCTOU_CROP_HALF_PX` 局部裁剪口径）+ 屏幕文字注入过滤（12 条英文 + 23 条中文越权词表，实测 FP=0/159）；不依赖模型层防御。
+- **K1-K8 加固**（2026-08-05 审计八真缺口三轨落地）：锁屏/会话状态检测、落点核验（点击后 `WindowFromPoint` + OCR 锚点验证 `anchor_verify`——Win32 前台/标题/CLOAKED 状态会撒谎，像素锚点才可信）、前台获取梯级、定向感知默认装配、步骤记录 `step_record` 回路等；审查门 PASS。遗留：ActionSpec 生成层与两处工程假设的实机标定。
 
 感知 → 安全门 → 操控 → 停滞/续跑的一轮闭环：
 
@@ -42,6 +43,16 @@ zero-link 一轮数据流（感知先验注入 → Zero 确定性计算 → 表�
 
 > 图源 [`docs/v2/zero-link-dataflow.mmd`](docs/v2/zero-link-dataflow.mmd)（mermaid，飞书画板渲染）。
 
+## 能力三：VTube Studio 渲染终端 + 离散行为层
+
+Zero 情感内核的 `expression` 输出经 MCP 驱动 Live2D 数字人（VTube Studio Public API，WebSocket）；已与 Hiyori_A 实机端到端联调 + 两轮标定。分界由用户拍板：**参数通道归 MCP，自然度归 Zero 侧动作模型**。
+
+- **表情流 sink**（`sinks/vts.py::VtsExpressionSink`）：消费 `RenderFrame`（能力二的输出），ARKit blendshape → VTS 输入参数注入；`VTS_SINK_EXPRESSIVENESS` 幅度增益 + 微表情环境层（眨眼/呼吸/微噪声）。
+- **离散行为层**（`vts_behavior_mcp_server.py`，独立 MCP server，10 工具）：12 词离散行为 + 热键枚举/触发（标定期兜底）；主通道是 `params_animate` **裸参数轨迹通道**——Zero 侧动作模型经 keyframes 直驱任意 Live2D 输入参数（Hiyori_A 全 127 参数实测），attack/release 缓入缓出接管与交还、无跳变；上限 10s/600 帧，重叠调用排队。已消化 Zero motion 门控回件（motion-disabled 归不可降级错误子类、describe_config v4/v5 键登记、errorID 51 自解释处置文案）。
+- **`speech_play` 语音播放 + 口型同步**（2026-08-14，Zero 开工件）：wav 播放（sounddevice `RawOutputStream` + stdlib `wave`，零 numpy）+ `mouth_track` 口型轨迹**独占嘴部**（`TrajectoryPlayer` 挂渲染循环最终覆盖层，播完/失败即释放）；`mouth_track` 沿用 `params_animate` 的关键帧形状，但上限为 speech 专属 **60s/1200 帧**（应 Zero chat 语料实测 0.17s/字放宽；`params_animate` 的 10s/600 不动）；重叠调用 FIFO 排队（上限 5，满则 `[vtsb:throttled]`）。成功回包 `{accepted, duration_ms}` 是**跨仓锁定的字面形状**（Zero 先行合入的单测按它写，故意不套本仓 status/code 三态惯例）。⚠ 音画对齐 ≤80ms 目前是工程论证（`t0 = monotonic() + stream.latency`），真机 chat 联调未做，联调过前不宣称达标。
+- **MCP stdio 预热纪律**（`src/mcp/native_warmup.py`）：stdio server 进事件循环后在工具体内**首次 import numpy 系依赖会无限期死锁**（Zero 实机 `vts_connect` 挂起的根因，2026-08-11 已修）——凡工具体可能首次触达者必须在 `mcp.run()` 前预热（放 flag 分支内保零回归），且 flag 关时门必须是工具体**第一条可执行语句**（AST 守卫按语义身份钉死，非行号判据）。⚠ 函数体内延迟 import 的依赖「预热整模块」救不了——预热路径必须真正执行到那次 import。
+- 双 flag 复合门（`VTS_BEHAVIOR_ENABLED` + `VTS_SPEECH_ENABLED`）、wav 格式要求与跨进程双插件冲突见「配置详解」。
+
 ## 记忆层与存储层（持久化接线）
 
 - **记忆层** `src/memory/api.py::ScopedMemoryAPI`：四条记忆纪律**代码强制**——显式 scope 两级 fail-fast（禁默认 user）· 每任务一条摘要（写入按任务完成节流）· 与运行态物理分表 · 新事实使旧事实失效（打戳不删行）。未做：自动抽取、跨事实去重、向量检索。
@@ -67,7 +78,7 @@ zero-link 一轮数据流（感知先验注入 → Zero 确定性计算 → 表�
 | 主 | Python 3.12 | LLM agent 框架（LangGraph）+ 编排/记忆/存储 + MCP server/client + 感知/操控原语 |
 | MCP 对外层 | TypeScript | `mcp-server/`，`@modelcontextprotocol/sdk`（对外聚合，暂未用） |
 
-核心依赖：`langgraph` · `mcp`（python-sdk）· `pydantic` · `httpx` · `mss` · `rapidocr-onnxruntime` · `pywinauto`/`uiautomation` · `pyautogui` · `jinja2`；存储层另需 `aiosqlite`（延迟 import，缺库时报带指引的 ImportError）。可选 extras：`dev`/`poc` · GPU 加速 `gpu-cuda`/`gpu-dml`/`omniparser`（CPU 为默认兜底）· zero-link 感知 `physio`（NeuroKit2）/`perception-audio`（torch/transformers）/`perception-vision`（emotiefflib ONNX）· 真硬件采集 `hardware-audio`（sounddevice）/`hardware-wearable`（pyserial）。⚠ 文件适配层用到的 `librosa` 当前未在任何 extra 声明，需手动装。
+核心依赖：`langgraph` · `mcp`（python-sdk）· `pydantic` · `httpx` · `mss` · `rapidocr-onnxruntime` · `pywinauto`/`uiautomation` · `pyautogui` · `jinja2`；存储层另需 `aiosqlite`（延迟 import，缺库时报带指引的 ImportError）。可选 extras：`dev`/`poc` · GPU 加速 `gpu-cuda`/`gpu-dml`/`omniparser`（CPU 为默认兜底）· zero-link 感知 `physio`（NeuroKit2）/`perception-audio`（torch/transformers）/`perception-vision`（emotiefflib ONNX）· 真硬件采集 `hardware-audio`（sounddevice）/`hardware-wearable`（pyserial）· 语音播放 `speech`（sounddevice——与 `hardware-audio` 同包**不同能力开关**：那边是麦克风采集，这边是 `speech_play` 播放，互不隐含）。⚠ 文件适配层用到的 `librosa` 当前未在任何 extra 声明，需手动装。
 
 ## 目录结构
 
@@ -88,16 +99,23 @@ Zero_MCP/
 │   ├── agents/                     # Worker Agent 层（职责单一，经 state + Supervisor 协作）
 │   │   ├── screen_perception_agent.py  #   屏幕感知：快照 → 模型无关结构化文本
 │   │   ├── desktop_control_agent.py    #   桌面操控：动作规划与执行封装
+│   │   ├── anchor_verify.py            #   落点核验：点击后 OCR 锚点验证（K1-K8：Win32 状态不可信，像素才可信）
 │   │   ├── text_filter.py              #   屏幕文字注入过滤（12 英文 + 23 中文越权词表，实测 FP=0/159）
 │   │   ├── protocols.py                #   agent 层协议（SnapshotStore 权威定义在此，编排层只 re-export）
 │   │   └── models/                     #   共享契约层（跨层数据形状唯一真相，pydantic）
 │   │       ├── screen_snapshot.py          #     桌面感知契约（ScreenSnapshot / TextBlock / capture_origin）
+│   │       ├── step_record.py              #     步骤记录契约（K1-K8 state 回路）
+│   │       ├── vts_behavior.py             #     VTS 行为层契约（[vtsb:*] 码表 / TrajectoryRequest / SpeechRequest·Receipt）
 │   │       └── zero_affect.py              #     Zero↔MCP 情感契约（(v,a) 刺激 / 先验流 / 13 维 FACS 双通路 expression）
 │   ├── mcp/                        # MCP 互操作边界（Python = 内部能力封装）
 │   │   ├── desktop_mcp_server.py       #   桌面能力 MCP server（FastMCP + stdio，10 工具，flag 默认关）
 │   │   ├── desktop_mcp_client.py       #   编排层侧 client（spawn 子进程，异常三件套）
+│   │   ├── vts_behavior_mcp_server.py  #   VTS 离散行为层 MCP server（10 工具：behavior_* / params_* / speech_play / vts_*）
+│   │   ├── native_warmup.py            #   跨层基础设施：mcp.run() 前预热 numpy 系依赖（stdio 首次 import 死锁防护）
+│   │   ├── behavior/                   #   行为层业务：service.py 编排 · speech_playback.py 音频播放+口型队列（sounddevice+wave）
 │   │   ├── desktop/
 │   │   │   ├── capability_probe.py         #     启动能力探测：GPU EP 自适应 / OCR / OmniParser（幂等缓存）
+│   │   │   ├── session_state.py            #     锁屏/会话状态检测（K1-K8）
 │   │   │   └── tools/                      #     perception.py 感知原语（UIA/mss/RapidOCR/PrintWindow）· control.py 操控原语
 │   │   └── zero/                       #   zero-link：Zero↔MCP 情感对接层（不 import Zero，协议镜像）
 │   │       ├── client.py                   #     ZeroLinkClient：三段式会话 + stdio/HTTP + Bearer + resume + graceful_step
@@ -108,16 +126,18 @@ Zero_MCP/
 │   │       ├── channels/                   #     感知通道：physio(EDA 纯 numpy / HRV NeuroKit2) / audio / vision / callable
 │   │       ├── io_adapters/                #     真采集 I/O 适配层：文件/合成 signal_source + hardware_adapters 真硬件
 │   │       ├── mappers/                    #     表达映射：facs(12 AU→ARKit) / prosody(→SSML) / physiology(WESAD μS/°C)
-│   │       └── sinks/                      #     rendering.py：RenderingExpressionSink → RenderFrame（DUAL 含微表情泄漏帧）
+│   │       └── sinks/                      #     rendering.py（→RenderFrame，DUAL 含微表情泄漏帧）· vts.py（VTS 渲染终端）
+│   │                                       #     · trajectory.py（TrajectoryPlayer 回放器）· behavior_overlay.py（离散行为叠加层）
 │   ├── memory/                     # 记忆层
 │   │   └── api.py                      #   ScopedMemoryAPI：显式 scope · 任务完成节流 · 新事实使旧失效（只调存储层）
-│   └── storage/                    # 存储层（SQLite 已落地；PG/Neo4j 为平行扩展点）
-│       ├── sqlite_backend.py           #   aiosqlite 连接 + schema（snapshots / memory_facts 物理分表）
-│       ├── memory_store.py             #   长期记忆事实读写（invalidated_at 时序失效，不物理删）
-│       └── snapshot_store.py           #   运行态快照存取（同 ID 幂等覆盖，load 缺失抛 KeyError）
+│   ├── storage/                    # 存储层（SQLite 已落地；PG/Neo4j 为平行扩展点）
+│   │   ├── sqlite_backend.py           #   aiosqlite 连接 + schema（snapshots / memory_facts 物理分表）
+│   │   ├── memory_store.py             #   长期记忆事实读写（invalidated_at 时序失效，不物理删）
+│   │   └── snapshot_store.py           #   运行态快照存取（同 ID 幂等覆盖，load 缺失抛 KeyError）
+│   └── logging_config.py           # 跨层基础设施：日志统一配置（console 恒 stderr——stdio 的 stdout 是协议线路）
 ├── mcp-server/                     # TS MCP 对外聚合层（@modelcontextprotocol/sdk，独立 package.json，暂未用）
 ├── docs/v2/                        # 架构图：*.mmd（mermaid 源）+ *.png（飞书画板渲染，随仓提交，README 内嵌）
-├── tests/                          # 约 1.2k 用例（以 pytest --collect-only 为准）：agents/mcp/memory/orchestration/
+├── tests/                          # 约 1.9k 用例（以 pytest --collect-only 为准）：agents/mcp/memory/orchestration/
 │                                   #   safety/storage/poc/e2e（marker：realenv 实机 · zerorepo 跨仓回归 45 条）
 ├── evals/                          # 53 条 agent 行为级 evals（感知/操控/停滞）+ 8 个 WESAD 真被试生理度量脚本
 ├── ai-docs/                        # 知识库：模块三件套 + catalog + pitfalls + engineering-practices（本地维护，不入库）
@@ -201,6 +221,8 @@ cd mcp-server && npm install && npm run typecheck
 - `VTS_SINK_MODEL` 用 VTS **列表显示名**（如 Hiyori_A），与 CurrentModelRequest 的内部名可以不同，核对以 modelID 为准。
 - `VTS_SINK_EXPRESSIVENESS`：1.0=忠实 AU 幅度；实测产品幅度叠 VTS 参数平滑后肉眼偏淡，演示/直播观感建议 1.5~2.0（只放大幅度，不改表情结构）。
 - `VTS_BEHAVIOR_ENABLED` 与 `VTS_SINK_ENABLED` **语义不同**：行为层工具**始终注册**，flag 关时运行时拒绝（ToolError 带 `[vtsb:disabled]` 令牌）。连接复用同一套 `VTS_API_URL` / `VTS_TOKEN_FILE` / `VTS_SINK_MODEL` / `VTS_SINK_AMBIENT_MOTION`，不另设键。
+- `VTS_BEHAVIOR_HOTKEYS=true`：热键枚举/触发开关；模型无热键时零影响。
+- `VTS_SPEECH_ENABLED=false`：`speech_play` 的**双 flag 复合门**——须与 `VTS_BEHAVIOR_ENABLED` **同时**为 true 才可用，单开无效；关时拒绝 `[vtsb:speech_disabled]`。依赖走 extra `speech`（sounddevice）。wav 硬要求 **44100Hz / 单声道 / 16bit**（不符 → `[vtsb:speech_format_error]`）；文件不存在/不可读 → `[vtsb:speech_file_error]`、播放设备不可用 → `[vtsb:speech_device_error]`、队列满（上限 5）→ 复用 `[vtsb:throttled]`。
 - ⚠ **跨进程双插件冲突**：勿同时跑 standalone 行为 server 与另一进程的表情流 sink——两个插件 set 同一参数会触发 VTS 454 独占错误；同进程共享一个 sink 实例才安全。
 
 > 说明：本仓库仅跟踪 Zero_MCP 工程代码（`src/` · `tests/` · `docs/` · 配置）。项目自用的 Claude Code harness（`.claude/` · `CLAUDE.md`）、知识库（`ai-docs/`）、设计纪要（`notes/`）、PRP 工作区（`PRP/` · `ai-shared/`）、行为 evals（`evals/`）与交接文档（`HANDOFF.md`）经 `.git/info/exclude` 本地排除，不随本仓库提交，仅在本地开发环境维护——README 中引用它们的实测数字（FP=0/159、7/7、conf 0.954 等）因此无法从克隆件回溯。
