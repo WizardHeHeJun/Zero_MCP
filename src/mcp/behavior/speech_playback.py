@@ -266,10 +266,12 @@ class SpeechQueue:
         self.worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.worker_task
+        discarded = self.queue.qsize()
         while not self.queue.empty():
             self.queue.get_nowait()
         self.active = False
         self.speech_mouth.clear(time.monotonic())
+        logger.info("语音播放队列已关闭：丢弃未播 job %d 个，嘴部独占已释放。", discarded)
 
     # ── 内部 ─────────────────────────────────────────────────────────────────
 
@@ -325,8 +327,15 @@ class SpeechQueue:
             )
 
         play_task.add_done_callback(_propagate_early_failure)
+        logger.info(
+            "语音播放起播中：%.0fms，口型 %d 帧（fps=%g）",
+            job.duration_ms,
+            len(job.mouth_keyframes),
+            job.fps,
+        )
         try:
             t0 = await anchor
+            logger.debug("起播锚点已到达：t0=%.3f（含设备 latency 偏移）", t0)
             result = self.speech_mouth.feed(
                 job.mouth_keyframes,
                 mode="absolute",
@@ -342,6 +351,7 @@ class SpeechQueue:
                 self.last_error = f"口型轨迹被拒（音频照常播放）：{result.code} {result.detail}"
                 logger.warning("speech_play 口型注入被拒——%s", self.last_error)
             await play_task
+            logger.debug("语音播放完成（%.0fms），口型轨迹自然播尽释放。", job.duration_ms)
         finally:
             if not play_task.done():
                 play_task.cancel()

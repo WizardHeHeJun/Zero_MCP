@@ -90,7 +90,7 @@ from src.mcp.zero.sinks.behavior_overlay import (
     Ranges,
     resolve_degradation,
 )
-from src.mcp.zero.sinks.trajectory import TrajectoryPlayer
+from src.mcp.zero.sinks.trajectory import RELEASE_S, TrajectoryPlayer
 from src.mcp.zero.sinks.vts import (
     GOVERNED_PARAMS,
     VtsApiError,
@@ -327,6 +327,7 @@ class BehaviorService:
         播放调度，正在播的音频线程尽力收尾（`SpeechQueue.aclose` 语义）。
         """
         async with self.lifecycle_lock:
+            was_connected = self.connected
             if self.speech_queue is not None:
                 await self.speech_queue.aclose()
                 self.speech_queue = None
@@ -336,6 +337,8 @@ class BehaviorService:
             self.connected = False
             self.hotkeys = None
             self.model_id = None
+            if was_connected:
+                logger.info("行为层已断开：渲染循环停止，1s 后 VTS 收回参数控制权。")
             return self.status()
 
     # ── 触发 / 打断（AD-6 / AD-7） ───────────────────────────────────────────
@@ -350,8 +353,22 @@ class BehaviorService:
         sink = self._require_connected()
         now = time.monotonic()
         if request.name.startswith(HOTKEY_PREFIX):
-            return await self._trigger_hotkey(sink, request.name, now)
-        return self.engine.trigger(request, now=now, ranges=sink.ranges)
+            receipt = await self._trigger_hotkey(sink, request.name, now)
+        else:
+            receipt = self.engine.trigger(request, now=now, ranges=sink.ranges)
+        if receipt.status == "rejected":
+            logger.info("行为触发被拒 %s：%s %s", request.name, receipt.code, receipt.detail)
+        else:
+            logger.info(
+                "行为触发 %s（%s）：channels=%s，est=%dms%s%s",
+                request.name,
+                receipt.status,
+                receipt.channels,
+                receipt.estimated_duration_ms,
+                f"，降级通道 {receipt.degraded_channels}" if receipt.degraded_channels else "",
+                f"——{receipt.detail}" if receipt.detail else "",
+            )
+        return receipt
 
     def interrupt(self, channel: str | None = None) -> BehaviorReceipt:
         """打断活跃行为（channel=None 清全部）——交叉淡出回语义静息基准（AD-6）。
@@ -359,7 +376,13 @@ class BehaviorService:
         只清手势层，不触碰表情 target；无匹配活跃行为也返回 accepted（幂等）。
         """
         self._require_connected()
-        return self.engine.interrupt(channel, now=time.monotonic())
+        receipt = self.engine.interrupt(channel, now=time.monotonic())
+        logger.info(
+            "行为打断（channel=%s）：%s",
+            channel if channel is not None else "全部",
+            receipt.detail,
+        )
+        return receipt
 
     # ── 裸参数轨迹通道（2026-07-31 二期：Zero 侧动作模型直驱） ────────────────
 
@@ -379,6 +402,21 @@ class BehaviorService:
             known_params=known,
         )
         status = "accepted" if result.ok else "rejected"
+        if not result.ok:
+            logger.info("轨迹投喂被拒：%s %s", result.code, result.detail)
+        elif result.dropped_params:
+            logger.warning(
+                "轨迹投喂接受但丢弃缺席参数 %s（duration=%dms，queue_depth=%d）",
+                result.dropped_params,
+                result.duration_ms,
+                result.queue_depth,
+            )
+        else:
+            logger.debug(
+                "轨迹投喂接受：duration=%dms，queue_depth=%d",
+                result.duration_ms,
+                result.queue_depth,
+            )
         return TrajectoryReceipt(
             status=status,
             duration_ms=result.duration_ms,
@@ -392,6 +430,7 @@ class BehaviorService:
         """清除轨迹队列并交还参数控制权（幂等；250ms 缓出无跳变）。"""
         self._require_connected()
         self.trajectory_player.clear(time.monotonic())
+        logger.info("轨迹队列已清除，参数交还中（%.0fms 缓出）。", RELEASE_S * 1000.0)
         return TrajectoryReceipt(status="accepted", detail="轨迹已清除，参数交还中（缓出）。")
 
     def list_params(self) -> ParamCatalog:
@@ -440,6 +479,12 @@ class BehaviorService:
             fps=request.fps,
         )
         await self.speech_queue.enqueue(job)
+        logger.info(
+            "语音播放已入队：%s（%.0fms，口型 %d 帧）",
+            request.wav_path,
+            duration_ms,
+            len(request.mouth_track),
+        )
         return SpeechReceipt(accepted=True, duration_ms=duration_ms)
 
     # ── 清单 / 状态（AD-7 / §5） ─────────────────────────────────────────────
