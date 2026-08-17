@@ -76,6 +76,10 @@ export class BackendManager {
   private lastError: string | undefined;
   private restartTimer: NodeJS.Timeout | null = null;
   private closed = false;
+  /** 在途握手流程（connectWithTimeout 整体）——close() 等它结算，防孤儿子进程。 */
+  private connecting: Promise<void> | null = null;
+  /** 在途握手里已 spawn 但尚未被采纳的 transport——close() 直接关它中止握手。 */
+  private pendingTransport: StdioClientTransport | null = null;
 
   constructor(config: BackendConfig, options: BackendManagerOptions = {}) {
     this.config = config;
@@ -127,12 +131,32 @@ export class BackendManager {
     return result as CallToolResult;
   }
 
-  /** 优雅关停：取消待触发的重启定时器，关闭 transport（终止子进程）。 */
+  /**
+   * 优雅关停：取消待触发的重启定时器，中止在途握手，关闭 transport（终止子进程）。
+   *
+   * 复核轮 WARN 收口：信号可能精确落在"spawn+握手在途"窗口（此时 this.transport
+   * 仍 null，旧实现无事可关直接返回，随后 process.exit 抢在"迟到成功自清理"分支
+   * 之前执行 → 孤儿子进程）。现在先关 pendingTransport（立即终止已 spawn 的
+   * 子进程、让 connectOnce 尽快 reject——也避免关停被握手超时拖住最长 15s），
+   * 再 await connecting 结算（成功迟到分支自清理、失败分支 scheduleRestart 因
+   * closed 为 no-op），保证返回时无任何在途句柄。
+   */
   async close(): Promise<void> {
     this.closed = true;
     if (this.restartTimer !== null) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
+    }
+    const pending = this.pendingTransport;
+    if (pending !== null) {
+      try {
+        await pending.close();
+      } catch (exc) {
+        logger.warn(`后端 ${this.config.id} 中止在途握手时出错：${describeError(exc)}`);
+      }
+    }
+    if (this.connecting !== null) {
+      await this.connecting.catch(() => undefined);
     }
     const transport = this.transport;
     this.client = null;
@@ -168,12 +192,34 @@ export class BackendManager {
         this.handleTransportError(error);
       }
     };
-    await client.connect(transport);
-    const listed = await client.listTools();
-    return { client, transport, tools: listed.tools };
+    // 握手期间登记为 pending，供 close() 直接中止（spawn 发生在 connect 内部）；
+    // 无论成败都在结算时注销——成功后句柄的归属转给 connectWithTimeout 采纳逻辑。
+    this.pendingTransport = transport;
+    try {
+      await client.connect(transport);
+      const listed = await client.listTools();
+      return { client, transport, tools: listed.tools };
+    } finally {
+      if (this.pendingTransport === transport) {
+        this.pendingTransport = null;
+      }
+    }
   }
 
+  /** 发起一次连接尝试，并把整个流程登记到 this.connecting 供 close() 等待结算。 */
   private async connectWithTimeout(): Promise<void> {
+    const attempt = this.runConnectAttempt();
+    this.connecting = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this.connecting === attempt) {
+        this.connecting = null;
+      }
+    }
+  }
+
+  private async runConnectAttempt(): Promise<void> {
     if (this.closed) {
       return;
     }

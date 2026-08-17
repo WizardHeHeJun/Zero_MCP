@@ -50,10 +50,14 @@ def _is_enabled() -> bool:
 
 
 def _require_enabled() -> None:
-    """feature flag 未开时 raise ToolError，阻止工具执行。"""
+    """feature flag 未开时 raise ToolError，阻止工具执行。
+
+    带机读令牌 ``[desk:disabled]``（位置无关，消费侧 re.search 提取）——与 VTS 侧
+    ``[vtsb:disabled]`` 对称（此前不对称由 TS 聚合层真机验证核出，PR #21 遗留项）。
+    """
     if not _is_enabled():
         raise ToolError(
-            "桌面屏幕能力未启用（SCREEN_CAPABILITY_ENABLED=false）。"
+            "[desk:disabled] 桌面屏幕能力未启用（SCREEN_CAPABILITY_ENABLED=false）。"
             "请在 .env 中设置 SCREEN_CAPABILITY_ENABLED=true 后重启 server。"
         )
 

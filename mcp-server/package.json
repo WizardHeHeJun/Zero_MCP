@@ -12,15 +12,15 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "*",
-    "zod": "*"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "*",
-    "@types/node": "*",
-    "vitest": "*",
-    "eslint": "*",
-    "typescript-eslint": "*",
-    "prettier": "*"
+    "typescript": "^6.0.3",
+    "@types/node": "^26.2.0",
+    "vitest": "^4.1.10",
+    "eslint": "^10.8.1",
+    "typescript-eslint": "^8.67.0",
+    "prettier": "^3.9.6"
   }
 }
