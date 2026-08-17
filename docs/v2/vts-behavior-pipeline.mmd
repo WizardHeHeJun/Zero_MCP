@@ -1,0 +1,41 @@
+flowchart LR
+  subgraph inputs["📥 三路输入"]
+    direction TB
+    frame["RenderFrame · 能力二输出<br/>ARKit blendshape 表情流"]:::client
+    motion["Zero 侧动作模型<br/>params_animate keyframes<br/>10s/600 帧 · 重叠排队"]:::client
+    speech["speech_play<br/>wav + mouth_track<br/>speech 专属上限 60s/1200 帧"]:::client
+  end
+
+  subgraph server["🔌 vts_behavior_mcp_server · 10 工具 · stdio"]
+    direction TB
+    gate["双 flag 复合门<br/>① _require_enabled<br/>② _require_speech_enabled<br/>AST 守卫钉死语句序"]:::proto
+    svc["BehaviorService<br/>行为触发 · 轨迹排队<br/>SpeechQueue FIFO ≤5"]:::proto
+    gate --> svc
+  end
+
+  subgraph loop["🎭 VtsExpressionSink 渲染循环 · 后应用者赢 = 独占语义"]
+    direction TB
+    amb["① 表情流 + 微表情环境层<br/>眨眼 / 呼吸 / 微噪声"]:::sink
+    ovl["② behavior_overlay<br/>12 词离散行为叠加"]:::sink
+    trj["③ trajectory 轨迹混合<br/>attack/release 缓入缓出<br/>接管与交还无跳变"]:::sink
+    mouth["④ speech 嘴部最终覆盖<br/>播放期独占<br/>播完/失败即释放"]:::sink
+    amb --> ovl --> trj --> mouth
+  end
+
+  audio["🔊 音频线程 sounddevice<br/>t0 = monotonic + stream.latency<br/>call_soon_threadsafe 单向回交"]:::note
+
+  vts["VTube Studio Public API<br/>WebSocket · Live2D<br/>Hiyori_A 实机联调"]:::engine
+
+  frame --> amb
+  motion --> gate
+  speech --> gate
+  svc --> trj
+  svc --> audio
+  audio -->|"起播锚点 feed"| mouth
+  mouth ==> vts
+
+  classDef client fill:#F0F4FC,stroke:#5178C6,color:#1F2329
+  classDef proto fill:#FEF1CE,stroke:#D4B45B,color:#1F2329
+  classDef sink fill:#DFF5E5,stroke:#509863,color:#1F2329
+  classDef engine fill:#FEE3E2,stroke:#D25D5A,color:#1F2329
+  classDef note fill:#FFF9E6,stroke:#D4B45B,color:#8A6D1B
