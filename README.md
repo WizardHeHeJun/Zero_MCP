@@ -53,6 +53,12 @@ Zero 情感内核的 `expression` 输出经 MCP 驱动 Live2D 数字人（VTube 
 - **MCP stdio 预热纪律**（`src/mcp/native_warmup.py`）：stdio server 进事件循环后在工具体内**首次 import numpy 系依赖会无限期死锁**（Zero 实机 `vts_connect` 挂起的根因，2026-08-11 已修）——凡工具体可能首次触达者必须在 `mcp.run()` 前预热（放 flag 分支内保零回归），且 flag 关时门必须是工具体**第一条可执行语句**（AST 守卫按语义身份钉死，非行号判据）。⚠ 函数体内延迟 import 的依赖「预热整模块」救不了——预热路径必须真正执行到那次 import。
 - 双 flag 复合门（`VTS_BEHAVIOR_ENABLED` + `VTS_SPEECH_ENABLED`）、wav 格式要求与跨进程双插件冲突见「配置详解」。
 
+三路输入（表情流 / 动作模型轨迹 / speech_play）经双 flag 门与渲染循环四层混合驱动 VTS 的一轮链路：
+
+<img src="docs/v2/vts-behavior-pipeline.png" alt="VTS 渲染终端+离散行为层管线：RenderFrame 表情流、params_animate keyframes 与 speech_play 三路输入；行为 server 双 flag 复合门→BehaviorService；渲染循环按 表情流+环境层→behavior_overlay→trajectory→speech 嘴部最终覆盖 的后应用者赢顺序混合（即独占语义）；音频线程 sounddevice 以 monotonic+latency 锚点经 call_soon_threadsafe 单向回交口型 feed" width="900">
+
+> 图源 [`docs/v2/vts-behavior-pipeline.mmd`](docs/v2/vts-behavior-pipeline.mmd)（mermaid，飞书画板渲染）。
+
 ## 记忆层与存储层（持久化接线）
 
 - **记忆层** `src/memory/api.py::ScopedMemoryAPI`：四条记忆纪律**代码强制**——显式 scope 两级 fail-fast（禁默认 user）· 每任务一条摘要（写入按任务完成节流）· 与运行态物理分表 · 新事实使旧事实失效（打戳不删行）。未做：自动抽取、跨事实去重、向量检索。
