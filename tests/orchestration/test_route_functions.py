@@ -21,6 +21,7 @@ from src.orchestration.desktop_graph import (
     route_after_stall,
     route_after_supervisor,
 )
+from src.orchestration.desktop_supervisor import MAX_ITERATIONS_EXCEEDED
 from src.orchestration.state import DesktopTaskState, TaskStatus
 
 # ── 辅助构造 ──────────────────────────────────────────────────────────────────
@@ -114,7 +115,7 @@ class TestRouteAfterSupervisor:
         即使 next_agent 是合法 Worker 也不得继续派发。
         """
         state = _make_state(
-            failure_reason="max_iterations_exceeded",
+            failure_reason=MAX_ITERATIONS_EXCEEDED,
             next_agent="perceive",
         )
         assert route_after_supervisor(state) == "error_report"
@@ -127,7 +128,7 @@ class TestRouteAfterSupervisor:
         """
         state = _make_state(
             task_status=TaskStatus.FAILED,
-            failure_reason="max_iterations_exceeded",
+            failure_reason=MAX_ITERATIONS_EXCEEDED,
         )
         assert route_after_supervisor(state) == "memory_flush"
 

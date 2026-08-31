@@ -180,6 +180,7 @@ cd mcp-server && npm install && npm run typecheck
 ### 编排层状态窗口
 
 - `STATE_STEP_KEEP` / `STALL_MAX_STEPS` / `STALL_THRESHOLD` 已接线（`src/orchestration/state.py` 与 `desktop_graph.py` 读 `os.environ`）。
+- `DESKTOP_MAX_ITERATIONS=30`（`src/orchestration/desktop_supervisor.py`）：Supervisor 规划轮次硬上限。命中时不调 LLM，以机读 `failure_reason=max_iterations_exceeded` 经 error_report 收口（FAILED + 现场包），与 LLM 判定失败/停滞失败可区分。默认 30 为工程假设；一轮 ≈ supervisor+worker+stall 三个超步，**调用方 `recursion_limit` 须 ≥ 3×上限+裕量**，否则 LangGraph 的 `GraphRecursionError` 会先于本上限触发、拿不到可区分的失败收口。
 - **`CONTEXT_STEP_WINDOW` 未接线**：值写死在 `src/orchestration/prompt_loader.py`（该模块不 import os），在 `.env` 里设它无效；唯一可调路径是 `PromptLoader(step_window=...)` 入参。
 
 ### 安全门 TOCTOU 与锚点验证

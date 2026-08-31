@@ -32,6 +32,7 @@ from src.orchestration.desktop_graph import (
     get_graph,
     make_error_report_node,
 )
+from src.orchestration.desktop_supervisor import MAX_ITERATIONS_EXCEEDED
 from src.orchestration.protocols import IncidentReporter, NoopIncidentReporter
 from src.orchestration.safety.incident_reporter import FileIncidentReporter
 from src.orchestration.state import DesktopTaskState, StepRecord, TaskStatus
@@ -364,13 +365,13 @@ class TestErrorReportNodeRecentSteps:
             task_id="task-max-iter",
             task_description="硬上限现场包测试",
             task_status=TaskStatus.RUNNING,
-            failure_reason="max_iterations_exceeded",
+            failure_reason=MAX_ITERATIONS_EXCEEDED,
             iteration_count=31,
         )
         await node(state)
 
         metadata = reporter.report.await_args.kwargs["metadata"]
-        assert metadata["failure_reason"] == "max_iterations_exceeded"
+        assert metadata["failure_reason"] == MAX_ITERATIONS_EXCEEDED
         assert metadata["iteration_count"] == 31
 
     async def test_recent_steps_perception_summary_truncated(self) -> None:
