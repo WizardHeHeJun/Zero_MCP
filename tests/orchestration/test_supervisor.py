@@ -664,3 +664,95 @@ async def test_step_archive_stub_no_op() -> None:
     steps = [_make_step(0), _make_step(1)]
     # 不应抛任何异常
     await archive.archive(task_id="t1", steps=steps)
+
+
+# ── 10. 主备模型单次切换（K3 紧后 §2.2）───────────────────────────────────────
+
+
+def _make_failing_then_ok_llm(fail_times: int = 1) -> MagicMock:
+    """构造前 fail_times 次调用抛异常、之后成功的 mock LLM client。"""
+    llm = MagicMock()
+    llm.messages = MagicMock()
+    ok_response = _make_llm_response()
+    effects: list[object] = [RuntimeError(f"模拟主模型异常 #{i}") for i in range(fail_times)]
+    effects.append(ok_response)
+    llm.messages.create = AsyncMock(side_effect=effects)
+    return llm
+
+
+async def test_plan_primary_ok_fallback_not_used() -> None:
+    """主模型成功时不碰备用：恰一次调用且用主模型 ID。"""
+    llm = _make_mock_llm()
+    agent = DesktopSupervisorAgent(llm_client=llm, fallback_model="backup-model")
+    state = _make_state()
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await agent.plan(state)
+
+    assert result["task_status"] == "RUNNING"
+    assert llm.messages.create.call_count == 1
+    assert llm.messages.create.call_args.kwargs["model"] == agent.model
+
+
+async def test_plan_primary_fails_fallback_succeeds() -> None:
+    """主模型异常 + 配了备用 → 切备用重试一次成功，返回正常 plan。"""
+    llm = _make_failing_then_ok_llm(fail_times=1)
+    agent = DesktopSupervisorAgent(llm_client=llm, fallback_model="backup-model")
+    state = _make_state()
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await agent.plan(state)
+
+    assert result["task_status"] == "RUNNING", "备用成功应返回正常 plan 而非 FAILED"
+    assert llm.messages.create.call_count == 2
+    models = [c.kwargs["model"] for c in llm.messages.create.call_args_list]
+    assert models == [agent.model, "backup-model"], f"调用模型序列应为主→备，实际 {models}"
+
+
+async def test_plan_both_models_fail_returns_failed() -> None:
+    """主备均异常 → FAILED，恰两次调用（单次切换不递归）。"""
+    llm = _make_failing_then_ok_llm(fail_times=2)
+    agent = DesktopSupervisorAgent(llm_client=llm, fallback_model="backup-model")
+    state = _make_state()
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await agent.plan(state)
+
+    assert result["task_status"] == TaskStatus.FAILED
+    assert result["next_agent"] == "error_report"
+    assert "主备均败" in result["current_instruction"]
+    assert llm.messages.create.call_count == 2, "备用失败后不得再回退主模型（防互踢死循环）"
+
+
+async def test_plan_primary_fails_no_fallback_zero_regression() -> None:
+    """零回归：未配备用时主模型异常即 FAILED，恰一次调用（现状行为）。"""
+    llm = _make_failing_then_ok_llm(fail_times=1)
+    agent = DesktopSupervisorAgent(llm_client=llm)  # 不传 fallback_model
+    agent.fallback_model = None  # 隔离宿主环境可能设置的 env 备用值
+    state = _make_state()
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await agent.plan(state)
+
+    assert result["task_status"] == TaskStatus.FAILED
+    assert llm.messages.create.call_count == 1
+
+
+async def test_plan_parse_failure_does_not_trigger_fallback() -> None:
+    """判别负对照：主模型调用成功但返回不可解析文本 → 不切备用（解析失败
+    与模型可用性无关），FAILED 且恰一次调用。"""
+    llm = MagicMock()
+    llm.messages = MagicMock()
+    bad_response = MagicMock()
+    bad_block = MagicMock()
+    bad_block.text = "not json at all"
+    bad_response.content = [bad_block]
+    llm.messages.create = AsyncMock(return_value=bad_response)
+    agent = DesktopSupervisorAgent(llm_client=llm, fallback_model="backup-model")
+    state = _make_state()
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await agent.plan(state)
+
+    assert result["task_status"] == TaskStatus.FAILED
+    assert llm.messages.create.call_count == 1, "解析失败不得触发备用切换"
