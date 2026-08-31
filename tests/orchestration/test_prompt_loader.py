@@ -28,7 +28,6 @@ from src.orchestration.prompt_loader import (
     _serialize_snapshot_compact,
     _truncate_perception_summary,
     _truncate_step_window,
-    build_grounding_table,
     derive_last_step_outcome,
 )
 from src.orchestration.state import DesktopTaskState, StepRecord, TaskStatus
@@ -541,32 +540,38 @@ class TestSerializeSnapshotCompact:
         assert any("截断" in r.message for r in caplog.records)
 
 
-class TestBuildGroundingTable:
-    """`build_grounding_table` 与渲染文本一致性测试。"""
+class TestRenderReturnedGroundingTable:
+    """render_action_generation 随渲染返回的 grounding 表（PR #29 BLOCK 收口：
+    表与渲染文本同一次构建，`build_grounding_table` 公开入口已删除）。"""
 
-    def test_table_matches_rendered_ids(self) -> None:
+    def test_table_matches_rendered_ids(self, loader: PromptLoader) -> None:
         snapshot = _make_snapshot(
             uia_elements=[_make_uia_element()],
             text_blocks=[_make_text_block()],
         )
-        table = build_grounding_table(snapshot)
+        _, user, table = loader.render_action_generation(_make_state(), snapshot)
         assert set(table.keys()) == {"uia:0", "ocr:0"}
         assert table["uia:0"].x == 100
         assert table["ocr:0"].x == 10
+        for compact_id in table:
+            assert f'id="{compact_id}"' in user, "表中 id 必须出现在渲染文本里"
 
-    def test_truncated_elements_absent_from_table(self) -> None:
-        """截断口径与渲染文本一致：被丢弃的元素不进查找表（LLM 只能引用它
-        实际看到的 id，核验才有意义）。"""
+    def test_truncated_elements_absent_from_table_and_text(self) -> None:
+        """截断口径与渲染文本一致：被丢弃的元素**同时**不进文本与查找表——
+        这正是 BLOCK 场景的防线（LLM 只能引用它实际看到的 id）。"""
+        small_loader = PromptLoader(summary_max_chars=200)
         elements = [_make_uia_element(name=f"元素{i}") for i in range(50)]
         snapshot = _make_snapshot(uia_elements=elements)
 
-        table = build_grounding_table(snapshot, max_chars=200)
+        _, user, table = small_loader.render_action_generation(_make_state(), snapshot)
 
         assert "uia:0" in table
         assert "uia:49" not in table
+        assert 'id="uia:49"' not in user
 
-    def test_empty_snapshot_returns_empty_table(self) -> None:
-        assert build_grounding_table(_make_snapshot()) == {}
+    def test_empty_snapshot_returns_empty_table(self, loader: PromptLoader) -> None:
+        _, _, table = loader.render_action_generation(_make_state(), _make_snapshot())
+        assert table == {}
 
 
 class TestRenderActionGeneration:
@@ -577,7 +582,7 @@ class TestRenderActionGeneration:
         state = state.model_copy(update={"current_instruction": "点击确定按钮"})
         snapshot = _make_snapshot(uia_elements=[_make_uia_element()])
 
-        system, user = loader.render_action_generation(state, snapshot)
+        system, user, _ = loader.render_action_generation(state, snapshot)
 
         assert isinstance(system, str) and len(system) > 0
         assert isinstance(user, str) and len(user) > 0
@@ -587,7 +592,7 @@ class TestRenderActionGeneration:
         state = _make_state()
         snapshot = _make_snapshot(uia_elements=[_make_uia_element(name="确定")])
 
-        _, user = loader.render_action_generation(state, snapshot)
+        _, user, _ = loader.render_action_generation(state, snapshot)
 
         assert 'id="uia:0"' in user
         assert "确定" in user
@@ -596,7 +601,7 @@ class TestRenderActionGeneration:
         state = _make_state()
         snapshot = _make_snapshot()
 
-        _, user = loader.render_action_generation(state, snapshot)
+        _, user, _ = loader.render_action_generation(state, snapshot)
 
         assert "未提取到任何可定位元素" in user
 
@@ -604,7 +609,7 @@ class TestRenderActionGeneration:
         state = _make_state(uia_hollow=True)
         snapshot = _make_snapshot(uia_elements=[_make_uia_element()], uia_hollow=True)
 
-        _, user = loader.render_action_generation(state, snapshot)
+        _, user, _ = loader.render_action_generation(state, snapshot)
 
         assert "UIA 空洞" in user
         assert "不要引用 `target_element_id`" in user
@@ -613,7 +618,7 @@ class TestRenderActionGeneration:
         state = _make_state(uia_hollow=False)
         snapshot = _make_snapshot(uia_elements=[_make_uia_element()], uia_hollow=False)
 
-        _, user = loader.render_action_generation(state, snapshot)
+        _, user, _ = loader.render_action_generation(state, snapshot)
 
         assert "UIA 空洞" not in user
 
@@ -622,7 +627,7 @@ class TestRenderActionGeneration:
         state = _make_state(step_history=[bad])
         snapshot = _make_snapshot()
 
-        _, user = loader.render_action_generation(state, snapshot)
+        _, user, _ = loader.render_action_generation(state, snapshot)
 
         assert "上一步执行**失败**" in user
         assert "请勿原样重试同一动作" in user

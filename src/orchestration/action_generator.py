@@ -18,9 +18,11 @@ Checkpointer 持久化后重放读同一值，不受 LLM 非确定性影响）�
 `llm_fallback.call_with_single_fallback`（同 Supervisor 语义）。
 
 grounding 解析（蓝图决策 C）：LLM 只能引用 prompt 中列出的紧凑 id
-（`target_element_id`），服务端按 `prompt_loader.build_grounding_table` 查
-bbox 中心覆写坐标——不信 LLM 自报坐标防像素幻觉；`uia_hollow` 场景 LLM 只给
-`coordinate` 时沿用（OCR 兜底通道，不覆写）。
+（`target_element_id`），服务端按 `render_action_generation` 随渲染**同一次
+构建**返回的查找表查 bbox 中心覆写坐标——不信 LLM 自报坐标防像素幻觉；
+`uia_hollow` 场景 LLM 只给 `coordinate` 时沿用（OCR 兜底通道，不覆写）。
+查找表不得在消费侧重建（PR #29 审查 BLOCK：重建预算与渲染预算脱钩时，
+LLM 可引用它没看到的 id 被放行）。
 
 失败处理（蓝图决策 D）：单条丢弃 + 结构化记录进下一轮 planner，不建 JSON
 自修复循环。失败复用 `control_error` 字段 + 机读令牌
@@ -58,11 +60,7 @@ from src.orchestration.desktop_supervisor import (
     DESKTOP_SUPERVISOR_MODEL_FALLBACK,
 )
 from src.orchestration.llm_fallback import LLMFallbackError, call_with_single_fallback
-from src.orchestration.prompt_loader import (
-    PERCEPTION_SUMMARY_MAX_TOKENS,
-    PromptLoader,
-    build_grounding_table,
-)
+from src.orchestration.prompt_loader import PromptLoader
 from src.orchestration.protocols import SnapshotStore
 from src.orchestration.state import DesktopTaskState
 
@@ -144,14 +142,19 @@ def _extract_tool_use(response: Any) -> Any | None:
 
 
 class ActionPromptLoader(Protocol):
-    """ActionGeneratorAgent 提示词加载接口（结构子类型，真实现=PromptLoader）。"""
+    """ActionGeneratorAgent 提示词加载接口（结构子类型，真实现=PromptLoader）。
+
+    grounding 表随渲染结果一并返回（PR #29 审查 BLOCK 收口）：表与 prompt 里
+    的元素文本必须出自**同一次构建**——消费方不得按自己的预算重建，否则
+    LLM 可引用它没看到的 id 被放行（坐标级安全缺口）。
+    """
 
     def render_action_generation(
         self,
         state: DesktopTaskState,
         snapshot: ScreenSnapshot,
-    ) -> tuple[str, str]:
-        """渲染 ActionGenerator 提示词（system + user）。"""
+    ) -> tuple[str, str, dict[str, BBox]]:
+        """渲染 ActionGenerator 提示词，返回 (system, user, grounding_table)。"""
         ...
 
 
@@ -236,7 +239,9 @@ class ActionGeneratorAgent:
         except Exception as exc:
             return self._fail(state, f"快照加载失败: {exc}")
 
-        system_prompt, user_prompt = self.prompt_loader.render_action_generation(state, snapshot)
+        system_prompt, user_prompt, grounding_table = self.prompt_loader.render_action_generation(
+            state, snapshot
+        )
 
         try:
             response = await call_with_single_fallback(
@@ -260,8 +265,9 @@ class ActionGeneratorAgent:
         except ValidationError as exc:
             return self._fail(state, f"工具输入校验失败: {exc}")
 
-        # id 存在性核验 + 服务端坐标解析（蓝图决策 C：不信 LLM 自报坐标）
-        grounding_error = self._resolve_grounding(parsed, snapshot)
+        # id 存在性核验 + 服务端坐标解析（蓝图决策 C：不信 LLM 自报坐标）。
+        # 查找表来自 render 的同一次构建——与 LLM 实际看到的元素集合严格一致
+        grounding_error = self._resolve_grounding(parsed, grounding_table)
         if grounding_error is not None:
             return self._fail(state, grounding_error)
 
@@ -287,7 +293,7 @@ class ActionGeneratorAgent:
     def _resolve_grounding(
         self,
         parsed: ActionGenerationBase,
-        snapshot: ScreenSnapshot,
+        grounding_table: dict[str, BBox],
     ) -> str | None:
         """核验 target_element_id 存在性，并用 bbox 中心覆写坐标（蓝图决策 C）。
 
@@ -297,7 +303,9 @@ class ActionGeneratorAgent:
 
         Args:
             parsed: 已通过 pydantic 校验的生成子模型实例（就地修改 .coordinate）。
-            snapshot: 本轮感知快照（与渲染 prompt 用的是同一份，保证 id 表一致）。
+            grounding_table: `render_action_generation` 随渲染**同一次构建**返回
+                的 compact_id -> BBox 查找表（PR #29 审查 BLOCK 收口：不得在此
+                重建——重建预算与渲染预算脱钩时，LLM 可引用它没看到的 id）。
 
         Returns:
             None=通过（或不适用）；否则为失败原因文本。
@@ -306,9 +314,6 @@ class ActionGeneratorAgent:
             return None
 
         if parsed.target_element_id is not None:
-            grounding_table: dict[str, BBox] = build_grounding_table(
-                snapshot, PERCEPTION_SUMMARY_MAX_TOKENS
-            )
             bbox = grounding_table.get(parsed.target_element_id)
             if bbox is None:
                 return (

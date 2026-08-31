@@ -231,28 +231,6 @@ def _serialize_snapshot_compact(
     return "\n".join(lines)
 
 
-def build_grounding_table(
-    snapshot: ScreenSnapshot,
-    max_chars: int = PERCEPTION_SUMMARY_MAX_TOKENS,
-) -> dict[str, BBox]:
-    """构造 compact_id -> BBox 查找表，供 ActionGeneratorAgent 做 id 存在性核验
-    与服务端坐标解析（蓝图决策 C：LLM 只给 id，坐标由服务端查表得出）。
-
-    与 `_serialize_snapshot_compact` 共用同一截断逻辑（`_build_grounding_lines`），
-    保证查找表与实际注入 prompt 的元素集合严格一致。
-
-    Args:
-        snapshot: 完整感知快照（须与本次 render_action_generation 用的是同一份，
-            否则查找表与 LLM 实际看到的元素集合不一致）。
-        max_chars: 渲染文本字符数预算，须与 render_action_generation 使用的一致。
-
-    Returns:
-        compact_id -> BBox 查找表。
-    """
-    _, table = _build_grounding_lines(snapshot, max_chars)
-    return table
-
-
 def derive_last_step_outcome(
     step_history: list[StepRecord],
 ) -> Literal["initial", "succeeded", "failed"]:
@@ -410,12 +388,17 @@ class PromptLoader:
         self,
         state: DesktopTaskState,
         snapshot: ScreenSnapshot,
-    ) -> tuple[str, str]:
-        """渲染 ActionGeneratorAgent 的 system + user 提示词（蓝图任务 7）。
+    ) -> tuple[str, str, dict[str, BBox]]:
+        """渲染 ActionGeneratorAgent 的 system + user 提示词 + grounding 查找表。
 
         与 `render_supervisor` 的区别：不含任务分解/路由上下文，只含「翻译当前
         指令为一次动作调用」所需的最小上下文——当前指令、上一步结果三态、
-        错误原文、三类感知元素合并后的紧凑 id 查找表（`_serialize_snapshot_compact`）。
+        错误原文、三类感知元素合并后的紧凑 id 表。
+
+        **grounding 表与渲染文本同一次构建**（PR #29 审查 BLOCK 收口）：查找表
+        随渲染结果一并返回，消费方（ActionGeneratorAgent）不得自行重建——两次
+        独立构建若预算不一致，LLM 可引用它没看到的 id 被放行（坐标级安全缺口，
+        审查已实证）。原 `build_grounding_table` 公开入口因此删除。
 
         Args:
             state: 当前 DesktopTaskState（取 current_instruction / step_history /
@@ -424,13 +407,16 @@ class PromptLoader:
                 由调用方经 SnapshotStore 加载后传入——本方法不做快照加载 I/O）。
 
         Returns:
-            (system_prompt, user_prompt) 两个非空字符串。
+            (system_prompt, user_prompt, grounding_table)：前两者为非空字符串，
+            grounding_table 是与 user_prompt 中元素表**严格一致**的
+            compact_id -> BBox 查找表。
             模板语法错误会向上抛出 jinja2.TemplateError（由调用方决定如何降级）。
         """
-        grounding_table_text: str = _serialize_snapshot_compact(
+        grounding_lines, grounding_table = _build_grounding_lines(
             snapshot,
             self.summary_max_chars,
         )
+        grounding_table_text: str = "\n".join(grounding_lines)
 
         user_vars: dict[str, object] = {
             "current_instruction": state.current_instruction,
@@ -451,10 +437,11 @@ class PromptLoader:
 
         logger.debug(
             "PromptLoader.render_action_generation: system=%d chars, user=%d chars, "
-            "grounding_table=%d chars",
+            "grounding_table=%d chars / %d entries",
             len(system_prompt),
             len(user_prompt),
             len(grounding_table_text),
+            len(grounding_table),
         )
 
-        return system_prompt, user_prompt
+        return system_prompt, user_prompt, grounding_table

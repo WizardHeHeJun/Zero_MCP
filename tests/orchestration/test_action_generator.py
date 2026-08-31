@@ -529,3 +529,71 @@ async def test_make_generate_action_node_returns_dict(monkeypatch: pytest.Monkey
 
     assert isinstance(result, dict)
     assert "pending_action" in result
+
+
+# ── PR #29 审查 BLOCK 回归：grounding 表与渲染同一次构建 ─────────────────────
+
+
+class TestGroundingTableBudgetCoupling:
+    """审查实证的坐标级安全场景：注入小预算 loader（prompt 只展示部分元素），
+    LLM 引用未展示的 id——修复前（消费侧按模块常量大预算重建表）会被放行并
+    产出真实坐标；修复后（表随渲染同一次构建返回）必须拒绝并带失败令牌。"""
+
+    async def test_llm_reference_to_unrendered_id_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        # 30 个元素 + 200 字符预算：渲染表只装得下前两三个，uia:10 不在其中
+        elements = [_make_uia_element() for _ in range(30)]
+        snapshot = _make_snapshot(uia_elements=elements)
+        llm = _make_mock_llm(
+            _make_tool_use_response(
+                "click",
+                {
+                    "reasoning": "点一个没见过的元素",
+                    "risk_level": "low_risk",
+                    "target_element_id": "uia:10",
+                },
+            )
+        )
+        agent = ActionGeneratorAgent(
+            llm_client=llm,
+            prompt_loader=PromptLoader(summary_max_chars=200),
+            snapshot_store=_FakeSnapshotStore(snapshot=snapshot),
+        )
+
+        result = await agent.generate(_make_state())
+
+        assert result["pending_action"] is None, (
+            "LLM 引用 prompt 未展示的 id 必须被拒绝——放行即坐标级安全缺口"
+        )
+        assert ACTION_GENERATION_FAILED_TOKEN in (result["control_error"] or "")
+
+    async def test_rendered_id_still_resolves_under_small_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """正对照：同一小预算下，引用表内 id（uia:0）仍正常解析出 bbox 中心。"""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        elements = [_make_uia_element() for _ in range(30)]
+        snapshot = _make_snapshot(uia_elements=elements)
+        llm = _make_mock_llm(
+            _make_tool_use_response(
+                "click",
+                {
+                    "reasoning": "点第一个元素",
+                    "risk_level": "low_risk",
+                    "target_element_id": "uia:0",
+                },
+            )
+        )
+        agent = ActionGeneratorAgent(
+            llm_client=llm,
+            prompt_loader=PromptLoader(summary_max_chars=200),
+            snapshot_store=_FakeSnapshotStore(snapshot=snapshot),
+        )
+
+        result = await agent.generate(_make_state())
+
+        spec = result["pending_action"]
+        assert spec is not None
+        assert spec.coordinates == (140, 220), "bbox(100,200,80,40) 中心应为 (140,220)"
