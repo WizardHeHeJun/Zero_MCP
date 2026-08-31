@@ -418,15 +418,14 @@ class HrvChannel:
     对 RMSSD 提取质量的影响不受 v3 改动波及，结论沿用）：{15,30,60}s 下同一 stress 段
     μa 的逐被试极差中位 **0.0156**，暖机后 None 率三档均为 0.00%。主用 60s、建议下界 30s。
 
-    验收数字来自 `evals/wesad_hrv_v3_ln_calibration.py::final_verification`（在 WESAD 真被试
-    S2–S6 全会话缓存 RMSSD 序列上跑本类同款公式的离线参考实现，60s 窗 / 700Hz 胸带 ECG）：
-    判别力 4/5（v2 同为 4/5）PASS · G-Drift 中位 0.106（门 <0.5）PASS · 跨采样率极差中位
-    0.0064（门 <0.15）PASS · 方向性中位 Δ=+0.146>0（n=5 单侧 Wilcoxon p=0.0625，n=15
-    p=0.0062）· 冷启动 300s · None 4.7%（不劣于 v2）· **跨被试静息 μa 极差 0.075（v2 0.293）**
-    ← 本改造的目标函数 · stress 撞 |μa|=1 全被试 0.0%（v2 最差被试 9.1%）。⚠ 上述数字由离线
-    参考实现产出，其算法与本类 ``_process`` 逐行同构、经单测 `TestHrvDeltaSemantics` 等按
-    mock RMSSD 精确数值比对确认一致；`evals/wesad_hrv_v3_acceptance_gates.py`（对接**本类
-    真实例**，全流程重新跑真 ``nk.ecg_process``）作独立确认，跑批耗时较长，结论应与此一致。
+    验收（`evals/wesad_hrv_v3_acceptance_gates.py`，**对接本类真实例**的 WESAD 全会话流式
+    回放，60s 窗 / 700Hz 胸带 ECG / S2–S6；数字与 `wesad_hrv_v3_ln_calibration.py` 的离线
+    参考实现逐位一致，交叉确认两者未分叉）：判别力 4/5（v2 同为 4/5）PASS · G-Drift 中位
+    0.106（门 <0.5）PASS · G1' 跨采样率极差中位 0.0064（门 <0.15）PASS · G-Sign 方向性
+    中位 Δ=+0.146>0（单侧 Wilcoxon p=0.0625，n=5 功效低仅作报告项）PASS · 冷启动 300s ·
+    None 4.7%（不劣于 v2）PASS · 撞界%stress 中位 0.0%（约束 ≤5%）PASS ·
+    **跨被试静息 μa 极差 0.075（v2 0.293）** ← 本改造的目标函数 · stress 撞 |μa|=1 全被试
+    0.0%（v2 最差被试 9.1%）。
 
     ⚠ **已知限制（覆盖面很小，报告时勿放大）**：n=5 标定 / n=15 σ 交叉核验，单数据集
     （WESAD）、单设备通路（RespiBAN 胸带 ECG，坐姿实验室）。**腕带 BVP/PPG 完全未测**
