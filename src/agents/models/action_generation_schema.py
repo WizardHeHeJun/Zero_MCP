@@ -72,6 +72,18 @@ class ActionGenerationBase(BaseModel):
     reasoning: str
     risk_level: ActionRisk
 
+    def to_action_spec(self, action_id: str) -> ActionSpec:
+        """适配为内部执行契约 `ActionSpec`（每个子模型必须覆写）。
+
+        基类不可实例化出有意义的动作——本方法只声明契约形状供 mypy 校验
+        `ActionGeneratorAgent`（PR-β 任务 8）按基类引用调用 `to_action_spec`
+        的调用点；调用基类本身是编程错误。
+
+        Raises:
+            NotImplementedError: 恒抛出，子类必须覆写。
+        """
+        raise NotImplementedError
+
 
 class ClickActionInput(ActionGenerationBase):
     """点击动作。定位二选一：`target_element_id`（主通道）或 `coordinate`（OCR 兜底）。"""

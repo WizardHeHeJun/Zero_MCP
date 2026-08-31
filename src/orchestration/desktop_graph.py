@@ -1,23 +1,30 @@
-"""桌面任务执行图（Task 10BC）。
+"""桌面任务执行图（Task 10BC + ActionSpec 生成层蓝图 PR-β 任务 9）。
 
-图连线（R3 决策，per 蓝图主研批注）：
+图连线（R3 决策 + 蓝图决策 A/G）：
     START → supervisor
-    supervisor →route_after_supervisor→ perceive | control | playwright
+    supervisor →route_after_supervisor→ perceive | generate_action | playwright
                                         | memory_flush | error_report
     perceive → stall_detect            ← R3：感知失败也经统一停滞节点
+    generate_action →route_after_generate_action→ control | stall_detect
+                                        ← 蓝图决策 A：生成层独立节点，永远在
+                                          control 之前落 pending_action（interrupt
+                                          节点整体重放铁律），生成失败复用
+                                          stall_detect 通路（蓝图决策 D）
     control →route_after_control→ stall_detect | supervisor
     stall_detect →route_after_stall→ supervisor | error_report
     error_report → memory_flush
     memory_flush → END
 
 节点：
-    supervisor_node  — 调 DesktopSupervisorAgent.plan，无业务路由判断。
-    perceive_node    — 调 ScreenPerceptionAgent.perceive，返回感知增量。
-    control_node     — 调 DesktopControlAgent.execute，含 interrupt/resume 分区。
-    stall_detect_node— 三信号停滞检测（phash 不变 / 步骤重复 / 错误指纹去重计数），
-                       无信号轮 stall_count 归零（K5 连续语义）。
-    error_report_node— 记录错误 + incident_reporter 打桩，设 FAILED。
-    memory_flush_node— 唯一记忆写入点，scope=session 显式，经 MemoryAPI Protocol。
+    supervisor_node      — 调 DesktopSupervisorAgent.plan，无业务路由判断。
+    perceive_node        — 调 ScreenPerceptionAgent.perceive，返回感知增量。
+    generate_action_node — 调 ActionGeneratorAgent.generate，把 current_instruction
+                            翻译为恰好一个 ActionSpec 写入 pending_action（蓝图任务 8）。
+    control_node         — 调 DesktopControlAgent.execute，含 interrupt/resume 分区。
+    stall_detect_node    — 三信号停滞检测（phash 不变 / 步骤重复 / 错误指纹去重计数），
+                           无信号轮 stall_count 归零（K5 连续语义）。
+    error_report_node    — 记录错误 + incident_reporter 打桩，设 FAILED。
+    memory_flush_node    — 唯一记忆写入点，scope=session 显式，经 MemoryAPI Protocol。
 
 Protocols（在 src/orchestration/protocols.py）：
     MemoryAPI / SnapshotStore / IncidentReporter
@@ -51,6 +58,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.desktop_control_agent import DesktopControlAgent, make_control_node
 from src.agents.screen_perception_agent import ScreenPerceptionAgent, make_perceive_node
 from src.mcp.desktop_mcp_client import DesktopMCPClient
+from src.orchestration.action_generator import ActionGeneratorAgent, make_generate_action_node
 from src.orchestration.desktop_supervisor import DesktopSupervisorAgent, make_supervisor_node
 from src.orchestration.phash import average_hash_from_bytes as _compute_average_hash
 from src.orchestration.phash import hamming_bits as _hamming_distance
@@ -147,7 +155,7 @@ def is_browser_task(instruction: str) -> bool:
 
 def route_after_supervisor(
     state: DesktopTaskState,
-) -> Literal["perceive", "control", "playwright", "memory_flush", "error_report"]:
+) -> Literal["perceive", "generate_action", "playwright", "memory_flush", "error_report"]:
     """Supervisor 节点后的路由函数。
 
     优先级（从高到低）：
@@ -156,7 +164,11 @@ def route_after_supervisor(
          max_iterations_exceeded——K4 紧后 §3.3 回路硬上限）
       3. stall_count >= STALL_THRESHOLD → error_report（停滞超阈值）
       4. next_agent == "perceive" → perceive
-      5. next_agent == "control" → control
+      5. next_agent == "control" → generate_action（蓝图决策 A/G：Supervisor
+         仍输出语义上的 "control"——它判定「需要控制 Worker 执行」，实际路由
+         先经 generate_action 把当前指令翻译为具体 ActionSpec，再由
+         route_after_generate_action 转交 control；pending_action 此前无
+         生产者，此路径本就退化态，改路由是必须的既有语义变更，非新增分叉）
       6. is_browser_task(current_instruction) → playwright
       7. 默认 → error_report（未识别的 next_agent）
 
@@ -203,7 +215,7 @@ def route_after_supervisor(
     if next_agent == "perceive":
         return "perceive"
     if next_agent == "control":
-        return "control"
+        return "generate_action"
 
     # 规则 6：浏览器任务 → playwright
     if is_browser_task(instruction):
@@ -216,6 +228,28 @@ def route_after_supervisor(
         next_agent,
     )
     return "error_report"
+
+
+def route_after_generate_action(
+    state: DesktopTaskState,
+) -> Literal["control", "stall_detect"]:
+    """generate_action_node 后的路由函数（蓝图任务 9）。
+
+    - pending_action 非 None（生成成功）→ control（执行刚生成的动作）。
+    - pending_action 为 None（生成失败，`ActionGeneratorAgent._fail` 已清空）
+      → stall_detect（复用既有停滞通路，蓝图决策 D：单条丢弃 + 结构化记录进
+      下一轮 planner，不建 JSON 自修复循环）。
+
+    Args:
+        state: 当前 DesktopTaskState。
+
+    Returns:
+        目标节点名（Literal 类型）。
+    """
+    if state.pending_action is not None:
+        return "control"
+    logger.debug("route_after_generate_action: pending_action=None → stall_detect")
+    return "stall_detect"
 
 
 def route_after_control(
@@ -665,6 +699,7 @@ def get_graph(
     client: DesktopMCPClient | None = None,
     supervisor_agent: DesktopSupervisorAgent | None = None,
     perception_agent: ScreenPerceptionAgent | None = None,
+    action_generator_agent: ActionGeneratorAgent | None = None,
     control_agent: DesktopControlAgent | None = None,
     memory_api: MemoryAPI | None = None,
     incident_reporter: IncidentReporter | None = None,
@@ -677,10 +712,11 @@ def get_graph(
     默认使用 InMemorySaver（测试用，免装 Postgres）。
     生产环境由 eng-team 注入 AsyncPostgresSaver（独立包，首用需 .setup()）。
 
-    图连线（R3 决策）：
+    图连线（R3 决策 + 蓝图决策 A/G，见模块 docstring）：
         START → supervisor
-        supervisor → perceive | control | playwright | memory_flush | error_report
+        supervisor → perceive | generate_action | playwright | memory_flush | error_report
         perceive → stall_detect
+        generate_action → control | stall_detect
         control → stall_detect | supervisor
         stall_detect → supervisor | error_report
         error_report → memory_flush
@@ -701,6 +737,10 @@ def get_graph(
         perception_agent: ScreenPerceptionAgent 实例；None 且 client 非 None 时自动创建，
                 并与 stall/incident 共用同一 snapshot_store（K3 ①：store 分裂会让
                 信号 A 加载不到 perceive 存的快照而静默失效）。
+        action_generator_agent: ActionGeneratorAgent 实例（蓝图任务 8/9）；None 时
+                创建默认实例——复用 supervisor_agent.llm_client（同一 anthropic
+                客户端探测结果，不重复实例化）、真 PromptLoader、与 stall/perceive
+                共用同一 snapshot_store（供 grounding 解析加载快照）。
         control_agent: DesktopControlAgent 实例；None 且 client 非 None 时自动创建。
         memory_api: MemoryAPI 实现；None 时使用 NoopMemoryAPI 打桩。
         incident_reporter: IncidentReporter 实现；None 时看 env INCIDENT_DIR——
@@ -744,6 +784,16 @@ def get_graph(
             step_archive=step_archive or StepArchive(),
         )
 
+    # 自动创建 ActionGeneratorAgent（蓝图任务 8/9）：复用 supervisor_agent 已探测
+    # 好的 llm_client 实例（同一 anthropic 客户端或 None，不重复探测/实例化）、
+    # 真 PromptLoader、与 perceive/stall 共用同一 snapshot_store。
+    if action_generator_agent is None:
+        action_generator_agent = ActionGeneratorAgent(
+            llm_client=supervisor_agent.llm_client,
+            prompt_loader=PromptLoader(),
+            snapshot_store=snapshot_store,
+        )
+
     # 自动创建 PerceptionAgent（需要 client）
     if perception_agent is None and client is not None:
         # K3 ①：与 stall/incident 共用同一 snapshot_store——agent 私有 InMemory
@@ -782,6 +832,8 @@ def get_graph(
             logger.warning("control_node: ControlAgent 未注入")
             return {"control_error": "ControlAgent 未注入"}
 
+    gen_action_node = make_generate_action_node(action_generator_agent)
+
     stall_node = make_stall_detect_node(snapshot_store=snapshot_store)
     err_node = make_error_report_node(
         incident_reporter=_resolve_incident_reporter(incident_reporter, snapshot_store)
@@ -797,13 +849,14 @@ def get_graph(
     # 注册节点
     builder.add_node("supervisor", sup_node)
     builder.add_node("perceive", perceive_node)
+    builder.add_node("generate_action", gen_action_node)
     builder.add_node("control", ctrl_node)
     builder.add_node("stall_detect", stall_node)
     builder.add_node("error_report", err_node)
     builder.add_node("memory_flush", mem_node)
     builder.add_node("playwright", _playwright_placeholder_node)
 
-    # 图连线（R3 决策）
+    # 图连线（R3 决策 + 蓝图决策 A/G）
     builder.add_edge(START, "supervisor")
 
     builder.add_conditional_edges(
@@ -811,7 +864,7 @@ def get_graph(
         route_after_supervisor,
         {
             "perceive": "perceive",
-            "control": "control",
+            "generate_action": "generate_action",
             "playwright": "playwright",
             "memory_flush": "memory_flush",
             "error_report": "error_report",
@@ -820,6 +873,16 @@ def get_graph(
 
     # perceive → stall_detect（R3：感知失败也经统一停滞节点）
     builder.add_edge("perceive", "stall_detect")
+
+    # generate_action → control | stall_detect（蓝图任务 9：生成失败复用停滞通路）
+    builder.add_conditional_edges(
+        "generate_action",
+        route_after_generate_action,
+        {
+            "control": "control",
+            "stall_detect": "stall_detect",
+        },
+    )
 
     builder.add_conditional_edges(
         "control",

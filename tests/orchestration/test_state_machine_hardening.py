@@ -111,6 +111,27 @@ def _make_mock_guard(
     return guard
 
 
+def _make_passthrough_action_generator() -> MagicMock:
+    """构造回显 state.pending_action 的桩 ActionGeneratorAgent（同集成测试先例）。
+
+    ActionSpec 生成层蓝图 PR-β 任务 9：route_after_supervisor 的 "control"
+    现在先经 generate_action 节点。本用例测的是拒绝后终态状态机（K5），不是
+    生成层，注入原样回显桩保留既有直构 pending_action 语义。
+    """
+    agent = MagicMock()
+
+    async def _generate(state: Any) -> dict[str, Any]:
+        pending = (
+            state.pending_action
+            if hasattr(state, "pending_action")
+            else state.get("pending_action")
+        )
+        return {"pending_action": pending}
+
+    agent.generate = _generate
+    return agent
+
+
 def _make_mock_memory_api() -> MagicMock:
     mock = MagicMock()
     mock.write_session_summary = AsyncMock()
@@ -287,6 +308,7 @@ class TestRejectionTerminalStateMachine:
             ),
             # perceive 在本场景不会被路由到，MagicMock 占位即可（工厂只闭包引用）
             perception_agent=MagicMock(),
+            action_generator_agent=_make_passthrough_action_generator(),
             control_agent=DesktopControlAgent(client=mock_client, guard=mock_guard),
             memory_api=mock_memory,
             checkpointer=None,

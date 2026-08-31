@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+from src.agents.models.screen_snapshot import ActionRisk, ActionSpec
 from src.orchestration.desktop_graph import (
     STALL_THRESHOLD,
     is_browser_task,
     route_after_control,
+    route_after_generate_action,
     route_after_stall,
     route_after_supervisor,
 )
@@ -80,9 +82,10 @@ class TestRouteAfterSupervisor:
         assert route_after_supervisor(state) == "perceive"
 
     def test_next_agent_control(self) -> None:
-        """next_agent="control" → control（规则 4）。"""
+        """next_agent="control" → generate_action（规则 5，蓝图决策 A/G：Supervisor
+        仍语义上要求 control Worker，实际路由先经 generate_action 生成动作）。"""
         state = _make_state(next_agent="control")
-        assert route_after_supervisor(state) == "control"
+        assert route_after_supervisor(state) == "generate_action"
 
     def test_browser_instruction_routes_to_playwright(self) -> None:
         """current_instruction 含浏览器关键词 → playwright（规则 5）。"""
@@ -166,12 +169,13 @@ class TestRouteAfterSupervisor:
         assert route_after_supervisor(state) == "perceive"
 
     def test_waiting_confirm_routes_by_next_agent(self) -> None:
-        """WAITING_CONFIRM 状态不触发终态路由（非 DONE/FAILED），按 next_agent 走。"""
+        """WAITING_CONFIRM 状态不触发终态路由（非 DONE/FAILED），按 next_agent 走
+        （next_agent="control" → generate_action，蓝图决策 A/G）。"""
         state = _make_state(
             task_status=TaskStatus.WAITING_CONFIRM,
             next_agent="control",
         )
-        assert route_after_supervisor(state) == "control"
+        assert route_after_supervisor(state) == "generate_action"
 
     def test_stalled_status_routes_by_next_agent_if_count_below(self) -> None:
         """STALLED 状态但 stall_count 未达阈时按 next_agent 路由。"""
@@ -226,6 +230,31 @@ class TestRouteAfterControl:
         # DONE 不等于 FAILED，control_error=None → supervisor
         state = _make_state(control_error=None, task_status=TaskStatus.DONE)
         assert route_after_control(state) == "supervisor"
+
+
+# ── route_after_generate_action 测试（蓝图任务 9/10）───────────────────────────
+
+
+class TestRouteAfterGenerateAction:
+    """route_after_generate_action 全分支测试。"""
+
+    def test_pending_action_present_routes_to_control(self) -> None:
+        """生成成功（pending_action 非 None）→ control。"""
+        action = ActionSpec(
+            action_id="act-gen-001",
+            action_type="click",
+            target_element_id=None,
+            coordinates=(1, 2),
+            text_payload=None,
+            risk_level=ActionRisk.LOW_RISK,
+        )
+        state = _make_state(pending_action=action)
+        assert route_after_generate_action(state) == "control"
+
+    def test_pending_action_none_routes_to_stall_detect(self) -> None:
+        """生成失败（pending_action=None）→ stall_detect（蓝图决策 D）。"""
+        state = _make_state(pending_action=None)
+        assert route_after_generate_action(state) == "stall_detect"
 
 
 # ── route_after_stall 测试 ─────────────────────────────────────────────────────
