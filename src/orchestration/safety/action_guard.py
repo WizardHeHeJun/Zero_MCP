@@ -55,8 +55,11 @@ _ACTION_RISK_WHITELIST: dict[str, ActionRisk] = {
     "move_mouse": ActionRisk.LOW_RISK,
     "scroll": ActionRisk.LOW_RISK,
     # ActionSpec 生成层 K4 元动作（notes/2026-08-31-actionspec-generation-blueprint.md
-    # 决策 B）：wait 只本地 asyncio.sleep，无 client RPC，可逆。
-    "wait": ActionRisk.LOW_RISK,
+    # 决策 B）：wait 只本地 asyncio.sleep，无 client RPC、无落点、零副作用。
+    # READ_ONLY（PR #28 审查 WARN②）：wait 语义=容忍界面过渡，若归 LOW_RISK 会
+    # 恒触发 TOCTOU 并在过渡场景被「界面已变」误杀（语义倒置），且 TOCTOU 防护
+    # 对象（hijacking 落点）不存在；READ_ONLY+无坐标使 needs_toctou 自然为 False。
+    "wait": ActionRisk.READ_ONLY,
     "click": ActionRisk.LOW_RISK,
     "type": ActionRisk.LOW_RISK,
     "key": ActionRisk.LOW_RISK,

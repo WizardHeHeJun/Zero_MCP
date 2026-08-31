@@ -10,6 +10,16 @@
 用 `GroundingCoordinate{x, y}` 对象承载坐标，只在 `to_action_spec()` 内部转回
 `ActionSpec.coordinates` 期望的 tuple——LLM 侧从不产出 tuple 形状。
 
+strict 兼容口径（2026-08-31 现场核验 Structured Outputs 官方文档，PR #28 审查
+BLOCK/WARN 的裁定依据）：
+- **Supported 含 `default` 与 optional 字段**（"default property for all
+  supported types"；required 不必覆盖全部 properties）——`action_type` 带
+  默认值合法，审查方按 OpenAI strict 口径提出的 required 完整性顾虑对
+  Anthropic 管线不成立。
+- **Not Supported 含数值约束**（minimum/maximum/multipleOf）与字符串约束
+  （minLength/maxLength）——本模块字段边界一律走 pydantic `model_validator`
+  （Python 侧校验，不进 JSON Schema），不用 `Field(ge=/le=)`。
+
 设计依据：
 - notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md §4.1（Skyvern 按
   action_type 拆模型的正例 / browser-use #3293 大 union 单模型反例）。
@@ -28,7 +38,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from src.agents.models.screen_snapshot import ActionRisk, ActionSpec
 
@@ -170,20 +180,34 @@ class WindowCloseActionInput(ActionGenerationBase):
 
 
 class WaitActionInput(ActionGenerationBase):
-    """等待动作（元动作，K4 白名单 LOW_RISK）。
+    """等待动作（元动作，K4 白名单 READ_ONLY）。
 
     `wait_ms` 边界 [100, 10000] 为**工程假设**（蓝图「工程假设清单」标注，
-    实机标定项，留待后续）。
+    实机标定项，留待后续）。边界校验走 `model_validator` 而非 `Field(ge=/le=)`
+    ——数值约束 minimum/maximum 在 strict 的 Not Supported 列表（见模块
+    docstring 的 strict 兼容口径），不得进 JSON Schema。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     action_type: Literal["wait"] = "wait"
-    wait_ms: int = Field(ge=100, le=10000)
+    wait_ms: int
+
+    @model_validator(mode="after")
+    def _check_wait_bounds(self) -> WaitActionInput:
+        if not (100 <= self.wait_ms <= 10000):
+            raise ValueError(f"wait_ms 须在 [100, 10000] 毫秒内，得到 {self.wait_ms}")
+        return self
 
     def to_action_spec(self, action_id: str) -> ActionSpec:
         """适配为内部执行契约 `ActionSpec`（拍板①：`wait_ms` 走独立可选字段，
         不复用 `text_payload` 防双重语义污染）。
+
+        `risk_level` **强制 READ_ONLY、忽略 LLM 声明值**（PR #28 审查 WARN②）：
+        wait 无落点、无副作用，TOCTOU 防护对象（notification hijacking 落点）
+        不存在；且 wait 的语义正是「容忍界面过渡」，若按声明值走 LOW_RISK 触发
+        TOCTOU，会在它最该生效的过渡场景被「界面已变」误杀——语义倒置。
+        READ_ONLY + 无坐标使 `toctou_verify` 的 needs_toctou 自然为 False。
         """
         return ActionSpec(
             action_id=action_id,
@@ -191,6 +215,6 @@ class WaitActionInput(ActionGenerationBase):
             target_element_id=None,
             coordinates=None,
             text_payload=None,
-            risk_level=self.risk_level,
+            risk_level=ActionRisk.READ_ONLY,
             wait_ms=self.wait_ms,
         )

@@ -1,15 +1,19 @@
 """action_generation_schema 单测（ActionSpec 生成层蓝图 PR-α，tasks 1+2）。
 
 覆盖：
-  1. strict tool use 兼容自查：5 个子模型 `model_json_schema()` 递归无
-     `prefixItems`、无超出 minItems∈{0,1} 的数组约束（判别性核心用例——
-     `ActionSpec.coordinates: tuple[int, int]` 若被误用会在此红）。
+  1. strict tool use 兼容自查（判别性核心，口径=2026-08-31 现场核验的官方
+     Not Supported 清单）：5 个子模型 `model_json_schema()` 递归无
+     `prefixItems`、无超出 minItems∈{0,1} 的数组约束、**无数值约束
+     minimum/maximum/multipleOf、无字符串约束 minLength/maxLength**（PR #28
+     审查后补齐——此前只扫数组类，wait_ms 的 Field(ge/le) 漏网即实证）。
+     `default`/optional 字段在官方 Supported 列表，action_type 带默认值合法。
   2. 5 类 `to_action_spec()` 字段映射（含 coordinate→tuple、window_handle→str、
-     wait_ms 透传、risk_level 透传）。
+     wait_ms 透传；risk_level 透传——wait 例外，强制 READ_ONLY 见 7）。
   3. Click/Type「target 与 coordinate 至少其一」校验。
-  4. WaitActionInput.wait_ms 边界 [100, 10000]。
-  5. `_ACTION_RISK_WHITELIST["wait"]` == LOW_RISK（task 2）。
+  4. WaitActionInput.wait_ms 边界 [100, 10000]（model_validator 实现，不进 schema）。
+  5. `_ACTION_RISK_WHITELIST["wait"]` == READ_ONLY（task 2 + PR #28 WARN②）。
   6. `ActionSpec.wait_ms` 加字段零回归：默认构造不传仍合法。
+  7. wait 的 risk_level 强制 READ_ONLY（忽略 LLM 声明，防 TOCTOU 语义倒置）。
 """
 
 from __future__ import annotations
@@ -81,6 +85,24 @@ class TestStrictToolUseSchemaCompat:
                         f"{model_cls.__name__} schema 数组节点 {key}={node[key]} "
                         "超出 strict 兼容范围 {0, 1}"
                     )
+
+    @pytest.mark.parametrize("model_cls", _GENERATION_MODELS, ids=lambda c: c.__name__)
+    def test_no_numeric_or_string_constraints(self, model_cls: type[BaseModel]) -> None:
+        """无数值/字符串约束关键字（官方 Not Supported 清单，2026-08-31 现场核验：
+        "Numerical constraints (such as minimum, maximum, multipleOf)" 与
+        "String constraints (minLength, maxLength)" 均不支持）。
+
+        判别性实证：PR #28 首版 `wait_ms: int = Field(ge=100, le=10000)` 编译出
+        minimum/maximum——本用例在该版本上必红，改为 model_validator 后转绿。
+        """
+        schema = model_cls.model_json_schema()
+        forbidden = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+                     "multipleOf", "minLength", "maxLength")
+        for node in _walk_schema_nodes(schema):
+            for key in forbidden:
+                assert key not in node, (
+                    f"{model_cls.__name__} schema 含 strict 不支持的约束 {key}: {node}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +211,17 @@ class TestWaitToActionSpec:
         assert spec.target_element_id is None
         assert spec.coordinates is None
         assert spec.text_payload is None
-        assert spec.risk_level == ActionRisk.LOW_RISK
+
+    def test_risk_level_forced_read_only_ignoring_declared(self) -> None:
+        """PR #28 WARN② 收口：wait 无落点无副作用，声明值被忽略、强制 READ_ONLY
+        ——否则 LOW_RISK 恒触发 TOCTOU，在等待过渡态场景被「界面已变」误杀。"""
+        model = WaitActionInput(
+            reasoning="LLM 高报风险",
+            risk_level=ActionRisk.DESTRUCTIVE,
+            wait_ms=500,
+        )
+        spec = model.to_action_spec("act-7b")
+        assert spec.risk_level == ActionRisk.READ_ONLY
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +268,10 @@ class TestWaitMsBounds:
 
 
 class TestWaitWhitelist:
-    def test_wait_is_low_risk_in_whitelist(self) -> None:
-        assert _ACTION_RISK_WHITELIST["wait"] == ActionRisk.LOW_RISK
+    def test_wait_is_read_only_in_whitelist(self) -> None:
+        """READ_ONLY（PR #28 WARN②）：配合适配器强制 READ_ONLY，使
+        toctou_verify 的 needs_toctou 对 wait 自然为 False。"""
+        assert _ACTION_RISK_WHITELIST["wait"] == ActionRisk.READ_ONLY
 
 
 # ---------------------------------------------------------------------------
