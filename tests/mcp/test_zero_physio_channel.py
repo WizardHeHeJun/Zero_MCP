@@ -4,7 +4,7 @@
 符合性、Hub 集成、默认关、NaN 守卫）与 **HrvChannel 的度量路径**。
 
 ⚠ **两通道的度量语义**（指标−基线 Δ、冷启动、基线历史裁剪、跨被试可比）不在本文件：
-EDA 在 `tests/mcp/test_zero_physio_eda_v2.py`、HRV 在 `tests/mcp/test_zero_physio_hrv_v2.py`。
+EDA 在 `tests/mcp/test_zero_physio_eda_v2.py`、HRV 在 `tests/mcp/test_zero_physio_hrv_v3.py`。
 本文件对二者只断言「通道级」行为，故用注入时钟预热到能出读数即可，一般不关心读数取值
 （个别处用取值做正控，防断言退化成恒真式）。
 
@@ -27,6 +27,7 @@ EDA 在 `tests/mcp/test_zero_physio_eda_v2.py`、HRV 在 `tests/mcp/test_zero_ph
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -112,7 +113,7 @@ def _make_warm_hrv_channel(**kwargs: Any) -> tuple[HrvChannel, _StepClock]:
     ⚠ 2026-07-29 起 HrvChannel 与 EdaChannel 同构（窗间中位数基线 + 对称归一化 + 冷启动
     返回 None），单发 ``sense()`` 必然返回 None。本文件测的是**通道级契约**（modality 名、
     Πv、μv、μa 值域、Hub 集成），故只需跨过冷启动双门；度量语义在
-    `tests/mcp/test_zero_physio_hrv_v2.py`。
+    `tests/mcp/test_zero_physio_hrv_v3.py`。
     """
     clock = _StepClock()
     channel = HrvChannel(clock=clock, **kwargs)
@@ -381,12 +382,12 @@ class TestHrvChannelPath:
     async def test_hrv_mu_a_in_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """E12d：HrvChannel mu[1]（μa）∈ [-1, 1]——含远超 ref 的 Δ 也不越界（对称钳制）。
 
-        RMSSD=500ms 对 60ms 基线 → Δ=−440ms ≫ delta_ref=100ms → 钳到 −1.0（不是 NaN、
-        不是 −4.4）。⚠ 该 Δ 为**负**：RMSSD 远高于基线 = 迷走张力高 = 唤醒低。
+        RMSSD=2000ms 对 60ms 基线 → Δ=ln(60/2000)≈−3.51nats ≫ ln_delta_ref=3.0 → 钳到
+        −1.0（不是 NaN、不是 −1.17）。⚠ 该 Δ 为**负**：RMSSD 远高于基线 = 迷走张力高 = 唤醒低。
         """
         monkeypatch.setenv("ZERO_PHYSIO_CHANNEL_ENABLED", "true")
         ch, _clock = _make_warm_hrv_channel(sampling_rate=256)
-        nk = _make_nk_mock(rmssd_ms=500.0)
+        nk = _make_nk_mock(rmssd_ms=2000.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             result = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert result is not None
@@ -470,12 +471,12 @@ class TestPhysioChannelNaNGuard:
         assert all(np.isfinite(v) for _, v in ch.baseline_history)
 
         # 正控：同一实例随后喂正常 RMSSD 仍能出读数，且基线未被 NaN 破坏
-        # （基线中位数 = 60ms，Δ = 60−40 = +20ms，ref=100ms → μa=+0.2）
+        # （基线中位数 = 60ms，Δ = ln(60/40) = ln(1.5) ≈ 0.4055nats，ref=3.0 → μa≈+0.1352）
         nk.hrv_time.return_value = _make_fake_hrv_df(40.0)
         with patch.dict("sys.modules", {"neurokit2": nk}):
             recovered = await ch.sense(signal=_make_ecg_signal(rate=256))
         assert recovered is not None
-        assert recovered.mu[1] == pytest.approx(0.2, abs=1e-9)
+        assert recovered.mu[1] == pytest.approx(math.log(1.5) / 3.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

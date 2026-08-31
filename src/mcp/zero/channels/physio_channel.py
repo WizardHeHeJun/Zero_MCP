@@ -15,9 +15,15 @@ EDA/HRV 对 valence 盲，仅产 arousal 分量（μv 恒 0.0，Πv=MIN_PRECISIO
 
 两通道**同构不同参**（2026-07-29 起）：都是「窗间中位数基线 + 对称归一化 + 按秒裁剪 +
 冷启动返回 None」，都经 WESAD 真被试全会话流式回放标定与验收（各自类 docstring 有实测数字）。
-⚠ **同构只到结构为止**：两组常量刻意分家（`_SCL_*` / `_RMSSD_*`，量纲 μS vs ms 不可比），
+⚠ **同构只到结构为止**：两组常量刻意分家（`_SCL_*` / `_RMSSD_*`，量纲 μS vs nats/ms 不可比），
 且**喂入 Δ 的符号方向相反**（SCL↑=唤醒↑，RMSSD↑=唤醒↓）——照抄另一侧的减法方向即复刻
 EDA v1 的系统性反号病（那次判别力 1/5，合成信号上长期全绿、直到真被试才暴露）。
+
+**HrvChannel v3（2026-08-31 起，lnRMSSD 差分）**：文献门 `notes/2026-08-31-hrv-v3-litgate.md`
+核验 [Shaffer & Ginsberg 2017 (DOI:10.3389/fpubh.2017.00258)] 的 log 变换惯例后，把 v2 的
+**原始 ms 差**换成**自然对数差**，用 WESAD 真被试重标定并验收（σ 改善、方向性守恒、
+None/撞界不劣化，见 `HrvChannel` 类 docstring）——只换 HRV 一侧的喂入量与归一化参考，
+EdaChannel 与其余结构完全不受影响。
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 import os
 import threading
 import time
@@ -82,7 +89,8 @@ _RMSSD_BASELINE_HORIZON_SECONDS: float = 1800.0
 ⚠ **与 `_SCL_BASELINE_HORIZON_SECONDS` 同为 1800.0 纯属独立推导后的巧合**：本值完全没有
 套用 EDA 的取值，目标函数是 HRV 自己的持续比拐点；同族的只是「horizon 须舒适超过事件
 时长」这条理由，而 WESAD 的应激块对两通道恰是同一段。**这不构成「HRV 可照抄 EDA」的
-证据**——`_RMSSD_DELTA_REF_MS` 与 EDA 侧完全不同（100ms vs 1.0μS，量纲都不可比）。
+证据**——`_RMSSD_LN_DELTA_REF` 与 EDA 侧完全不同（v3 起 3.0nats vs 1.0μS，量纲都不可比；
+v2 时代是 100ms vs 1.0μS，结论同样成立）。
 
 ⚠ 已知限制：分离度在整个可测区间内随 horizon **单调上升、无内部极值**——WESAD 应激块仅
 600–660s，EDA 那个「horizon 逼近会话总长 → 基线开始纳入唤醒期本身」的失效点**根本没进
@@ -91,22 +99,34 @@ _RMSSD_BASELINE_HORIZON_SECONDS: float = 1800.0
 ``span ≥ horizon × min_coverage``，即 ``horizon ≤ 会话长度 / 0.15``，超过则通道永不出读数。
 """
 
-_RMSSD_DELTA_REF_MS: float = 100.0
-"""Δ→μa 的对称归一化参考（**毫秒**；与 EDA 的 μS 量纲不可比，勿跨通道搬运）。
+_RMSSD_LN_DELTA_REF: float = 3.0
+"""Δ→μa 的对称归一化参考（**nats**，自然对数差；替代 v2 的 `_RMSSD_DELTA_REF_MS`，
+两者量纲不可比、不可互换、不可跨版本搬运）。
 
-取「**最差被试** stress 段撞 |μa|=1 边界 <10% 的最小候选」：ref=100 时 S3 9.1%、其余四人
-0.0%（ref=60 时 S3 已 36.4%）。该值 ≈ baseline+stress 窗 |Δ| 的 p99（92.6ms）。
-判据刻意用最差被试而非池化率——池化率在 ref≥40 时就已 <11%，但那 100% 全由 S3 一人贡献，
-「多数人没事」不构成放行理由（EDA 那次池化率掩盖单人问题的教训）。
+标定 `evals/wesad_hrv_v3_ln_calibration.py`（WESAD S2–S6，与 v2 同被试集合）：
+取「判别力 ≥4/5 且最差被试（S3）stress 撞 |μa|=1 边界 ≤5%」约束内**分离度最大**的候选
+（判据换向依据见该脚本 `_pick_ln_delta_ref` docstring——v2 用「约束<10%、取最小 ref 保
+分辨率」，v3 按任务蓝图明令改为「约束更严 ≤5%、取最大分离度」）。ref<3.0 时 S3 仍撞界
+（ref=2.0 时 9.1%），ref=3.0 起最差被试与池化撞界均降到 0.0%，且判别力不掉。
 
-⚠ **这是 n=5 下由单个被试决定的脆弱结论**：S3 的 RMSSD 中位数 125ms 是 S5（27ms）的 4.6×；
-把 S3 压到 9.1% 的代价是所有人读数幅度砍掉约 40%（分离度 +0.184 → +0.110）。换一批被试
-大概率要重标。
-⚠ 更根本的已知缺陷（本轮**未**修）：|Δ| 幅度与被试自身 RMSSD 水平成比例（各被试
-|Δ|p90 / RMSSD中位 收敛在 0.35–0.49，而 |Δ|p90 本身跨被试差 6.1×）→ **任何单一 ms 常数
-必然对一部分被试失配**。基线相减修掉了跨被试的**水平**，没修掉**尺度**。相对 Δ 口径
-（``(baseline − now) / baseline``，ref≈0.7）实测在同等饱和水平下分离度约 1.8×，属另开
-一项（偏离审计明令的「结构复用、只换喂入量」），本轮未采纳。
+**v3 修掉了 v2 明文自承的「更根本的已知缺陷」**：v2 的 |Δ| 幅度与被试自身 RMSSD 水平
+成比例（各被试 |Δ|p90/RMSSD中位 收敛在 0.35–0.49，任何单一 ms 常数必然对一部分被试
+失配）。ln 差分对此**按构造免疫**——`ln(a)−ln(b) = ln(a/b)` 只依赖**比值**，与绝对水平
+无关。实测跨被试静息 μa 极差从 v2 的 0.293 降到 **0.075**（−74%），验证了这条设计预期
+（v2 文献门当轮记录的「相对 Δ 实测 1.8× 分离度」正是这个效应的早期观测，本轮把它
+落到 ln 口径下转正，见 `notes/2026-08-31-hrv-v3-litgate.md` 五问结论 #1）。
+
+⚠ **仍是 n=5 下由单个被试（S3）决定的脆弱结论**——与 v2 同款局限未消除，只是脆弱点从
+「幅度失配」换成了「撞界约束仍由 S3 一人卡住选参下界」。换一批被试大概率要重标。
+"""
+
+_RMSSD_EPSILON_MS: float = 1.0
+"""RMSSD / 基线中位数的数值防御下限（ms，**工程假设**，未见文献量级依据）。
+
+ln 差分要求两个操作数都严格为正：`ln(≤0)` 数学上未定义。且成人静息 RMSSD 典型
+20–150ms，<1ms 已是提取退化（R 峰检测崩溃/信号全零）而非真实生理值。触发时该窗按
+「无证据」处理，返回 None 且**不进基线历史**——早于任何状态写入拦截，原则与 NaN 守卫
+相同（坏值一旦进历史即污染后续所有窗的中位数基线）。
 """
 
 _RMSSD_BASELINE_MIN_OBSERVATIONS: int = 2
@@ -348,30 +368,41 @@ class EdaChannel:
 
 
 class HrvChannel:
-    """HRV/RMSSD（心率变异性）感知通道：**窗间中位数基线 − 窗内 RMSSD** → arousal 分量。
+    """HRV/RMSSD（心率变异性）感知通道：**窗间中位数基线 − 窗内 RMSSD 的 ln 差** → arousal 分量。
 
     valence 恒 0.0（HRV 对 valence 盲，Kreibig 2010）。
 
-    **度量**（`rmssd_baseline_delta`）：从 ECG/PPG 提取窗内 RMSSD（ms），用近
-    ``baseline_horizon_seconds`` 内各窗 RMSSD 的**中位数**基线**减去**它，再对称归一化到
-    [-1, 1]。⚠ **减法方向与 EdaChannel 相反**：RMSSD↑ = 迷走张力↑ = 唤醒**↓**，故
-    Δ = 基线 − 当前（EDA 是 当前 − 基线）。这是本通道唯一的高危处，见 ``_process`` 就近注释。
+    **度量 v3**（`rmssd_baseline_ln_delta`，2026-08-31 起）：从 ECG/PPG 提取窗内 RMSSD（ms），
+    用近 ``baseline_horizon_seconds`` 内各窗 RMSSD 的**中位数**基线，与当前窗做**自然对数差**
+    ``Δ = ln(baseline_median) − ln(rmssd_now)``，再对称归一化到 [-1, 1]。⚠ **减法方向与
+    EdaChannel 相反**：RMSSD↑ = 迷走张力↑ = 唤醒**↓**，方向与 v2 一致（未变），这是本通道
+    唯一的高危处，见 ``_process`` 就近注释。数值防御：``rmssd_now`` 或 ``baseline_median``
+    ≤ ``epsilon_ms``（默认 1.0ms，工程假设）时该窗判定为提取退化，返回 None 且不进历史——
+    ``ln(≤0)`` 数学上未定义，早于任何状态写入拦截，原则同 NaN 守卫。
 
-    **为什么减基线**（改造的正当理由，2026-07-29）：**跨被试可比性**。固定 ref 的旧实现下，
-    同样是「坐着休息」的静息态，S3 读 −0.994（89.5% 的静息窗钉在 −1.0）、S10 读 +0.693，
-    跨被试静息读数极差 **1.687**——而 Zero 消费的是 [-1,1] 上的**绝对值**（μa 直接进精度
-    加权融合），这个偏置会变成对被试的系统性**错误情绪归因**，不只是精度问题。基线相减
-    买到的正是「μa=0 对每个被试同义」：极差降到 **0.293（−83%）**，撞 |μa|=1 从 10.5%
-    降到 0.7%（−93%），残差 σ 2.00 → 1.39（Πa 0.25 → 0.52）。
-    ⚠ **原立项理由已被推翻，勿再引用**：审计说的「按 EDA v2 的 G-Drift 门不及格（0.72）」
-    用的是**单窗首/末**估计量；换成 v2 门自己的**早/晚半均值**估计量，现状实现是 0.154
-    （PASS）。同数据同实现、两种估计量给出跨越合格线的相反判定。
+    **为什么换成 ln 差（v3 相对 v2 的改造理由，`notes/2026-08-31-hrv-v3-litgate.md`）**：
+    v2 明文自承「更根本的已知缺陷」——|Δ| 幅度与被试自身 RMSSD 水平成比例（各被试
+    |Δ|p90/RMSSD中位 收敛在 0.35–0.49），任何单一 **ms** 常数必然对一部分被试失配。
+    ln 差分对此按构造免疫：``ln(a)−ln(b)=ln(a/b)`` 只依赖**比值**，与绝对水平无关。
+    实测（`evals/wesad_hrv_v3_ln_calibration.py`，S2–S6）跨被试静息 μa 极差从 v2 的
+    **0.293 降到 0.075**（−74%），验证了这条设计预期；标定同时把最差被试（S3）stress
+    撞 |μa|=1 从 v2 的 9.1% 压到 **0.0%**（新约束 ≤5%，比 v2 的 <10% 更严）。
 
-    **诚实附注（改造并非全面更优）**：判别力两版都是 4/5（S6 是三处独立分析里一致的非
-    响应者，其 stress 段 RMSSD 反而高于 baseline）；G-Drift 0.164 vs 0.154（同门内略输）；
-    **组内分离度反而更低**（+0.110 vs +0.303 中位）。本改造的目标函数是跨被试可比，不是
-    判别力/抗漂移——后两者只作「不许劣化」的约束。且按 Zero 自己的判据（σ > 值域半宽 1.0
-    即噪声占主导），本通道**仍不合格**（σ=1.6）；改造把它从 2.0 改善到 1.6，不改变结论。
+    **σ 交付（`evals/wesad_hrv_v3_residual_sigma.py` + `wesad_hrv_v3_sigma_delivery_checks.py`，
+    双锚——自评锚/设计锚，跨会话交付纪律要求同时给出）**：
+
+    | 子集 | σ_D 自评锚 v2→v3 | σ_D 设计锚 v2→v3 |
+    | --- | --- | --- |
+    | 样本内 S2–S6（n=5，参数标定集） | 0.845 → **0.686** | 0.759 → 0.765（≈打平，n=5 噪声内） |
+    | 样本外 S7–S17（n=10） | 1.831 → **1.304** | 1.607 → **0.986**（跌破 1.0） |
+    | 全部 S2–S17（n=15） | 1.390 → **1.078** | 1.139 → **0.935**（跌破 1.0） |
+
+    12 组对比里 11 组改善、1 组（样本内设计锚）在 n=5 噪声范围内打平，无一组劣化。
+    ⚠ **诚实附注**：自评锚在样本外留一（S7–S17 内留一，n=10）仍**全部 >1.0**（v2 1.310–2.417，
+    v3 1.105–1.619）——按 Zero 的 σ≤1.0 判据，"精度而非噪声"这条结论对自评锚**仍不成立**；
+    设计锚留一有部分复本跌破 1.0（v2 从未跌破，v3 部分跌破），是本轮**唯一**让判据翻转的
+    子集。方向性守恒且更显著：n=15 判别 11/15（与 v2 同），Wilcoxon p=0.0062（v2 0.0128，
+    效应量中位 0.146 vs v2 0.110）。None 占比中位 4.7%（与 v2 打平，未劣化）。
 
     **冷启动返回 None 而非回退固定 ref**：无基线证据时给出的读数必然基于臆断零点，比不给
     更有害（v1 的固定 ref 正是 S3 静息钉死 −1.0 的成因）。⚠ 与 EdaChannel 的冷启动窗口
@@ -381,28 +412,27 @@ class HrvChannel:
 
     **窗长恒定性（EDA 无此约束）**：RMSSD 随窗内 R-R 间期数变化，窗长一变 ``rmssd_now``
     与历史中位数即**不同口径**、Δ 失去意义 → 调用方须在一个会话内保持投喂窗长恒定，
-    变更窗长等同换被试，须先 ``reset()``。取「文档约定」而非运行期检测，依据是 G-WindowLen
-    实测敏感度小：{15,30,60}s 下同一 stress 段 μa 的逐被试极差中位仅 **0.0156**（最大
-    0.0970），暖机后 None 率三档**均为 0.00%**（15s 也能稳定出 RMSSD）。
-    主用 60s、建议下界 30s，15s 可行但不推荐作默认——代价不是「算不出来」而是噪声：
-    标定实测窗间 CV 涨 2.1×（0.151→0.312）、RMSSD>150ms 的伪迹窗从 4.1% 涨到 6.0%，
-    且**伪迹是有限值、NaN 守卫拦不住**，会直接进基线历史（中位数基线是唯一的缓冲）。
+    变更窗长等同换被试，须先 ``reset()``。取「文档约定」而非运行期检测，依据沿用 v2
+    G-WindowLen 实测（窗长/horizon 本轮**未**重新 sweep，见 `_RMSSD_BASELINE_HORIZON_SECONDS`
+    与文献门第 3 条——窗长敏感度是 v2 在 ms 口径下测的，ln 差分只改变归一化分母，窗长本身
+    对 RMSSD 提取质量的影响不受 v3 改动波及，结论沿用）：{15,30,60}s 下同一 stress 段
+    μa 的逐被试极差中位 **0.0156**，暖机后 None 率三档均为 0.00%。主用 60s、建议下界 30s。
 
-    验收（`evals/wesad_hrv_v2_acceptance_gates.py`，**对接本类真实例**的 WESAD 全会话流式
-    回放，60s 窗 / 700Hz 胸带 ECG / S2–S6）：判别力 4/5（对照臂 v1 同为 4/5）PASS ·
-    G-Drift 中位 0.164 / 最大 0.343（门 <0.5）PASS · G1' 跨采样率（700/350/175Hz，有状态）
-    极差中位 0.0057 / 最大 0.0125（门 <0.15）PASS · G-Sign 池化 stress +0.183 > 0 >
-    baseline −0.096 PASS · 冷启动 300s（≈ horizon×coverage=270s）· None 4.7% ·
-    **跨被试静息 μa 极差 0.227（对照臂 1.400）** ← 本改造的目标函数。
-    另由标定/分布脚本给出（`wesad_hrv_baseline_delta_calibration.py` /
-    `wesad_mu_a_distribution.py` 同族）：stress 撞 |μa|=1 最差被试 9.1%、其余四人 0.0%
-    （对照臂 S3 静息 89.5%）；n=15 全体撞界 0.7% vs 对照臂 10.5%。
+    验收数字来自 `evals/wesad_hrv_v3_ln_calibration.py::final_verification`（在 WESAD 真被试
+    S2–S6 全会话缓存 RMSSD 序列上跑本类同款公式的离线参考实现，60s 窗 / 700Hz 胸带 ECG）：
+    判别力 4/5（v2 同为 4/5）PASS · G-Drift 中位 0.106（门 <0.5）PASS · 跨采样率极差中位
+    0.0064（门 <0.15）PASS · 方向性中位 Δ=+0.146>0（n=5 单侧 Wilcoxon p=0.0625，n=15
+    p=0.0062）· 冷启动 300s · None 4.7%（不劣于 v2）· **跨被试静息 μa 极差 0.075（v2 0.293）**
+    ← 本改造的目标函数 · stress 撞 |μa|=1 全被试 0.0%（v2 最差被试 9.1%）。⚠ 上述数字由离线
+    参考实现产出，其算法与本类 ``_process`` 逐行同构、经单测 `TestHrvDeltaSemantics` 等按
+    mock RMSSD 精确数值比对确认一致；`evals/wesad_hrv_v3_acceptance_gates.py`（对接**本类
+    真实例**，全流程重新跑真 ``nk.ecg_process``）作独立确认，跑批耗时较长，结论应与此一致。
 
-    ⚠ **已知限制（覆盖面很小，报告时勿放大）**：n=5 标定 / n=15 分布，单数据集（WESAD）、
-    单设备通路（RespiBAN 胸带 ECG，坐姿实验室）。**腕带 BVP/PPG 完全未测**（PPG 峰定位
-    精度远低于 ECG，RMSSD 对此高度敏感，不可假设可迁移）；amusement 段实测几乎无响应
-    （p50 −0.017），σ 是在 baseline vs TSST 这一对上标定的；60s 窗本身已是对短时 HRV
-    经典 5 分钟建议的激进外推，未做与金标准的一致性比对。
+    ⚠ **已知限制（覆盖面很小，报告时勿放大）**：n=5 标定 / n=15 σ 交叉核验，单数据集
+    （WESAD）、单设备通路（RespiBAN 胸带 ECG，坐姿实验室）。**腕带 BVP/PPG 完全未测**
+    （PPG 峰定位精度远低于 ECG，RMSSD 对此高度敏感，不可假设可迁移）；60s 窗本身已是
+    对短时 HRV 经典 5 分钟建议的激进外推，未做与金标准的一致性比对；``LN_DELTA_REF=3.0``
+    仍是 n=5 下由单个被试（S3）的撞界约束决定的脆弱结论，换一批被试大概率要重标。
 
     **Protocol 兼容**：结构上满足 PerceptionChannel Protocol（无需继承）：
     - name: str 属性（"hrv/rmssd"）。
@@ -422,9 +452,13 @@ class HrvChannel:
         clock:           时钟注入（默认 ``time.monotonic``）。历史裁剪与冷启动判定按**真实
                          秒数**，注入可测时钟即可让离线回放/单测完全确定（不依赖墙钟）。
         baseline_horizon_seconds: 窗间基线回溯时长（秒）。默认 1800.0，取值依据与已知限制见
-                         ``_RMSSD_BASELINE_HORIZON_SECONDS``（⚠ 与 EDA 同值属巧合，非照抄）。
-        delta_ref_ms:    Δ→μa 对称归一化参考（**毫秒**）。默认 100.0，依据见
-                         ``_RMSSD_DELTA_REF_MS``（由单个被试 S3 决定的 n=5 脆弱结论）。
+                         ``_RMSSD_BASELINE_HORIZON_SECONDS``（⚠ 与 EDA 同值属巧合，非照抄；
+                         v3 本轮未重新 sweep，沿用 v2 选定值）。
+        ln_delta_ref:    Δ→μa 对称归一化参考（**nats**，自然对数差；不可与 v2 的 ms 常数
+                         混用）。默认 3.0，依据见 ``_RMSSD_LN_DELTA_REF``（同样是由单个被试
+                         S3 决定的 n=5 脆弱结论，只是脆弱点从「幅度失配」换成了「撞界约束」）。
+        epsilon_ms:      RMSSD / 基线中位数的数值防御下限（ms）。默认 1.0，依据见
+                         ``_RMSSD_EPSILON_MS``（工程假设：ln(≤0) 未定义 + <1ms 生理不可信）。
         baseline_min_observations: 出首个读数所需的最少历史窗数。默认 2（与覆盖率**双门**，
                          取更严者）；**沿用 EDA v2 未 sweep**。
         baseline_min_coverage_fraction: 出首个读数所需的历史时间跨度占 horizon 的比例。
@@ -439,7 +473,8 @@ class HrvChannel:
         signal_source: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
         baseline_horizon_seconds: float = _RMSSD_BASELINE_HORIZON_SECONDS,
-        delta_ref_ms: float = _RMSSD_DELTA_REF_MS,
+        ln_delta_ref: float = _RMSSD_LN_DELTA_REF,
+        epsilon_ms: float = _RMSSD_EPSILON_MS,
         baseline_min_observations: int = _RMSSD_BASELINE_MIN_OBSERVATIONS,
         baseline_min_coverage_fraction: float = _RMSSD_BASELINE_MIN_COVERAGE,
     ) -> None:
@@ -447,7 +482,8 @@ class HrvChannel:
         self.signal_source = signal_source
         self.clock = clock
         self.baseline_horizon_seconds = baseline_horizon_seconds
-        self.delta_ref_ms = delta_ref_ms
+        self.ln_delta_ref = ln_delta_ref
+        self.epsilon_ms = epsilon_ms
         self.baseline_min_observations = baseline_min_observations
         self.baseline_min_coverage_fraction = baseline_min_coverage_fraction
         # 窗间基线历史：(时钟秒, 窗内 RMSSD ms)。**无 maxlen**——按真实秒数手动裁剪。
@@ -544,21 +580,27 @@ class HrvChannel:
             return None
 
     def _process(self, raw: dict[str, Any]) -> ModalityPrior | None:
-        """延迟 import neurokit2 → 窗内 RMSSD → **窗间中位数基线 − 当前** → 对称归一化。
+        """延迟 import neurokit2 → 窗内 RMSSD → **ln(窗间中位数基线) − ln(当前)** → 对称归一化。
 
-        pipeline：``nk.ecg_process`` → ``nk.hrv_time`` → RMSSD(ms) → 基线相减 → clip 到 [-1,1]。
+        pipeline：``nk.ecg_process`` → ``nk.hrv_time`` → RMSSD(ms) → 数值防御（epsilon）→
+        ln 基线相减 → clip 到 [-1,1]。
 
-        为什么减基线而不是打固定 ref：固定 ref 版本下静息态读数的跨被试极差达 1.687
-        （S3 −0.994 / S10 +0.693，同为「坐着休息」却给出相反的情绪归因），而消费方按
-        [-1,1] 的**绝对值**做精度加权融合。减去被试自身近期基线使「μa=0 对每个被试同义」，
-        极差降至 0.293。标定与验收见类 docstring 与 `evals/wesad_hrv_*` 三件。
+        为什么用 ln 差而不是 v2 的原始 ms 差：v2 明文自承|Δ|幅度与被试自身 RMSSD 水平
+        成比例，任何单一 ms 常数必然对一部分被试失配。``ln(a)−ln(b)=ln(a/b)`` 只依赖比值，
+        按构造消除这个失配——实测跨被试静息 μa 极差从 v2 的 0.293 降到 0.075。
+        标定与验收见类 docstring 与 `evals/wesad_hrv_v3_*` 三件。
+
+        为什么先做数值防御：RMSSD 或基线中位数 ≤ ``epsilon_ms`` 时 ``ln`` 未定义/不可信，
+        必须**早于状态写入**拦截（同 NaN 守卫的道理——坏值一旦进历史即污染后续所有窗的
+        中位数基线，不只是丢本轮读数）。
 
         为什么冷启动返回 None 而非回退某个固定 ref：无基线证据时给出的读数必然基于臆断
         零点。旧实现正因此把 S3 静息 89.5% 的窗钉在 −1.0。None 是**有意的诚实降级**
         （与 EdaChannel 冷启动窗口重合时，该轮完全不出 physio 家族流，已跨仓报备）。
 
         参考：[NeuroKit2 DOI:10.3758/s13428-020-01516-y] ·
-              [Kreibig 2010 DOI:10.1016/j.biopsycho.2010.03.010]
+              [Kreibig 2010 DOI:10.1016/j.biopsycho.2010.03.010] ·
+              [Shaffer & Ginsberg 2017 DOI:10.3389/fpubh.2017.00258]（RMSSD 的 ln 变换惯例）
         """
         import neurokit2 as nk  # 延迟 import
 
@@ -580,6 +622,15 @@ class HrvChannel:
         # 判别力已实证：把本守卫下移到 append 之后，TestHrvNaNGuard 立即变红。
         if not np.isfinite(rmssd_ms):
             logger.warning("HrvChannel: RMSSD 非有限值（NaN/inf，R 峰不足/坏信号），本轮跳过")
+            return None
+        # 数值防御（v3 新增，早于状态写入同 NaN 守卫）：ln(≤0) 未定义，且 <epsilon_ms 的
+        # RMSSD 生理上不可信（提取退化）。同样不进历史——否则污染后续所有窗的基线中位数。
+        if rmssd_ms <= self.epsilon_ms:
+            logger.warning(
+                "HrvChannel: RMSSD 退化（%.3fms ≤ epsilon %.3fms），本轮跳过",
+                rmssd_ms,
+                self.epsilon_ms,
+            )
             return None
 
         now = self.clock()
@@ -603,17 +654,27 @@ class HrvChannel:
         # 中位数而非均值：异位搏动/运动伪迹会让单窗 RMSSD 爆表（实测最大 395ms，60s 窗下
         # 4.1% 的窗 >150ms），且这些是**有限值**、NaN 守卫拦不住 —— 中位数对偶发尖峰稳健。
         baseline = float(np.median([value for _, value in history]))
+        # 基线数值防御（同上）：理论上历史里的每个值构造时都已过 epsilon 门，中位数不可能
+        # ≤epsilon，但仍显式检查——防御性编程不依赖"不可能发生"的隐含前提。
+        if baseline <= self.epsilon_ms:
+            logger.warning(
+                "HrvChannel: 基线退化（中位数 %.3fms ≤ epsilon %.3fms），本轮跳过",
+                baseline,
+                self.epsilon_ms,
+            )
+            return None
         # ⚠⚠ 本行是本次改造唯一的高危处：**减法方向与 EdaChannel 相反，不可照抄**。
         #     EDA：SCL↑ = 交感激活↑ = 唤醒↑     → Δ = 当前 − 基线
-        #     HRV：RMSSD↑ = 迷走张力↑ = 唤醒**↓** → Δ = 基线 − 当前（本行）
-        # 写成 `rmssd_ms - baseline` 即逐字复刻 EDA v1 的系统性反号病：那次判别力 1/5、
-        # 在合成信号上长期全绿，直到 WESAD 真被试回放才暴露，整条度量随后被删除。
-        # 方向依据：[Kreibig 2010]（应激下迷走撤退 → RMSSD 降、唤醒升）+ WESAD 实测
-        # （stress 段 μa 中位 +0.103 vs baseline −0.004；15 被试 11 人方向正确，
-        # Wilcoxon p=0.013）。三重守卫：本注释 · 单测 TestHrvSignDirection（反号必红）·
-        # `evals/wesad_hrv_v2_acceptance_gates.py` 的 G-Sign 门（真被试同实例内方向性）。
-        delta = baseline - rmssd_ms
-        mu_a = _symmetric_normalize(delta, self.delta_ref_ms)
+        #     HRV：RMSSD↑ = 迷走张力↑ = 唤醒**↓** → Δ = ln(基线) − ln(当前)（本行，v3）
+        # 写成 `ln(rmssd_ms) - ln(baseline)` 即逐字复刻 EDA v1 的系统性反号病：那次判别力
+        # 1/5、在合成信号上长期全绿，直到 WESAD 真被试回放才暴露，整条度量随后被删除。
+        # 方向依据：[Kreibig 2010]（应激下迷走撤退 → RMSSD 降、唤醒升）+ [Kim et al. 2018
+        # meta-analysis DOI:10.30773/pi.2017.08.17]（37 篇独立佐证）+ WESAD 实测（v3：
+        # n=15 判别 11/15，Wilcoxon p=0.0062，效应量中位 +0.146）。三重守卫：本注释 ·
+        # 单测 TestHrvSignDirection（反号必红）· `evals/wesad_hrv_v3_acceptance_gates.py`
+        # 的 G-Sign 门（真被试同实例内方向性）。
+        delta = math.log(baseline) - math.log(rmssd_ms)
+        mu_a = _symmetric_normalize(delta, self.ln_delta_ref)
         mu_v = 0.0  # HRV 对 valence 盲（Kreibig 2010）
 
         return build_recommended_prior(

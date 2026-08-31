@@ -1,8 +1,9 @@
-"""HrvChannel 唤醒度量（rmssd_baseline_delta）单测——HRV 基线相减改造 T14。
+"""HrvChannel 唤醒度量（rmssd_baseline_ln_delta）单测——HRV v3 lnRMSSD 差分改造。
 
-覆盖：冷启动双门 · Δ 语义与跨被试可比 · **符号方向（与 EdaChannel 相反）** · 单侧地板
-已删除 · horizon 裁剪 · NaN 早于状态写入 · reset · clock 注入确定性 · 并发下
-baseline_history 线程安全 · 两流同时冷启动的载荷形状 · 常量与标定选值一致。
+覆盖：冷启动双门 · Δ 语义（ln 差分）与跨被试可比 · **符号方向（与 EdaChannel 相反）** ·
+数值防御（epsilon，ln 未定义守卫）· horizon 裁剪 · NaN 早于状态写入 · reset ·
+clock 注入确定性 · 并发下 baseline_history 线程安全 · 两流同时冷启动的载荷形状 ·
+常量与标定选值一致。
 
 ⚠ 通道级契约（先验形状、signal_source、Hub 集成、默认关）在
 `tests/mcp/test_zero_physio_channel.py`；真 NeuroKit2 路径在
@@ -11,18 +12,21 @@ baseline_history 线程安全 · 两流同时冷启动的载荷形状 · 常量�
 
 ⚠ **任何常量标定、任何「度量有效」的结论都不在本文件**：合成/构造信号上全绿不构成证据
 （EDA v1 正是合成全绿、接真数据后反号）。度量有效性见
-`evals/wesad_hrv_v2_acceptance_gates.py`（WESAD 真被试全会话流式回放，对接本通道真实例）。
+`evals/wesad_hrv_v3_acceptance_gates.py`（WESAD 真被试全会话流式回放，对接本通道真实例）。
 
-设计与选参依据：`evals/wesad_hrv_baseline_delta_calibration.py`（horizon 持续比拐点 →
-1800s、delta_ref 最差被试撞界 <10% → 100ms、窗长下界 → 30s 建议/60s 主用）。
-改造的正当理由是**跨被试可比**（静息读数极差 1.687 → 0.293），不是判别力/抗漂移
-（二者都没赢过现状）——见 `HrvChannel` 类 docstring。
+设计与选参依据：`evals/wesad_hrv_v3_ln_calibration.py`（horizon/窗长维持 v2 值不变，
+`LN_DELTA_REF` 判别力≥4/5 且撞界率≤5% 约束内分离度最大 → 3.0nats）+
+`evals/wesad_hrv_v3_residual_sigma.py` / `wesad_hrv_v3_sigma_delivery_checks.py`（σ 双锚
+交付，n=5/10/15 三档均较 v2 改善或打平，方向性守恒且更显著）。
+v3 改造的正当理由是**修 v2 明文自承的「幅度与被试自身 RMSSD 水平成比例」缺陷**——
+ln 差分只依赖比值，跨被试静息 μa 极差从 v2 的 0.293 降到 0.075，见 `HrvChannel` 类 docstring。
 """
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import threading
 import time
 from collections import deque
@@ -38,7 +42,8 @@ from src.mcp.zero.channels.physio_channel import (
     _RMSSD_BASELINE_HORIZON_SECONDS,
     _RMSSD_BASELINE_MIN_COVERAGE,
     _RMSSD_BASELINE_MIN_OBSERVATIONS,
-    _RMSSD_DELTA_REF_MS,
+    _RMSSD_EPSILON_MS,
+    _RMSSD_LN_DELTA_REF,
     EdaChannel,
     HrvChannel,
 )
@@ -61,12 +66,13 @@ class FakeClock:
 class _FakeNeurokit:
     """假 neurokit2：把「窗内 RMSSD(ms)」变成测试可直接指定的量。
 
-    本文件测的是**基线相减度量本身**（Δ 语义、冷启动、裁剪、符号方向）。用假 nk 把 RMSSD
+    本文件测的是**基线相减度量本身**（ln Δ 语义、冷启动、裁剪、符号方向）。用假 nk 把 RMSSD
     作为直接输入，断言就不必依赖 nk 版本间的数值 offset，也不必为构造某个 RMSSD 去反解
     合成 ECG 的参数。真 nk 路径由 `test_zero_physio_real.py` 覆盖。
 
     ⚠ 它替换的只是「从 ECG 得到一个 RMSSD 标量」这一步；`HrvChannel._process` 的其余部分
-    （NaN 守卫、裁剪、快照、冷启动双门、中位数、减法方向、归一化、出线）全是真产品码。
+    （NaN 守卫、epsilon 数值防御、裁剪、快照、冷启动双门、中位数、减法方向、ln 变换、
+    归一化、出线）全是真产品码。
     """
 
     def __init__(self, rmssd_ms: float) -> None:
@@ -95,7 +101,7 @@ def _hrv_channel(clock: FakeClock, **kwargs: object) -> HrvChannel:
     params: dict[str, object] = {
         "clock": clock,
         "baseline_horizon_seconds": 1000.0,
-        "delta_ref_ms": 100.0,
+        "ln_delta_ref": 1.0,  # 取 1.0 使 μa = Δ（nats）本身，断言更直观
         "baseline_min_observations": 2,
         "baseline_min_coverage_fraction": 0.15,
     }
@@ -126,9 +132,9 @@ class TestHrvSinglePathNoMetricSwitch:
     """单路径直落（A 案）：不留任何 A/B 开关。
 
     HRV 改造**没有**走 EDA v2 那条「枚举 env + 构造期读取 → 翻默认 → 退役」的三段路：
-    v1 只有两行公式，对照实验完全可以在 evals 里用纯函数做（EDA 那边的 `control_arm()`
-    也从未依赖 src 开关）。保留双路径的收益为负——「默认值 / env / 显式入参」三者的
-    优先级会成为长期误配面（EDA 任务 9 退役 v1 时立的档）。本类防的是它被加回来。
+    v3 对 v2 是同结构换 Δ 公式，对照实验完全可以在 evals 里用纯函数做（EDA 那边的
+    `control_arm()` 也从未依赖 src 开关）。保留双路径的收益为负——「默认值 / env / 显式
+    入参」三者的优先级会成为长期误配面（EDA 任务 9 退役 v1 时立的档）。本类防的是它被加回来。
     """
 
     def test_default_construction_allocates_baseline_state(self) -> None:
@@ -149,7 +155,9 @@ class TestHrvSinglePathNoMetricSwitch:
         _warm(channel, clock, 60.0)
         reading = _sense(channel, 40.0)
         assert reading is not None, "冒牌 env 不应把通道切成别的度量"
-        assert reading.mu[1] == pytest.approx(0.2, abs=1e-9), "读数应是 Δ 语义（60−40=+20ms）"
+        assert reading.mu[1] == pytest.approx(math.log(60.0) - math.log(40.0), abs=1e-9), (
+            "读数应是 ln Δ 语义（ln60−ln40）"
+        )
 
     def test_default_clock_is_monotonic(self) -> None:
         """默认时钟是 `time.monotonic`（墙钟不可回退，且与 EdaChannel 同源）。"""
@@ -197,7 +205,7 @@ class TestHrvColdStart:
 
 
 class TestHrvDeltaSemantics:
-    """Δ = 基线 − 当前 的取值语义（符号方向另见 `TestHrvSignDirection`）。"""
+    """Δ = ln(基线) − ln(当前) 的取值语义（符号方向另见 `TestHrvSignDirection`）。"""
 
     def test_flat_signal_reads_neutral(self) -> None:
         """RMSSD 不变 → Δ=0 → μa=0.0（中性），**不是 −1.0**。
@@ -213,27 +221,29 @@ class TestHrvDeltaSemantics:
         assert prior.mu[1] == pytest.approx(0.0, abs=1e-9)
 
     def test_rmssd_drop_is_positive_arousal(self) -> None:
-        """RMSSD **下降**（迷走撤退）→ μa **正**：60→30ms，Δ=+30，ref=100 → +0.3。"""
+        """RMSSD **下降**（迷走撤退）→ μa **正**：60→30ms，Δ=ln60−ln30=ln2。"""
         clock = FakeClock()
         channel = _hrv_channel(clock)
         _warm(channel, clock, 60.0)
         prior = _sense(channel, 30.0)
         assert prior is not None
-        assert prior.mu[1] == pytest.approx(0.3, abs=1e-9)
+        assert prior.mu[1] == pytest.approx(math.log(2.0), abs=1e-9)
+        assert prior.mu[1] > 0.0
 
     def test_rmssd_rise_is_negative_arousal(self) -> None:
-        """RMSSD **上升**（迷走增强）→ μa **负**：60→90ms，Δ=−30 → −0.3。"""
+        """RMSSD **上升**（迷走增强）→ μa **负**：60→90ms，Δ=ln60−ln90=ln(2/3)。"""
         clock = FakeClock()
         channel = _hrv_channel(clock)
         _warm(channel, clock, 60.0)
         prior = _sense(channel, 90.0)
         assert prior is not None
-        assert prior.mu[1] == pytest.approx(-0.3, abs=1e-9)
+        assert prior.mu[1] == pytest.approx(math.log(60.0 / 90.0), abs=1e-9)
+        assert prior.mu[1] < 0.0
 
     def test_saturates_symmetrically_not_floored(self) -> None:
         """两端都钳到 ±1（对称），不是一端被地板压平。"""
         clock = FakeClock()
-        channel = _hrv_channel(clock)
+        channel = _hrv_channel(clock, ln_delta_ref=0.1)  # 小 ref 使中等 Δ 就能饱和
         _warm(channel, clock, 200.0)
         assert (up := _sense(channel, 20.0)) is not None
         clock.advance(100.0)
@@ -241,23 +251,38 @@ class TestHrvDeltaSemantics:
         assert up.mu[1] == pytest.approx(1.0)
         assert down.mu[1] == pytest.approx(-1.0)
 
-    def test_absolute_level_does_not_matter(self) -> None:
-        """判别性：跨被试可比的核心——同样的 Δ 在不同 RMSSD 绝对水平上读数**相同**。
+    def test_ratio_invariance_across_absolute_levels(self) -> None:
+        """判别性：跨被试可比的核心——同样的**比值** RMSSD_基线/RMSSD_当前 在不同绝对水平
+        上读数**相同**（v3 相对 v2 的改造目标：ln 差分只依赖比值，不依赖绝对水平）。
 
-        直接覆盖 v1 的饱和缺陷：固定 ref=100ms 下，RMSSD 中位 125ms 的 S3 有 89.5% 的
-        静息窗钉在 μa=−1.0，而 RMSSD 中位 27ms 的 S5 静息读 +0.41——同为「坐着休息」，
-        两人读数差 1.4。基线相减买到的就是「μa=0 对每个被试同义」。
+        直接覆盖 v2 的已知缺陷：v2 用绝对 ms 差，同样 |Δ|=10ms 在高 RMSSD 被试身上占比小、
+        低 RMSSD 被试身上占比大，幅度因人而异。ln 差分下，"基线是当前的 2 倍"这件事在任意
+        绝对水平上都读出同一个数。
         """
         readings = []
         for level in (30.0, 60.0, 150.0):
             clock = FakeClock()
             channel = _hrv_channel(clock)
             _warm(channel, clock, level)
-            prior = _sense(channel, level - 10.0)  # 同样 Δ=+10ms
+            prior = _sense(channel, level / 2.0)  # 同样的比值：当前 = 基线的一半
             assert prior is not None
             readings.append(prior.mu[1])
         assert max(readings) - min(readings) == pytest.approx(0.0, abs=1e-9)
-        assert readings[0] == pytest.approx(0.1, abs=1e-9)
+        assert readings[0] == pytest.approx(math.log(2.0), abs=1e-9)
+
+    def test_absolute_ms_delta_differs_across_levels_v2_defect_gone(self) -> None:
+        """反向对照：v2 的「同样 ms 差在不同水平读数相同」在 v3 下**不**成立——这正是
+        v3 有意改变的行为（v2 缺陷的直接反证，防止误将 v2 语义错当 v3 的回归目标）。
+        """
+        readings = []
+        for level in (30.0, 150.0):
+            clock = FakeClock()
+            channel = _hrv_channel(clock)
+            _warm(channel, clock, level)
+            prior = _sense(channel, level - 10.0)  # 同样 Δ=+10ms，比值不同
+            assert prior is not None
+            readings.append(prior.mu[1])
+        assert readings[0] != pytest.approx(readings[1])
 
     def test_valence_blind(self) -> None:
         """μv 恒 0.0（HRV 对 valence 盲）——跨仓承诺「physio 流 μv≡0」的通道侧。"""
@@ -271,8 +296,8 @@ class TestHrvDeltaSemantics:
     def test_baseline_is_median_not_mean(self) -> None:
         """基线取**中位数**：单个伪迹窗（RMSSD 爆表）不得整体抬走基线。
 
-        判别性：把产品码的 `np.median` 换成 `np.mean`，本例读数从 +0.1 变成 +0.725（基线被
-        单个 310ms 伪迹窗从 60 抬到 122.5），必红——已逐变异实证。
+        判别性：把产品码的 `np.median` 换成 `np.mean`，基线会被单个 310ms 伪迹窗从 60
+        抬到 122.5，读数随之改变，必红——已逐变异实证。
         伪迹是真实存在的——实测 60s 窗有 4.1% 的窗 RMSSD>150ms（最大 395ms），且它们是
         **有限值**，NaN 守卫拦不住，一定会进基线历史。
         """
@@ -283,7 +308,7 @@ class TestHrvDeltaSemantics:
             clock.advance(100.0)
         prior = _sense(channel, 50.0)
         assert prior is not None
-        assert prior.mu[1] == pytest.approx(0.1, abs=1e-9)
+        assert prior.mu[1] == pytest.approx(math.log(60.0) - math.log(50.0), abs=1e-9)
 
     def test_horizon_prunes_old_baseline(self) -> None:
         """超出 horizon 的历史被按**真实秒数**裁掉（非样本数/调用数）。"""
@@ -309,7 +334,7 @@ class TestHrvDeltaSemantics:
             for _ in range(3):
                 _sense(channel, 200.0)  # 旧基线：高 RMSSD
                 clock.advance(50.0)
-            clock.advance(400.0)  # horizon=300 时旧值全超龄；horizon=5000 时全保留
+            clock.advance(400.0)  # horizon=300 时旧值全超龄；horizon=2000 时全保留
             for _ in range(2):
                 _sense(channel, 60.0)  # 新基线：低 RMSSD
                 clock.advance(50.0)
@@ -317,20 +342,55 @@ class TestHrvDeltaSemantics:
             assert prior is not None
             readings.append(prior.mu[1])
         assert readings[0] != pytest.approx(readings[1]), "裁剪与不裁剪读数相同 → 裁剪未生效"
-        assert readings[0] == pytest.approx(0.1, abs=1e-9)  # 基线=60（旧值已裁）
+        assert readings[0] == pytest.approx(math.log(60.0) - math.log(50.0), abs=1e-9)  # 基线=60
+
+
+class TestHrvEpsilonGuard:
+    """v3 新增：数值防御——RMSSD 或基线中位数 ≤ epsilon 时降级返回 None（ln 未定义守卫）。"""
+
+    def test_rmssd_at_or_below_epsilon_returns_none_and_not_pollute_history(self) -> None:
+        clock = FakeClock()
+        channel = _hrv_channel(clock, epsilon_ms=1.0)
+        _warm(channel, clock, 60.0)
+        size_before = len(channel.baseline_history)
+        assert size_before > 0
+
+        assert _sense(channel, 0.5) is None, "RMSSD 0.5ms ≤ epsilon 1.0ms 应判定退化"
+        assert len(channel.baseline_history) == size_before, "退化窗不得进基线历史"
+
+        clock.advance(100.0)
+        prior = _sense(channel, 30.0)
+        assert prior is not None
+        assert prior.mu[1] == pytest.approx(math.log(60.0) - math.log(30.0), abs=1e-9), (
+            "基线未被退化窗污染"
+        )
+
+    def test_rmssd_exactly_at_epsilon_boundary_is_rejected(self) -> None:
+        """边界取 ``<=``（不是 ``<``）：恰好等于 epsilon 也判定退化，防「ln(≈0)」的病态值。"""
+        clock = FakeClock()
+        channel = _hrv_channel(clock, epsilon_ms=1.0)
+        _warm(channel, clock, 60.0)
+        assert _sense(channel, 1.0) is None
+
+    def test_custom_epsilon_is_respected(self) -> None:
+        """epsilon 可配置：调大后原本合法的 RMSSD 也会被判定退化。"""
+        clock = FakeClock()
+        channel = _hrv_channel(clock, epsilon_ms=50.0)
+        _warm(channel, clock, 60.0)
+        assert _sense(channel, 30.0) is None, "30ms ≤ 自定义 epsilon 50ms 应判定退化"
 
 
 class TestHrvSignDirection:
-    """⚠ **本次改造唯一的高危项专项**：Δ 的减法方向与 EdaChannel **相反**。
+    """⚠ **本次改造唯一的高危项专项**：Δ 的减法方向与 EdaChannel **相反**（v3 未改变此点）。
 
     EDA：SCL↑ = 交感激活↑ = 唤醒↑     → Δ = 当前 − 基线
-    HRV：RMSSD↑ = 迷走张力↑ = 唤醒**↓** → Δ = 基线 − 当前
+    HRV：RMSSD↑ = 迷走张力↑ = 唤醒**↓** → Δ = ln(基线) − ln(当前)
 
     照抄 EdaChannel 那一行即逐字复刻 EDA v1 的系统性反号病（判别力 1/5、合成信号上长期
     全绿、直到 WESAD 真被试回放才暴露，整条度量随后被删）。
 
-    判别力已逐变异实证：把产品码 `baseline - rmssd_ms` 改成 `rmssd_ms - baseline`，
-    本类**四条全红**（含跨通道那条）。
+    判别力已逐变异实证：把产品码 `math.log(baseline) - math.log(rmssd_ms)` 改成
+    `math.log(rmssd_ms) - math.log(baseline)`，本类**四条全红**（含跨通道那条）。
     """
 
     def test_higher_metric_means_lower_arousal(self) -> None:
@@ -363,13 +423,12 @@ class TestHrvSignDirection:
             f"μa 对 RMSSD 非严格递减：{readings}"
         )
 
-    def test_opposite_sign_to_eda_channel_on_same_numbers(self) -> None:
-        """**跨通道反号守卫**：同一组数字喂两条通道，μa 必须**符号相反**。
+    def test_opposite_sign_to_eda_channel_on_same_direction(self) -> None:
+        """**跨通道反号守卫**：同一"指标高于基线"的事件喂两条通道，μa 必须**符号相反**。
 
         这是「照抄 EdaChannel 那一行」这一具体错误的直接探针——两通道结构完全同构、
-        只有减法方向不同，故同样的 (基线, 当前) 必须给出互为相反数的读数。
+        只有减法方向不同，故"指标高于基线"必须在两条通道上给出相反符号的读数。
         任一侧的方向被改成与另一侧一致，本例立刻红。
-        （量纲刻意对齐：EDA 用 ref=1.0μS 喂 Δ=+0.3；HRV 用 ref=100ms 喂 Δ=−30ms。）
         """
         eda_clock, hrv_clock = FakeClock(), FakeClock()
         eda = EdaChannel(
@@ -386,12 +445,12 @@ class TestHrvSignDirection:
             eda_clock.advance(100.0)
         _warm(hrv, hrv_clock, 60.0)
 
-        # 两侧都让「当前 = 基线 + 0.3×ref」：EDA 5.0→5.3μS；HRV 60→90ms
+        # 两侧都让「当前 > 基线」：EDA 5.0→5.3μS；HRV 60→90ms
         eda_prior = asyncio.run(eda.sense({"eda": np.full(60, 5.3), "sampling_rate": 4}))
         hrv_prior = _sense(hrv, 90.0)
         assert eda_prior is not None and hrv_prior is not None
-        assert eda_prior.mu[1] == pytest.approx(0.3, abs=1e-9)
-        assert hrv_prior.mu[1] == pytest.approx(-0.3, abs=1e-9)
+        assert eda_prior.mu[1] > 0.0, "EDA：指标高于基线 → μa 正"
+        assert hrv_prior.mu[1] < 0.0, "HRV：指标高于基线 → μa 负（方向相反）"
         assert eda_prior.mu[1] * hrv_prior.mu[1] < 0, (
             f"两通道对「指标高于基线」给出同号读数（EDA {eda_prior.mu[1]}, "
             f"HRV {hrv_prior.mu[1]}）——HRV 很可能照抄了 EDA 的减法方向"
@@ -402,8 +461,7 @@ class TestHrvSignDirection:
 
         地板的可观测后果：**所有**高于基线的 RMSSD 被压成同一个读数（v1 里是 −1.0）。
         故本例喂两个不同的「高于基线」水平，要求读数**互不相同**且都严格 >−1（未饱和）。
-        判别力已实证：在产品码里恢复 `delta = max(0.0, delta)` 或对 μa 取
-        `max(-1.0, ...)` 之类的单侧处理，本例即红。
+        判别力已实证：在产品码里恢复单侧处理，本例即红。
         """
         clock = FakeClock()
         channel = _hrv_channel(clock)
@@ -412,8 +470,8 @@ class TestHrvSignDirection:
         clock.advance(100.0)
         strong = _sense(channel, 100.0)
         assert mild is not None and strong is not None
-        assert mild.mu[1] == pytest.approx(-0.2, abs=1e-9)
-        assert strong.mu[1] == pytest.approx(-0.4, abs=1e-9)
+        assert mild.mu[1] == pytest.approx(math.log(60.0 / 80.0), abs=1e-9)
+        assert strong.mu[1] == pytest.approx(math.log(60.0 / 100.0), abs=1e-9)
         assert mild.mu[1] != strong.mu[1], "两个不同的低唤醒水平读出同一个数 → 地板还在"
         assert -1.0 < strong.mu[1] < mild.mu[1] < 0.0
 
@@ -434,7 +492,7 @@ class TestHrvNaNGuard:
         clock.advance(100.0)
         prior = _sense(channel, 30.0)
         assert prior is not None
-        assert prior.mu[1] == pytest.approx(0.3, abs=1e-9)  # 基线未被 NaN 破坏
+        assert prior.mu[1] == pytest.approx(math.log(60.0 / 30.0), abs=1e-9)  # 基线未被 NaN 破坏
 
     def test_inf_is_also_rejected(self) -> None:
         """inf 同样是「非有限」→ 无证据（`np.isfinite` 而非 `not np.isnan`）。"""
@@ -461,12 +519,12 @@ class TestHrvReset:
         """判别性正控：**不** reset 就换被试，新被试的读数由旧被试基线决定（污染实证）。
 
         本例把「reset 契约的必要性」变成可观测量：同样喂 30ms 的新被试窗，
-        沿用旧被试 200ms 基线时读到 +1.0（饱和），reset 后则回到冷启动 None。
+        沿用旧被试 200ms 基线时读到饱和（+1.0），reset 后则回到冷启动 None。
         删掉 `HrvChannel.reset` 会让 `PerceptionHub.reset_all()` 对 HRV **静默无效**——
         无异常、无日志，只有读数悄悄错，故必须有守卫直接盯住它。
         """
         clock = FakeClock()
-        channel = _hrv_channel(clock)
+        channel = _hrv_channel(clock, ln_delta_ref=0.1)  # 小 ref 使跨被试污染可靠饱和
         _warm(channel, clock, 200.0)  # 旧被试：高 RMSSD 水平
 
         polluted = _sense(channel, 30.0)  # 新被试第一窗，未 reset
@@ -589,23 +647,27 @@ class TestBothPhysioStreamsColdStart:
 
 
 class TestHrvConstantsMatchCalibration:
-    """**四个** HRV 常量须与 WESAD 标定选定值一致——改动即须重跑标定（防静默漂移）。
+    """**五个** HRV 常量须与 WESAD v3 标定选定值一致——改动即须重跑标定（防静默漂移）。
 
     同时断言**模块常量**与**构造后实例属性**：只 pin 模块常量会漏掉「默认值绑错常量」
     这一类改动（EDA 那次 code-review WARN #4 的教训——类名承诺多少就 pin 多少）。
 
     ⚠ horizon 与 EDA 的 `_SCL_BASELINE_HORIZON_SECONDS` 同为 1800.0 是**独立推导后的
     巧合**（HRV 目标函数是持续比拐点），不是照抄——两组常量刻意分家，改一处不得静默
-    影响另一通道。`delta_ref` 就完全不同（100ms vs 1.0μS，量纲不可比）。
+    影响另一通道。`ln_delta_ref` 就完全不同（3.0nats vs 1.0μS，量纲不可比）。
     """
 
     def test_horizon_pinned(self) -> None:
         assert _RMSSD_BASELINE_HORIZON_SECONDS == 1800.0
         assert HrvChannel().baseline_horizon_seconds == 1800.0
 
-    def test_delta_ref_pinned(self) -> None:
-        assert _RMSSD_DELTA_REF_MS == 100.0
-        assert HrvChannel().delta_ref_ms == 100.0
+    def test_ln_delta_ref_pinned(self) -> None:
+        assert _RMSSD_LN_DELTA_REF == 3.0
+        assert HrvChannel().ln_delta_ref == 3.0
+
+    def test_epsilon_ms_pinned(self) -> None:
+        assert _RMSSD_EPSILON_MS == 1.0
+        assert HrvChannel().epsilon_ms == 1.0
 
     def test_min_observations_pinned(self) -> None:
         assert _RMSSD_BASELINE_MIN_OBSERVATIONS == 2
@@ -616,8 +678,8 @@ class TestHrvConstantsMatchCalibration:
         assert HrvChannel().baseline_min_coverage_fraction == 0.15
 
     def test_constants_are_not_shared_with_eda(self) -> None:
-        """两组常量必须是各自独立的对象/取值——`delta_ref` 同值即说明有人共用了常量。"""
+        """两组常量必须是各自独立的对象/取值——同值即说明有人共用了常量。"""
         from src.mcp.zero.channels.physio_channel import _SCL_DELTA_REF_US
 
-        assert _RMSSD_DELTA_REF_MS != _SCL_DELTA_REF_US
-        assert HrvChannel().delta_ref_ms != EdaChannel().delta_ref_us
+        assert _RMSSD_LN_DELTA_REF != _SCL_DELTA_REF_US
+        assert HrvChannel().ln_delta_ref != EdaChannel().delta_ref_us
