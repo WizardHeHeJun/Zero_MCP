@@ -23,6 +23,7 @@ import pytest
 
 from src.agents.models.screen_snapshot import ActionRisk
 from src.orchestration.desktop_supervisor import (
+    MAX_ITERATIONS_EXCEEDED,
     DesktopSupervisorAgent,
     _FallbackPromptLoader,
     _parse_plan_response,
@@ -437,8 +438,8 @@ async def test_plan_with_prerendered_prompt() -> None:
 # ── 8. supervisor_node（通过 make_supervisor_node）单元测试 ───────────────────
 
 
-async def test_supervisor_node_returns_4_fields() -> None:
-    """supervisor_node 返回恰好 4 个字段：3 plan 字段 + step_history。"""
+async def test_supervisor_node_returns_5_fields() -> None:
+    """supervisor_node 返回恰好 5 个字段：3 plan 字段 + step_history + iteration_count。"""
     llm = _make_mock_llm(
         next_agent="perceive",
         current_instruction="感知屏幕",
@@ -458,6 +459,7 @@ async def test_supervisor_node_returns_4_fields() -> None:
         "current_instruction",
         "task_status",
         "step_history",
+        "iteration_count",
     }
 
 
@@ -523,6 +525,77 @@ async def test_supervisor_node_missing_api_key_returns_failed() -> None:
     assert result["next_agent"] == "error_report"
     # step_history 仍有效（即使 plan 失败，截断仍执行）
     assert "step_history" in result
+
+
+# ── 8b. 回路硬上限 DESKTOP_MAX_ITERATIONS（K4 紧后 §3.3）─────────────────────
+
+
+async def test_supervisor_node_increments_iteration_count() -> None:
+    """每次非终态调用递增 iteration_count，未达上限不产生 failure_reason。"""
+    llm = _make_mock_llm()
+    agent = DesktopSupervisorAgent(llm_client=llm)
+    node_fn = make_supervisor_node(agent)
+    state = _make_state()
+    state = state.model_copy(update={"iteration_count": 4})
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        result = await node_fn(state)
+
+    assert result["iteration_count"] == 5
+    assert "failure_reason" not in result
+    llm.messages.create.assert_called_once()
+
+
+async def test_supervisor_node_max_iterations_cap_hits() -> None:
+    """命中硬上限：不调 LLM，返回 failure_reason=max_iterations_exceeded +
+    next_agent=error_report，且不设 task_status（终态由 error_report_node 落，
+    与 LLM 判定失败可区分——设计输入 §3.3）。"""
+    llm = _make_mock_llm()
+    agent = DesktopSupervisorAgent(llm_client=llm)
+    node_fn = make_supervisor_node(agent)
+    state = _make_state().model_copy(update={"iteration_count": 3})
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        with patch("src.orchestration.desktop_supervisor.DESKTOP_MAX_ITERATIONS", 3):
+            result = await node_fn(state)
+
+    assert result["failure_reason"] == MAX_ITERATIONS_EXCEEDED
+    assert result["next_agent"] == "error_report"
+    assert "task_status" not in result, "硬上限不直接设终态，由 error_report_node 统一落"
+    assert result["iteration_count"] == 4
+    llm.messages.create.assert_not_called()
+
+
+async def test_supervisor_node_below_cap_plan_called() -> None:
+    """低于上限一轮（第 cap 轮本身仍允许）：正常调 LLM，无 failure_reason。"""
+    llm = _make_mock_llm()
+    agent = DesktopSupervisorAgent(llm_client=llm)
+    node_fn = make_supervisor_node(agent)
+    state = _make_state().model_copy(update={"iteration_count": 2})
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        with patch("src.orchestration.desktop_supervisor.DESKTOP_MAX_ITERATIONS", 3):
+            result = await node_fn(state)
+
+    assert "failure_reason" not in result
+    assert result["iteration_count"] == 3
+    llm.messages.create.assert_called_once()
+
+
+async def test_supervisor_node_terminal_state_no_iteration_increment() -> None:
+    """终态守卫优先于硬上限：DONE 时返回空增量，不递增 iteration_count。"""
+    llm = _make_mock_llm()
+    agent = DesktopSupervisorAgent(llm_client=llm)
+    node_fn = make_supervisor_node(agent)
+    state = _make_state().model_copy(
+        update={"task_status": TaskStatus.DONE, "iteration_count": 99}
+    )
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
+        with patch("src.orchestration.desktop_supervisor.DESKTOP_MAX_ITERATIONS", 3):
+            result = await node_fn(state)
+
+    assert result == {}
 
 
 # ── 9. 顶层占位 supervisor_node 始终 raise RuntimeError ─────────────────────

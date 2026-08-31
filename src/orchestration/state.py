@@ -136,6 +136,10 @@ class DesktopTaskState(BaseModel):
                           累加，无任何信号则归零——K5 ② 连续语义）。
       last_screen_hash  — 上次感知的屏幕 phash（停滞检测用，字符串序列化 bits）。
       counted_error_fingerprint — 信号 C 已计数的错误指纹（K5 ① 去重）。
+      iteration_count   — Supervisor 规划轮次计数（supervisor_node 每次非终态
+                          调用递增；DESKTOP_MAX_ITERATIONS 硬上限判据）。
+      failure_reason    — 可区分的失败原因机读标识（如 max_iterations_exceeded），
+                          与 LLM 判定的 FAILED 分离；None=无专属失败原因。
       uia_hollow        — 当前目标窗口是否 UIA 空洞（Task 1 实测，影响提示词；
                           由 perceive 增量随快照刷新，感知失败时保留旧值）。
       target_window_handle — 定向感知目标窗口 HWND（K6，None=前台窗口）。
@@ -174,6 +178,14 @@ class DesktopTaskState(BaseModel):
     # state 里会跨节点残留（perceive 成功不清 control_error），按指纹去重保证
     # 同一错误只计一次；错误清空后指纹归 None，同一错误再现视为新停滞事件。
     counted_error_fingerprint: str | None = None
+
+    # 回路硬上限（设计输入 notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md
+    # §3.3，先例=Agent SDK agent-loop 的 error_max_turns 专属子类型）：
+    # supervisor_node 每次非终态调用递增；命中 DESKTOP_MAX_ITERATIONS 时设
+    # failure_reason="max_iterations_exceeded" 并路由 error_report——与 LLM
+    # 判定失败可区分，不混用。
+    iteration_count: int = 0
+    failure_reason: str | None = None
 
     # UIA 空洞标记（Task 1 实测；K4 起由 perceive 增量随快照刷新）
     uia_hollow: bool = False

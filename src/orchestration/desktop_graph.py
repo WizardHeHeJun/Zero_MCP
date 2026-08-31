@@ -152,11 +152,13 @@ def route_after_supervisor(
 
     优先级（从高到低）：
       1. task_status in (DONE, FAILED) → memory_flush（任务结束，写记忆）
-      2. stall_count >= STALL_THRESHOLD → error_report（停滞超阈值）
-      3. next_agent == "perceive" → perceive
-      4. next_agent == "control" → control
-      5. is_browser_task(current_instruction) → playwright
-      6. 默认 → error_report（未识别的 next_agent）
+      2. failure_reason 非 None → error_report（专属失败原因，如
+         max_iterations_exceeded——K4 紧后 §3.3 回路硬上限）
+      3. stall_count >= STALL_THRESHOLD → error_report（停滞超阈值）
+      4. next_agent == "perceive" → perceive
+      5. next_agent == "control" → control
+      6. is_browser_task(current_instruction) → playwright
+      7. 默认 → error_report（未识别的 next_agent）
 
     注意：感知失败停滞路径（perception_error 非 None）由 stall_detect_node 累加
     stall_count，再由此函数的规则 2 路由至 error_report（R3 决策）。
@@ -180,7 +182,15 @@ def route_after_supervisor(
         )
         return "memory_flush"
 
-    # 规则 2：停滞超阈值 → error_report
+    # 规则 2：专属失败原因（回路硬上限等）→ error_report
+    if state.failure_reason is not None:
+        logger.debug(
+            "route_after_supervisor: failure_reason=%r → error_report",
+            state.failure_reason,
+        )
+        return "error_report"
+
+    # 规则 3：停滞超阈值 → error_report
     if stall_count >= STALL_THRESHOLD:
         logger.debug(
             "route_after_supervisor: stall_count=%d >= STALL_THRESHOLD=%d → error_report",
@@ -189,13 +199,13 @@ def route_after_supervisor(
         )
         return "error_report"
 
-    # 规则 3-4：按 next_agent 路由
+    # 规则 4-5：按 next_agent 路由
     if next_agent == "perceive":
         return "perceive"
     if next_agent == "control":
         return "control"
 
-    # 规则 5：浏览器任务 → playwright
+    # 规则 6：浏览器任务 → playwright
     if is_browser_task(instruction):
         logger.debug("route_after_supervisor: is_browser_task=True → playwright")
         return "playwright"
@@ -454,10 +464,11 @@ def make_error_report_node(
         }
 
         logger.error(
-            "error_report_node: task_id=%r stall_count=%d "
+            "error_report_node: task_id=%r stall_count=%d failure_reason=%r "
             "perception_error=%r control_error=%r snapshot_ref=%r",
             state.task_id,
             state.stall_count,
+            state.failure_reason,
             state.perception_error,
             state.control_error,
             state.snapshot_ref,
@@ -472,6 +483,10 @@ def make_error_report_node(
                 metadata={
                     "task_description": state.task_description,
                     "task_status": state.task_status,
+                    # K4 紧后 §3.3：专属失败原因（如 max_iterations_exceeded），
+                    # None=经停滞/错误路径进入（非硬上限）
+                    "failure_reason": state.failure_reason,
+                    "iteration_count": state.iteration_count,
                     "step_count": len(state.step_history),
                     # 前 N 步流程（Task 14：异常现场含步骤历史，窗口 INCIDENT_STEP_WINDOW）。
                     # perception_summary 逐步截断（对齐 PERCEPTION_SUMMARY_MAX_TOKENS 的
@@ -536,6 +551,8 @@ def make_memory_flush_node(
             f"执行步骤数: {len(state.step_history)}",
             f"停滞计数: {state.stall_count}",
         ]
+        if state.failure_reason:
+            summary_lines.append(f"失败原因: {state.failure_reason}")
         if state.perception_summary:
             summary_lines.append(f"最终感知摘要: {state.perception_summary[:500]}")
         if state.perception_error:
@@ -548,6 +565,7 @@ def make_memory_flush_node(
             "step_count": len(state.step_history),
             "stall_count": state.stall_count,
             "task_status": state.task_status,
+            "failure_reason": state.failure_reason,
         }
 
         # 写入记忆（scope="session"，显式不默认 user）
