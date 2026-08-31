@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL = "claude-opus-4-8"
 DESKTOP_SUPERVISOR_MODEL: str = os.environ.get("DESKTOP_SUPERVISOR_MODEL", _DEFAULT_MODEL)
 
+# ── 主备模型单次切换（K3 紧后 §2.2）────────────────────────────────────────────
+# 设计输入 notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md §2.2：
+# 主模型调用异常时自动切备用重试**一次**，该次不再回退（防主备互踢死循环）——
+# 仿 UFO llm_call.py get_completion(use_backup_engine) 递归一次后置 False。
+# 空/未配置 = 无备用，保持现状降级 FAILED（零回归）。
+DESKTOP_SUPERVISOR_MODEL_FALLBACK: str | None = (
+    os.environ.get("DESKTOP_SUPERVISOR_MODEL_FALLBACK") or None
+)
+
 # ── 回路硬上限（K4 紧后 §3.3）──────────────────────────────────────────────────
 # 设计输入 notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md §3.3：
 # env 可配硬上限，命中返回可区分的 failure_reason="max_iterations_exceeded"，
@@ -275,6 +284,7 @@ class DesktopSupervisorAgent:
         prompt_loader: PromptLoader | None = None,
         step_archive: StepArchive | None = None,
         model: str | None = None,
+        fallback_model: str | None = None,
     ) -> None:
         """初始化 DesktopSupervisorAgent。
 
@@ -284,11 +294,15 @@ class DesktopSupervisorAgent:
             prompt_loader: PromptLoader Protocol 实现；None 时使用占位实现。
             step_archive: StepArchive 打桩实例；None 时使用默认打桩（无操作）。
             model: 模型 ID 覆写；None 时读 DESKTOP_SUPERVISOR_MODEL 环境变量。
+            fallback_model: 备用模型 ID 覆写（K3 紧后 §2.2 主备单次切换）；
+                None 时读 DESKTOP_SUPERVISOR_MODEL_FALLBACK 环境变量，
+                两者皆空 = 无备用（主模型失败即 FAILED，现状零回归）。
         """
         self.llm_client = llm_client
         self.prompt_loader: PromptLoader = prompt_loader or _FallbackPromptLoader()
         self.step_archive: StepArchive = step_archive or StepArchive()
         self.model: str = model or DESKTOP_SUPERVISOR_MODEL
+        self.fallback_model: str | None = fallback_model or DESKTOP_SUPERVISOR_MODEL_FALLBACK
 
     async def plan(
         self,
@@ -299,6 +313,11 @@ class DesktopSupervisorAgent:
 
         不含业务路由判断（next_agent 直接来自 LLM，条件边函数负责解释路由）。
 
+        主备单次切换（K3 紧后 §2.2）：主模型调用异常且配置了备用模型
+        （fallback_model）时，自动切备用重试一次；备用也失败 → FAILED（不再
+        回退，防互踢死循环）。仅覆盖**调用异常**——响应解析失败不触发切换
+        （解析问题与模型可用性无关，切模型救不了）。未配置备用时保持现状。
+
         Args:
             state: 当前任务 state。
             rendered_prompt: 可选的预渲染提示词 (system, user)；
@@ -306,7 +325,7 @@ class DesktopSupervisorAgent:
 
         Returns:
             dict，含 next_agent / current_instruction / task_status 3 个字段。
-            缺 ANTHROPIC_API_KEY 或 LLM 调用失败时返回 task_status=FAILED。
+            缺 ANTHROPIC_API_KEY 或 LLM 调用（含备用）失败时返回 task_status=FAILED。
         """
         # 检查 API key
         if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -331,31 +350,77 @@ class DesktopSupervisorAgent:
         else:
             system_prompt, user_prompt = self.prompt_loader.render_supervisor(state)
 
-        # 调用 LLM
+        # 调用 LLM：主模型一次；异常且有备用 → 备用一次；再失败 → FAILED
+        # （§2.2：单次切换不递归，防主备互踢死循环）
         try:
-            response = await self.llm_client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw_text: str = response.content[0].text
-            logger.debug(
-                "DesktopSupervisorAgent.plan: LLM 返回 raw=%r",
-                raw_text[:200],
-            )
+            raw_text: str = await self._call_llm(self.model, system_prompt, user_prompt)
         except Exception as exc:
+            if self.fallback_model is None:
+                logger.warning(
+                    "DesktopSupervisorAgent.plan: LLM 调用失败（%s），无备用模型",
+                    exc,
+                )
+                return {
+                    "next_agent": "error_report",
+                    "current_instruction": f"LLM 调用失败: {exc}",
+                    "task_status": TaskStatus.FAILED,
+                }
             logger.warning(
-                "DesktopSupervisorAgent.plan: LLM 调用失败（%s）",
+                "DesktopSupervisorAgent.plan: 主模型 %r 调用失败（%s），"
+                "切备用模型 %r 重试一次",
+                self.model,
                 exc,
+                self.fallback_model,
             )
-            return {
-                "next_agent": "error_report",
-                "current_instruction": f"LLM 调用失败: {exc}",
-                "task_status": TaskStatus.FAILED,
-            }
+            try:
+                raw_text = await self._call_llm(
+                    self.fallback_model, system_prompt, user_prompt
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "DesktopSupervisorAgent.plan: 备用模型 %r 也失败（%s），任务 FAILED",
+                    self.fallback_model,
+                    fallback_exc,
+                )
+                return {
+                    "next_agent": "error_report",
+                    "current_instruction": (
+                        f"LLM 调用失败（主备均败）: 主={exc} 备={fallback_exc}"
+                    ),
+                    "task_status": TaskStatus.FAILED,
+                }
 
         return _parse_plan_response(raw_text)
+
+    async def _call_llm(self, model: str, system_prompt: str, user_prompt: str) -> str:
+        """单次 LLM 调用（主/备共用），返回响应文本；异常向上抛由 plan 分级处理。
+
+        边界说明（PR #27 审查 INFO）：`response.content[0].text` 的提取在本方法
+        内——**响应对象结构异常**（空 content 的 IndexError、非文本块的
+        AttributeError）与网络/调用异常一并归类为「调用异常」，会触发主备切换；
+        「不触发切换」的解析失败专指 `_parse_plan_response` 的 JSON 内容解析。
+
+        Args:
+            model: 本次调用使用的模型 ID。
+            system_prompt: 系统提示词。
+            user_prompt: 用户提示词。
+
+        Returns:
+            LLM 响应首块文本。
+        """
+        response = await self.llm_client.messages.create(
+            model=model,
+            max_tokens=512,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw_text: str = response.content[0].text
+        logger.debug(
+            "DesktopSupervisorAgent._call_llm: model=%r 返回 raw=%r",
+            model,
+            raw_text[:200],
+        )
+        return raw_text
 
 
 # ── supervisor_node 节点函数工厂 ───────────────────────────────────────────────

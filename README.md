@@ -195,6 +195,7 @@ cd mcp-server && npm install && npm run typecheck
 ### 模型接入
 
 - `ANTHROPIC_API_KEY`：已设且 anthropic 包可用时 `get_graph` 默认装配自动构造 AsyncAnthropic 注入默认 Supervisor；缺失/包不可用时 `llm_client=None`——「优雅回退」＝**不崩溃且有终态**（plan 返回 FAILED 经 error_report → memory_flush 收口），不是任务可继续执行。
+- `DESKTOP_SUPERVISOR_MODEL_FALLBACK`（默认空=无备用）：主模型**调用异常**时自动切备用模型重试**一次**，该次不再回退（防主备互踢死循环，仿 UFO `get_completion(use_backup_engine)` 单次语义）；备用也失败才 FAILED。只覆盖调用异常——响应解析失败不触发切换（与模型可用性无关，切模型救不了）。
 
 ### zero-link · external_priors 多模态先验
 
