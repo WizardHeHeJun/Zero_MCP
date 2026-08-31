@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cv2
@@ -89,7 +89,7 @@ def _make_mock_client(write_result: ActionResult | None = None) -> MagicMock:
 
 def _make_mock_guard(
     risk: ActionRisk = ActionRisk.DESTRUCTIVE,
-    toctou_verdict: str = "pass",
+    toctou_verdict: Literal["pass", "abort", "abort_degraded"] = "pass",
 ) -> MagicMock:
     """构造 mock ActionGuard。"""
     guard = MagicMock()

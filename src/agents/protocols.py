@@ -73,7 +73,8 @@ class ActionGuardProtocol(Protocol):
 
     方法语义与 ActionGuard 一致（规格书 §1.2 / §1.5）：
       classify_risk  — 三级白名单风险判定，返回有效 ActionRisk。
-      toctou_verify  — Pre-execution UI State Verification，返回 pass/abort。
+      toctou_verify  — Pre-execution UI State Verification，返回
+                       pass / abort（界面已变）/ abort_degraded（验证降级）。
     """
 
     async def classify_risk(self, action: ActionSpec) -> ActionRisk:
