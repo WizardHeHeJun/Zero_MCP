@@ -54,6 +54,9 @@ _ACTION_RISK_WHITELIST: dict[str, ActionRisk] = {
     "focus_window": ActionRisk.LOW_RISK,
     "move_mouse": ActionRisk.LOW_RISK,
     "scroll": ActionRisk.LOW_RISK,
+    # ActionSpec 生成层 K4 元动作（notes/2026-08-31-actionspec-generation-blueprint.md
+    # 决策 B）：wait 只本地 asyncio.sleep，无 client RPC，可逆。
+    "wait": ActionRisk.LOW_RISK,
     "click": ActionRisk.LOW_RISK,
     "type": ActionRisk.LOW_RISK,
     "key": ActionRisk.LOW_RISK,
