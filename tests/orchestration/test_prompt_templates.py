@@ -46,6 +46,7 @@ def _make_default_user_vars(
     task_description: str = "打开计算器并计算 1+1",
     step_history_window: list[dict] | None = None,
     perception_summary: str | None = "屏幕显示桌面，无目标窗口。",
+    last_step_outcome: str = "initial",
     errors: dict | None = None,
     capability_flags: dict | None = None,
     stall_count: int = 0,
@@ -56,6 +57,7 @@ def _make_default_user_vars(
         "task_description": task_description,
         "step_history_window": step_history_window if step_history_window is not None else [],
         "perception_summary": perception_summary,
+        "last_step_outcome": last_step_outcome,
         "errors": errors
         if errors is not None
         else {"perception_error": None, "control_error": None},
@@ -352,3 +354,40 @@ def test_user_template_step_with_errors_renders() -> None:
     )
     assert "截图失败：屏幕锁定" in rendered
     assert "元素不可交互" in rendered
+
+
+# ── last_step_outcome 三态分支（K4 紧后 §3.2）────────────────────────────────
+
+
+def test_user_template_outcome_initial_branch() -> None:
+    """last_step_outcome=initial → 渲染「第一步」提示，不含成功/失败段落。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="initial")
+    )
+    assert "任务的第一步" in rendered
+    assert "上一步执行**成功**" not in rendered
+    assert "上一步执行**失败**" not in rendered
+
+
+def test_user_template_outcome_succeeded_branch() -> None:
+    """last_step_outcome=succeeded → 渲染成功段落，不含失败指导文案。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="succeeded")
+    )
+    assert "上一步执行**成功**" in rendered
+    assert "不要原样重试同一动作" not in rendered
+
+
+def test_user_template_outcome_failed_branch_has_guidance() -> None:
+    """last_step_outcome=failed → 渲染失败段落 + 可恢复/不可恢复指导文案
+    （§3.2：错误文案写「为什么失败 + 下一步可做什么」）。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="failed")
+    )
+    assert "上一步执行**失败**" in rendered
+    assert "不要原样重试同一动作" in rendered
+    assert "可恢复" in rendered
+    assert "FAILED" in rendered

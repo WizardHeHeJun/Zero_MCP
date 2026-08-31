@@ -25,6 +25,7 @@ from src.orchestration.prompt_loader import (
     PromptLoader,
     _truncate_perception_summary,
     _truncate_step_window,
+    derive_last_step_outcome,
 )
 from src.orchestration.state import DesktopTaskState, StepRecord, TaskStatus
 
@@ -387,3 +388,60 @@ class TestTruncatePerceptionSummary:
         """空字符串不截断（返回空字符串）。"""
         result = _truncate_perception_summary("", max_chars=2000)
         assert result == ""
+
+
+# ── derive_last_step_outcome（K4 紧后 §3.2，纯函数）──────────────────────────
+
+
+class TestDeriveLastStepOutcome:
+    """上一步结果三态派生：initial / succeeded / failed。"""
+
+    def test_empty_history_is_initial(self) -> None:
+        """空 step_history → initial。"""
+        assert derive_last_step_outcome([]) == "initial"
+
+    def test_clean_last_step_is_succeeded(self) -> None:
+        """最后一步无错误 → succeeded。"""
+        steps = [_make_step(0), _make_step(1)]
+        assert derive_last_step_outcome(steps) == "succeeded"
+
+    def test_last_step_control_error_is_failed(self) -> None:
+        """最后一步带 control_error → failed。"""
+        bad = _make_step(1).model_copy(update={"control_error": "TOCTOU abort"})
+        assert derive_last_step_outcome([_make_step(0), bad]) == "failed"
+
+    def test_last_step_perception_error_is_failed(self) -> None:
+        """最后一步带 perception_error → failed。"""
+        bad = _make_step(1).model_copy(update={"perception_error": "截图失败"})
+        assert derive_last_step_outcome([_make_step(0), bad]) == "failed"
+
+    def test_earlier_error_but_last_clean_is_succeeded(self) -> None:
+        """判别负对照：历史中段有错误、最后一步干净 → succeeded（只看最后一步，
+        不被平铺 history 中的旧错误污染——这正是三态存在的意义）。"""
+        bad = _make_step(0).model_copy(update={"control_error": "旧错误"})
+        assert derive_last_step_outcome([bad, _make_step(1)]) == "succeeded"
+
+
+class TestRenderLastStepOutcome:
+    """render_supervisor 集成：三态驱动 user_prompt 段落。"""
+
+    def test_failed_state_renders_guidance(self, loader: PromptLoader) -> None:
+        """最后一步失败 → user_prompt 含失败指导文案（禁原样重试）。"""
+        bad = _make_step(1).model_copy(update={"control_error": "元素不可交互"})
+        state = _make_state(step_history=[_make_step(0), bad])
+        _, user = loader.render_supervisor(state)
+        assert "上一步执行**失败**" in user
+        assert "不要原样重试同一动作" in user
+
+    def test_clean_state_renders_succeeded(self, loader: PromptLoader) -> None:
+        """最后一步干净 → user_prompt 含成功段落，无失败指导文案。"""
+        state = _make_state(step_history=[_make_step(0), _make_step(1)])
+        _, user = loader.render_supervisor(state)
+        assert "上一步执行**成功**" in user
+        assert "不要原样重试同一动作" not in user
+
+    def test_empty_history_renders_initial(self, loader: PromptLoader) -> None:
+        """空历史 → user_prompt 含第一步提示。"""
+        state = _make_state(step_history=[])
+        _, user = loader.render_supervisor(state)
+        assert "任务的第一步" in user
