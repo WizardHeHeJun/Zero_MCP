@@ -207,21 +207,27 @@ def test_user_template_contains_stall_count() -> None:
 
 
 def test_user_template_contains_perception_error() -> None:
-    """user 模板包含 errors.perception_error 内容（非 None 时）。"""
+    """user 模板包含 errors.perception_error 内容（failed 分支才渲染，PR #26 WARN①）。"""
     env = _make_env()
     err_msg = "MCP 连接超时，无法获取屏幕快照"
     rendered = env.get_template("supervisor_user.jinja2").render(
-        _make_default_user_vars(errors={"perception_error": err_msg, "control_error": None})
+        _make_default_user_vars(
+            last_step_outcome="failed",
+            errors={"perception_error": err_msg, "control_error": None},
+        )
     )
     assert err_msg in rendered
 
 
 def test_user_template_contains_control_error() -> None:
-    """user 模板包含 errors.control_error 内容（非 None 时）。"""
+    """user 模板包含 errors.control_error 内容（failed 分支才渲染，PR #26 WARN①）。"""
     env = _make_env()
     err_msg = "元素不可点击：按钮已禁用"
     rendered = env.get_template("supervisor_user.jinja2").render(
-        _make_default_user_vars(errors={"perception_error": None, "control_error": err_msg})
+        _make_default_user_vars(
+            last_step_outcome="failed",
+            errors={"perception_error": None, "control_error": err_msg},
+        )
     )
     assert err_msg in rendered
 
@@ -391,3 +397,29 @@ def test_user_template_outcome_failed_branch_has_guidance() -> None:
     assert "不要原样重试同一动作" in rendered
     assert "可恢复" in rendered
     assert "FAILED" in rendered
+
+
+def test_user_template_succeeded_hides_stale_errors() -> None:
+    """PR #26 审查 WARN① 收口：上一步成功时 LastValue 残留的 errors 不渲染——
+    避免「上一步执行成功」与「控制错误：…」并列的自相矛盾上下文。
+    旧错误原文仍经执行历史表逐步保留（不丢信息）。"""
+    env = _make_env()
+    stale = "TOCTOU abort: 界面在执行前发生变化 (action_id=old-001)"
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(
+            last_step_outcome="succeeded",
+            errors={"perception_error": None, "control_error": stale},
+        )
+    )
+    assert "上一步执行**成功**" in rendered
+    assert stale not in rendered, "succeeded 分支不得渲染 LastValue 残留错误"
+
+
+def test_user_template_unknown_outcome_falls_back_conservative() -> None:
+    """PR #26 审查 INFO 收口：last_step_outcome 意外值走 else 兜底（保守按失败处理），
+    不再静默缺整节。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="")
+    )
+    assert "上一步结果未知" in rendered
