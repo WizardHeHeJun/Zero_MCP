@@ -353,6 +353,26 @@ class TestErrorReportNodeRecentSteps:
         # dict 可直接 json 序列化（model_dump(mode="json") 保证）
         json.dumps(recent, ensure_ascii=False)
 
+    async def test_metadata_carries_failure_reason_and_iteration_count(self) -> None:
+        """K4 紧后 §3.3：现场包 metadata 带 failure_reason 与 iteration_count——
+        回路硬上限失败在事后排障时与停滞/LLM 失败可区分。"""
+        reporter = MagicMock()
+        reporter.report = AsyncMock()
+        node = make_error_report_node(incident_reporter=reporter)
+
+        state = DesktopTaskState(
+            task_id="task-max-iter",
+            task_description="硬上限现场包测试",
+            task_status=TaskStatus.RUNNING,
+            failure_reason="max_iterations_exceeded",
+            iteration_count=31,
+        )
+        await node(state)
+
+        metadata = reporter.report.await_args.kwargs["metadata"]
+        assert metadata["failure_reason"] == "max_iterations_exceeded"
+        assert metadata["iteration_count"] == 31
+
     async def test_recent_steps_perception_summary_truncated(self) -> None:
         """超长 perception_summary 逐步截断到 INCIDENT_SUMMARY_MAX_CHARS + 截断标记。
 

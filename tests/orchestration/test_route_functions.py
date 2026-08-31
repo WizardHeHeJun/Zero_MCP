@@ -100,10 +100,34 @@ class TestRouteAfterSupervisor:
         assert route_after_supervisor(state) == "error_report"
 
     def test_done_takes_priority_over_stall(self) -> None:
-        """DONE + stall_count 超阈 → memory_flush（规则 1 优先于规则 2）。"""
+        """DONE + stall_count 超阈 → memory_flush（规则 1 优先于规则 3）。"""
         state = _make_state(
             task_status=TaskStatus.DONE,
             stall_count=STALL_THRESHOLD + 10,
+        )
+        assert route_after_supervisor(state) == "memory_flush"
+
+    def test_failure_reason_routes_to_error_report(self) -> None:
+        """failure_reason 非 None → error_report（规则 2），优先于 next_agent。
+
+        K4 紧后 §3.3：回路硬上限命中后 supervisor 设 failure_reason，
+        即使 next_agent 是合法 Worker 也不得继续派发。
+        """
+        state = _make_state(
+            failure_reason="max_iterations_exceeded",
+            next_agent="perceive",
+        )
+        assert route_after_supervisor(state) == "error_report"
+
+    def test_terminal_takes_priority_over_failure_reason(self) -> None:
+        """FAILED + failure_reason → memory_flush（规则 1 优先于规则 2）。
+
+        error_report_node 落 FAILED 后 failure_reason 仍残留在 LastValue state，
+        下一轮 supervisor 必须按终态收口，不得再进 error_report 死循环。
+        """
+        state = _make_state(
+            task_status=TaskStatus.FAILED,
+            failure_reason="max_iterations_exceeded",
         )
         assert route_after_supervisor(state) == "memory_flush"
 

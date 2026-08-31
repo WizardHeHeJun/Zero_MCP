@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL = "claude-opus-4-8"
 DESKTOP_SUPERVISOR_MODEL: str = os.environ.get("DESKTOP_SUPERVISOR_MODEL", _DEFAULT_MODEL)
 
+# ── 回路硬上限（K4 紧后 §3.3）──────────────────────────────────────────────────
+# 设计输入 notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md §3.3：
+# env 可配硬上限，命中返回可区分的 failure_reason="max_iterations_exceeded"，
+# 不与 LLM 判定失败混用（先例=Agent SDK agent-loop 的 error_max_turns 专属
+# 子类型；computer-use-demo 的裸 while True 是反面）。
+# 默认 30 为工程假设：一轮 ≈ supervisor+worker+stall 三个超步，须配合调用方
+# recursion_limit ≥ 3×上限+裕量（停滞收口本身要 ~8 轮，30 覆盖其 3 倍余量）。
+DESKTOP_MAX_ITERATIONS: int = int(os.environ.get("DESKTOP_MAX_ITERATIONS", "30"))
+
+MAX_ITERATIONS_EXCEEDED: str = "max_iterations_exceeded"
+"""failure_reason 机读值：回路硬上限命中（与 LLM 判定 FAILED 可区分）。"""
+
 # ── PromptLoader Protocol（依赖注入接口，不 import 具体实现）────────────────────
 
 
@@ -364,9 +376,14 @@ def make_supervisor_node(agent: DesktopSupervisorAgent) -> Any:
              直接返回空增量 {}——route_after_supervisor 规则 1 会导向 memory_flush。
              防两类回退：终态被 LLM 新 plan 覆写回 RUNNING；人工拒绝（FAILED）后
              同一 pending_action 再次路由进 control 重复 interrupt。
+          0b. 回路硬上限（K4 紧后 §3.3）：本轮为第 iteration_count+1 轮，超过
+             DESKTOP_MAX_ITERATIONS 时不调 LLM，返回
+             failure_reason="max_iterations_exceeded" + next_agent=error_report
+             ——终态由 error_report_node 统一落（FAILED + 现场包），此处不设
+             task_status，保证与 LLM 判定失败可区分。
           1. 调 agent.plan(state) 获取 3 个增量字段。
           2. 截断 step_history（超 STATE_STEP_KEEP 时调 StepArchive 归档）。
-          3. 返回增量 dict（4 个字段：plan 3 字段 + step_history）。
+          3. 返回增量 dict（plan 3 字段 + step_history + iteration_count 递增）。
 
         注意：无任何业务路由判断（is_browser_task / uia_hollow 等），
               路由逻辑统一在 Task 10BC 的条件边函数中。
@@ -386,6 +403,26 @@ def make_supervisor_node(agent: DesktopSupervisorAgent) -> Any:
             )
             return {}
 
+        # 0b. 回路硬上限（K4 紧后 §3.3）：命中时不调 LLM，failure_reason 可区分
+        this_iteration = state.iteration_count + 1
+        if this_iteration > DESKTOP_MAX_ITERATIONS:
+            logger.error(
+                "supervisor_node: 迭代轮次 %d 超过硬上限 DESKTOP_MAX_ITERATIONS=%d，"
+                "failure_reason=%s → error_report",
+                this_iteration,
+                DESKTOP_MAX_ITERATIONS,
+                MAX_ITERATIONS_EXCEEDED,
+            )
+            return {
+                "next_agent": "error_report",
+                "current_instruction": (
+                    f"回路硬上限命中：已规划 {state.iteration_count} 轮，"
+                    f"上限 {DESKTOP_MAX_ITERATIONS}（DESKTOP_MAX_ITERATIONS）"
+                ),
+                "failure_reason": MAX_ITERATIONS_EXCEEDED,
+                "iteration_count": this_iteration,
+            }
+
         # 1. 获取 plan 增量（3 字段）
         plan_increment = await agent.plan(state)
 
@@ -402,6 +439,7 @@ def make_supervisor_node(agent: DesktopSupervisorAgent) -> Any:
             "current_instruction": plan_increment["current_instruction"],
             "task_status": plan_increment["task_status"],
             "step_history": truncated_history,
+            "iteration_count": this_iteration,
         }
 
     return supervisor_node
