@@ -395,6 +395,11 @@ class DesktopSupervisorAgent:
     async def _call_llm(self, model: str, system_prompt: str, user_prompt: str) -> str:
         """单次 LLM 调用（主/备共用），返回响应文本；异常向上抛由 plan 分级处理。
 
+        边界说明（PR #27 审查 INFO）：`response.content[0].text` 的提取在本方法
+        内——**响应对象结构异常**（空 content 的 IndexError、非文本块的
+        AttributeError）与网络/调用异常一并归类为「调用异常」，会触发主备切换；
+        「不触发切换」的解析失败专指 `_parse_plan_response` 的 JSON 内容解析。
+
         Args:
             model: 本次调用使用的模型 ID。
             system_prompt: 系统提示词。

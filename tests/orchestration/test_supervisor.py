@@ -364,6 +364,10 @@ async def test_plan_llm_call_failure_returns_failed() -> None:
     llm.messages = MagicMock()
     llm.messages.create = AsyncMock(side_effect=RuntimeError("network error"))
     agent = DesktopSupervisorAgent(llm_client=llm)
+    # 环境隔离（PR #27 审查 WARN）：宿主若设 DESKTOP_SUPERVISOR_MODEL_FALLBACK
+    # 会让本例静默走「主备均败」分支背离「恰一次调用」意图；patch.dict 对
+    # 模块导入期已读常量无效，直改实例属性是唯一可靠隔离方式
+    agent.fallback_model = None
     state = _make_state()
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key"}):
