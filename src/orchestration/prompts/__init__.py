@@ -18,6 +18,9 @@
   step_history_window      : list[dict] — 截断后的步骤历史（每项含 step_index/agent/
                              instruction/task_status/control_error/perception_error）
   perception_summary       : str | None — 最新感知摘要（已截断）
+  last_step_outcome        : str  — 上一步结果三态 "initial"|"succeeded"|"failed"
+                             （K4 紧后 §3.2，prompt_loader.derive_last_step_outcome
+                             派生，显式驱动模板分支，不让 LLM 从 history 猜）
   errors                   : dict  — {"perception_error": ..., "control_error": ...}
   capability_flags         : dict[str, bool] — 能力协商结果
   stall_count              : int   — 连续停滞计数

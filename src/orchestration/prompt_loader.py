@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Literal
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -113,6 +114,39 @@ def _truncate_perception_summary(
     return summary[:max_chars]
 
 
+def derive_last_step_outcome(
+    step_history: list[StepRecord],
+) -> Literal["initial", "succeeded", "failed"]:
+    """派生上一步结果三态（K4 紧后 §3.2，纯函数）。
+
+    设计输入 notes/2026-08-05-llm-integration-survey-k3k4-actionspec.md §3.2：
+    prompt 模板用 last_step_outcome 显式驱动不同段落（Agent-S2 manager.py 的
+    failed_subtask 三态拆分先例），不让 LLM 从平铺 history 里自己猜上一步成败。
+
+    三态判据：
+      - "initial"   — step_history 为空（任务第一步）。
+      - "failed"    — 最后一步带 control_error 或 perception_error。
+      - "succeeded" — 其余（最后一步无错误）。
+
+    注：设计输入的失败三分类（可恢复/不可恢复/用户拒绝）中，「用户拒绝」路径
+    （control_error="人工拒绝执行…" + task_status=FAILED）经 supervisor 终态
+    守卫（K5 ③）根本不会再进 LLM 规划——拒绝即任务收口，无需在此分类；
+    可恢复/不可恢复的判断权留给 LLM（模板 failed 分支给出指导性文案）。
+
+    Args:
+        step_history: 完整 step_history（未截断亦可，只看最后一步）。
+
+    Returns:
+        "initial" / "succeeded" / "failed"。
+    """
+    if not step_history:
+        return "initial"
+    last = step_history[-1]
+    if last.control_error is not None or last.perception_error is not None:
+        return "failed"
+    return "succeeded"
+
+
 # ── PromptLoader ──────────────────────────────────────────────────────────────
 
 
@@ -197,10 +231,13 @@ class PromptLoader:
         )
 
         # 3. 组装模板变量（与 prompts/__init__.py 变量约定对齐）
+        # K4 紧后 §3.2：last_step_outcome 三态显式驱动模板分支，
+        # 不让 LLM 从平铺 history 里猜上一步成败
         user_vars: dict[str, object] = {
             "task_description": state.task_description,
             "step_history_window": step_history_window,
             "perception_summary": perception_summary,
+            "last_step_outcome": derive_last_step_outcome(state.step_history),
             "errors": {
                 "perception_error": state.perception_error,
                 "control_error": state.control_error,

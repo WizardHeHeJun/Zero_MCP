@@ -81,6 +81,12 @@ class _FallbackPromptLoader:
 
     不依赖 Jinja2 文件，直接组装基础提示词以保证 supervisor 可独立测试。
     Task 11B 完成后，图构建时注入真实 PromptLoader 替换此占位实现。
+
+    ⚠ 行为分叉提醒（PR #26 审查 WARN②）：本占位不含 last_step_outcome
+    三态引导（K4 紧后 §3.2 只落在真 PromptLoader + jinja2 模板一侧），错误
+    只平铺进历史文本让 LLM 自己猜——恰是三态设计要规避的行为。仅供
+    「直接构造 DesktopSupervisorAgent 而未接线 loader」的兜底场景；生产
+    默认装配（get_graph）注入真 PromptLoader，不走此路径。
     """
 
     def render_supervisor(

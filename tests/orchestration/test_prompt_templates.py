@@ -46,6 +46,7 @@ def _make_default_user_vars(
     task_description: str = "打开计算器并计算 1+1",
     step_history_window: list[dict] | None = None,
     perception_summary: str | None = "屏幕显示桌面，无目标窗口。",
+    last_step_outcome: str = "initial",
     errors: dict | None = None,
     capability_flags: dict | None = None,
     stall_count: int = 0,
@@ -56,6 +57,7 @@ def _make_default_user_vars(
         "task_description": task_description,
         "step_history_window": step_history_window if step_history_window is not None else [],
         "perception_summary": perception_summary,
+        "last_step_outcome": last_step_outcome,
         "errors": errors
         if errors is not None
         else {"perception_error": None, "control_error": None},
@@ -205,21 +207,27 @@ def test_user_template_contains_stall_count() -> None:
 
 
 def test_user_template_contains_perception_error() -> None:
-    """user 模板包含 errors.perception_error 内容（非 None 时）。"""
+    """user 模板包含 errors.perception_error 内容（failed 分支才渲染，PR #26 WARN①）。"""
     env = _make_env()
     err_msg = "MCP 连接超时，无法获取屏幕快照"
     rendered = env.get_template("supervisor_user.jinja2").render(
-        _make_default_user_vars(errors={"perception_error": err_msg, "control_error": None})
+        _make_default_user_vars(
+            last_step_outcome="failed",
+            errors={"perception_error": err_msg, "control_error": None},
+        )
     )
     assert err_msg in rendered
 
 
 def test_user_template_contains_control_error() -> None:
-    """user 模板包含 errors.control_error 内容（非 None 时）。"""
+    """user 模板包含 errors.control_error 内容（failed 分支才渲染，PR #26 WARN①）。"""
     env = _make_env()
     err_msg = "元素不可点击：按钮已禁用"
     rendered = env.get_template("supervisor_user.jinja2").render(
-        _make_default_user_vars(errors={"perception_error": None, "control_error": err_msg})
+        _make_default_user_vars(
+            last_step_outcome="failed",
+            errors={"perception_error": None, "control_error": err_msg},
+        )
     )
     assert err_msg in rendered
 
@@ -352,3 +360,66 @@ def test_user_template_step_with_errors_renders() -> None:
     )
     assert "截图失败：屏幕锁定" in rendered
     assert "元素不可交互" in rendered
+
+
+# ── last_step_outcome 三态分支（K4 紧后 §3.2）────────────────────────────────
+
+
+def test_user_template_outcome_initial_branch() -> None:
+    """last_step_outcome=initial → 渲染「第一步」提示，不含成功/失败段落。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="initial")
+    )
+    assert "任务的第一步" in rendered
+    assert "上一步执行**成功**" not in rendered
+    assert "上一步执行**失败**" not in rendered
+
+
+def test_user_template_outcome_succeeded_branch() -> None:
+    """last_step_outcome=succeeded → 渲染成功段落，不含失败指导文案。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="succeeded")
+    )
+    assert "上一步执行**成功**" in rendered
+    assert "不要原样重试同一动作" not in rendered
+
+
+def test_user_template_outcome_failed_branch_has_guidance() -> None:
+    """last_step_outcome=failed → 渲染失败段落 + 可恢复/不可恢复指导文案
+    （§3.2：错误文案写「为什么失败 + 下一步可做什么」）。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="failed")
+    )
+    assert "上一步执行**失败**" in rendered
+    assert "不要原样重试同一动作" in rendered
+    assert "可恢复" in rendered
+    assert "FAILED" in rendered
+
+
+def test_user_template_succeeded_hides_stale_errors() -> None:
+    """PR #26 审查 WARN① 收口：上一步成功时 LastValue 残留的 errors 不渲染——
+    避免「上一步执行成功」与「控制错误：…」并列的自相矛盾上下文。
+    旧错误原文仍经执行历史表逐步保留（不丢信息）。"""
+    env = _make_env()
+    stale = "TOCTOU abort: 界面在执行前发生变化 (action_id=old-001)"
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(
+            last_step_outcome="succeeded",
+            errors={"perception_error": None, "control_error": stale},
+        )
+    )
+    assert "上一步执行**成功**" in rendered
+    assert stale not in rendered, "succeeded 分支不得渲染 LastValue 残留错误"
+
+
+def test_user_template_unknown_outcome_falls_back_conservative() -> None:
+    """PR #26 审查 INFO 收口：last_step_outcome 意外值走 else 兜底（保守按失败处理），
+    不再静默缺整节。"""
+    env = _make_env()
+    rendered = env.get_template("supervisor_user.jinja2").render(
+        _make_default_user_vars(last_step_outcome="")
+    )
+    assert "上一步结果未知" in rendered

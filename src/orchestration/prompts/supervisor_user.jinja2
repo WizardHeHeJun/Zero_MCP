@@ -23,15 +23,37 @@
 
 ---
 
+## 上一步结果
+
+{% if last_step_outcome == "initial" %}
+（这是任务的第一步，尚无执行历史——通常先路由 `perceive` 获取屏幕状态。）
+{% elif last_step_outcome == "succeeded" %}
+上一步执行**成功**。请基于最新感知摘要确认状态变化是否符合预期，再决定下一步。
+{% elif last_step_outcome == "failed" %}
+上一步执行**失败**（错误原文见下方「感知/控制错误」与执行历史）。请先判断失败性质再决策：
+- **可恢复**（界面变化、时序问题、目标未就绪、验证降级）→ 优先路由 `perceive` 重新感知后调整策略，**不要原样重试同一动作**；
+- **不可恢复**（能力缺失、目标不存在、权限不足）→ 将 `task_status` 设为 `FAILED` 收口，不做无效尝试。
+{% else %}
+（上一步结果未知——按失败保守处理，优先路由 `perceive` 重新感知。）
+{% endif %}
+
+---
+
 ## 当前执行状态
 
 **停滞计数**：{{ stall_count }}{% if stall_count > 0 %} ⚠ 已检测到连续停滞，请调整策略{% endif %}
 
+{# errors 取 state 的 LastValue 字段（perceive 成功不清 control_error，为 stall
+   指纹去重服务）——上一步成功时这里只剩陈旧残留，与「上一步执行成功」并列会
+   自相矛盾（PR #26 审查 WARN①），故仅 failed 分支渲染；旧步骤的错误原文
+   在下方执行历史表里逐步保留，不丢信息。 #}
+{% if last_step_outcome == "failed" %}
 {% if errors.perception_error %}
 **感知错误**：{{ errors.perception_error }}
 {% endif %}
 {% if errors.control_error %}
 **控制错误**：{{ errors.control_error }}
+{% endif %}
 {% endif %}
 
 ---
