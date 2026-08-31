@@ -18,13 +18,17 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from src.agents.models.screen_snapshot import BBox, ScreenSnapshot, TextBlock, UIAElement
 from src.orchestration.prompt_loader import (
     PromptLoader,
+    _serialize_snapshot_compact,
     _truncate_perception_summary,
     _truncate_step_window,
+    build_grounding_table,
     derive_last_step_outcome,
 )
 from src.orchestration.state import DesktopTaskState, StepRecord, TaskStatus
@@ -445,3 +449,180 @@ class TestRenderLastStepOutcome:
         state = _make_state(step_history=[])
         _, user = loader.render_supervisor(state)
         assert "任务的第一步" in user
+
+
+# ── render_action_generation / _serialize_snapshot_compact（蓝图 PR-β 任务 7/10）
+
+
+def _make_snapshot(
+    uia_elements: list[Any] | None = None,
+    text_blocks: list[Any] | None = None,
+    visual_objects: list[Any] | None = None,
+    uia_hollow: bool = False,
+) -> ScreenSnapshot:
+    """构造最小 ScreenSnapshot（供 grounding 序列化测试）。"""
+    return ScreenSnapshot(
+        snapshot_id="snap-render-001",
+        timestamp_ms=1_700_000_000_000,
+        screen_width=1920,
+        screen_height=1080,
+        active_window_title="测试窗口",
+        uia_elements=uia_elements or [],
+        text_blocks=text_blocks or [],
+        visual_objects=visual_objects or [],
+        screenshot_path=None,
+        perception_mode="uia_ocr",
+        capability_flags={},
+        uia_hollow=uia_hollow,
+    )
+
+
+def _make_uia_element(name: str = "确定", bbox: BBox | None = None) -> UIAElement:
+    return UIAElement(
+        element_id="uia_1234_0",
+        control_type="Button",
+        name=name,
+        automation_id="btnOK",
+        bbox=bbox or BBox(x=100, y=200, width=80, height=30),
+        is_enabled=True,
+        is_visible=True,
+        value=None,
+        source="uia",
+    )
+
+
+def _make_text_block(text: str = "搜索", bbox: BBox | None = None) -> TextBlock:
+    return TextBlock(
+        block_id="ocr_snap_0",
+        text=text,
+        bbox=bbox or BBox(x=10, y=20, width=40, height=15),
+        confidence=0.95,
+        source="ocr_rapidocr",
+    )
+
+
+class TestSerializeSnapshotCompact:
+    """`_serialize_snapshot_compact` 纯函数测试。"""
+
+    def test_empty_snapshot_returns_empty_string(self) -> None:
+        snapshot = _make_snapshot()
+        assert _serialize_snapshot_compact(snapshot) == ""
+
+    def test_uia_and_ocr_get_distinct_prefixes(self) -> None:
+        """三类元素合并进统一表，compact id 按类型分前缀（uia:/ocr:），互不冲突。"""
+        snapshot = _make_snapshot(
+            uia_elements=[_make_uia_element()],
+            text_blocks=[_make_text_block()],
+        )
+        text = _serialize_snapshot_compact(snapshot)
+        assert 'id="uia:0"' in text
+        assert 'id="ocr:0"' in text
+
+    def test_rendered_line_contains_role_text_bbox(self) -> None:
+        snapshot = _make_snapshot(uia_elements=[_make_uia_element(name="确定")])
+        text = _serialize_snapshot_compact(snapshot)
+        assert 'role="Button"' in text
+        assert 'text="确定"' in text
+        assert 'bbox="100,200,80,30"' in text
+
+    def test_truncation_drops_overflow_elements_and_logs(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """超出字符预算的元素被丢弃，不出现在渲染文本中，记 warning。"""
+        elements = [_make_uia_element(name=f"元素{i}") for i in range(50)]
+        snapshot = _make_snapshot(uia_elements=elements)
+
+        with caplog.at_level("WARNING"):
+            text = _serialize_snapshot_compact(snapshot, max_chars=200)
+
+        assert len(text) <= 200 + 100  # 允许最后一行边界宽裕，核心断言在下方
+        assert "uia:0" in text
+        assert "uia:49" not in text, "超出预算的元素不应出现在渲染文本中"
+        assert any("截断" in r.message for r in caplog.records)
+
+
+class TestBuildGroundingTable:
+    """`build_grounding_table` 与渲染文本一致性测试。"""
+
+    def test_table_matches_rendered_ids(self) -> None:
+        snapshot = _make_snapshot(
+            uia_elements=[_make_uia_element()],
+            text_blocks=[_make_text_block()],
+        )
+        table = build_grounding_table(snapshot)
+        assert set(table.keys()) == {"uia:0", "ocr:0"}
+        assert table["uia:0"].x == 100
+        assert table["ocr:0"].x == 10
+
+    def test_truncated_elements_absent_from_table(self) -> None:
+        """截断口径与渲染文本一致：被丢弃的元素不进查找表（LLM 只能引用它
+        实际看到的 id，核验才有意义）。"""
+        elements = [_make_uia_element(name=f"元素{i}") for i in range(50)]
+        snapshot = _make_snapshot(uia_elements=elements)
+
+        table = build_grounding_table(snapshot, max_chars=200)
+
+        assert "uia:0" in table
+        assert "uia:49" not in table
+
+    def test_empty_snapshot_returns_empty_table(self) -> None:
+        assert build_grounding_table(_make_snapshot()) == {}
+
+
+class TestRenderActionGeneration:
+    """`PromptLoader.render_action_generation` 集成测试。"""
+
+    def test_returns_nonempty_system_and_user(self, loader: PromptLoader) -> None:
+        state = _make_state(task_description="测试任务")
+        state = state.model_copy(update={"current_instruction": "点击确定按钮"})
+        snapshot = _make_snapshot(uia_elements=[_make_uia_element()])
+
+        system, user = loader.render_action_generation(state, snapshot)
+
+        assert isinstance(system, str) and len(system) > 0
+        assert isinstance(user, str) and len(user) > 0
+        assert "点击确定按钮" in user
+
+    def test_grounding_table_text_injected_into_user_prompt(self, loader: PromptLoader) -> None:
+        state = _make_state()
+        snapshot = _make_snapshot(uia_elements=[_make_uia_element(name="确定")])
+
+        _, user = loader.render_action_generation(state, snapshot)
+
+        assert 'id="uia:0"' in user
+        assert "确定" in user
+
+    def test_no_elements_renders_fallback_hint(self, loader: PromptLoader) -> None:
+        state = _make_state()
+        snapshot = _make_snapshot()
+
+        _, user = loader.render_action_generation(state, snapshot)
+
+        assert "未提取到任何可定位元素" in user
+
+    def test_uia_hollow_renders_coordinate_only_guidance(self, loader: PromptLoader) -> None:
+        state = _make_state(uia_hollow=True)
+        snapshot = _make_snapshot(uia_elements=[_make_uia_element()], uia_hollow=True)
+
+        _, user = loader.render_action_generation(state, snapshot)
+
+        assert "UIA 空洞" in user
+        assert "不要引用 `target_element_id`" in user
+
+    def test_uia_not_hollow_no_coordinate_only_guidance(self, loader: PromptLoader) -> None:
+        state = _make_state(uia_hollow=False)
+        snapshot = _make_snapshot(uia_elements=[_make_uia_element()], uia_hollow=False)
+
+        _, user = loader.render_action_generation(state, snapshot)
+
+        assert "UIA 空洞" not in user
+
+    def test_failed_last_step_renders_no_retry_guidance(self, loader: PromptLoader) -> None:
+        bad = _make_step(0).model_copy(update={"control_error": "元素不可交互"})
+        state = _make_state(step_history=[bad])
+        snapshot = _make_snapshot()
+
+        _, user = loader.render_action_generation(state, snapshot)
+
+        assert "上一步执行**失败**" in user
+        assert "请勿原样重试同一动作" in user
