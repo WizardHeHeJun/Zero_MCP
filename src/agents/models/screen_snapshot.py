@@ -19,6 +19,11 @@ OCR 主通道，消费侧不应假设 `uia_elements` 非空。
   `ScreenSnapshot` 类 docstring）；
 - `ActionSpec.expected_root_hwnd`：坐标点击的期望落点顶层窗口句柄，None=不核验
   （仅主窗元素点击设期望值，菜单点击勿设，语义见 `ActionSpec` 类 docstring）。
+
+ActionSpec 生成层拍板①增量（notes/2026-08-31-actionspec-generation-blueprint.md）：
+
+- `ActionSpec.wait_ms`：等待动作（`action_type == "wait"`）的等待毫秒数，
+  None=非 wait 动作。可选字段、默认 None，旧 payload 反序列化零回归。
 """
 
 from enum import StrEnum
@@ -152,6 +157,9 @@ class ActionSpec(BaseModel):
     # feat/desktop-hardening：期望落点顶层窗口句柄；None=不核验。语义与「菜单
     # 点击勿设」的误拒陷阱见类 docstring。
     expected_root_hwnd: int | None = None
+    # ActionSpec 生成层拍板①：等待动作的等待毫秒数，仅 action_type=="wait" 时
+    # 使用；None=非 wait 动作。可选字段防对 text_payload 的双重语义污染。
+    wait_ms: int | None = None
 
 
 class ActionResult(BaseModel):
