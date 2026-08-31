@@ -12,7 +12,8 @@
     2. interrupt 前无任何 client 写调用（dispatch 未被触发）。
     3. resume abort（confirmed=False）→ task_status=FAILED，无 client 写调用。
     4. resume confirm（confirmed=True）→ client 写调用恰好一次，control_error=None。
-    5. TOCTOU abort → control_error 含 "TOCTOU abort"，无 client 写调用。
+    5. TOCTOU abort → control_error 含 "TOCTOU abort"（不带降级令牌），无 client 写调用。
+    5b. TOCTOU abort_degraded → control_error 带 [desk:toctou_degraded]，无写调用。
     6. LOW_RISK 动作 → 无 interrupt，直接执行写操作。
     7. state 无 pending_action → control_error。
     8. _build_control_increment 辅助函数独立测试。
@@ -21,7 +22,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cv2
@@ -87,7 +89,7 @@ def _make_mock_client(write_result: ActionResult | None = None) -> MagicMock:
 
 def _make_mock_guard(
     risk: ActionRisk = ActionRisk.DESTRUCTIVE,
-    toctou_verdict: str = "pass",
+    toctou_verdict: Literal["pass", "abort", "abort_degraded"] = "pass",
 ) -> MagicMock:
     """构造 mock ActionGuard。"""
     guard = MagicMock()
@@ -255,7 +257,45 @@ async def test_toctou_abort_no_write() -> None:
     assert "TOCTOU abort" in result.get("control_error", ""), (
         f"control_error 应含 'TOCTOU abort'，得到 {result.get('control_error')!r}"
     )
+    # 三态化负对照：界面真变了的 abort 不得带降级令牌（消费侧靠此区分两种拒绝）
+    assert not re.search(r"\[desk:toctou_degraded\]", result.get("control_error", "")), (
+        f"「界面已变」abort 的 control_error 不应含 [desk:toctou_degraded]，"
+        f"得到 {result.get('control_error')!r}"
+    )
     # 无写操作
+    client.close_window.assert_not_called()
+    client.click_element.assert_not_called()
+    client.type_text.assert_not_called()
+    client.send_key.assert_not_called()
+
+
+# ── 5b. TOCTOU abort_degraded → control_error 带机读令牌，无写操作 ────────────
+
+
+async def test_toctou_abort_degraded_carries_token_no_write() -> None:
+    """三态化收口：toctou_verify 返回 abort_degraded 时，control_error 带机读
+    令牌 [desk:toctou_degraded]（位置无关，re.search 可提取），且无任何写调用。
+
+    与 test_toctou_abort_no_write 构成判别对：同一消费路径，verdict 不同 →
+    control_error 令牌有无不同——修复前两种拒绝的 control_error 文案相同，
+    本用例在修复前必红。
+    """
+    action = _make_action(action_type="window_close", risk_level=ActionRisk.DESTRUCTIVE)
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.DESTRUCTIVE, toctou_verdict="abort_degraded")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    result = await agent.execute(action)
+
+    control_error = result.get("control_error", "")
+    assert re.search(r"\[desk:toctou_degraded\]", control_error), (
+        f"abort_degraded 的 control_error 应含机读令牌 [desk:toctou_degraded]，"
+        f"得到 {control_error!r}"
+    )
+    assert "TOCTOU abort" in control_error, (
+        f"control_error 应保留 'TOCTOU abort' 前缀口径，得到 {control_error!r}"
+    )
+    # 无写操作（fail-closed）
     client.close_window.assert_not_called()
     client.click_element.assert_not_called()
     client.type_text.assert_not_called()

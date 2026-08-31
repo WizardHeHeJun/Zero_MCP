@@ -106,13 +106,15 @@ class DesktopControlAgent:
 
         分区协议（SDK 核验 §1a，规格书 §1.2）：
           [只读区] 1. classify_risk → 得到 effective_risk
-          [只读区] 2. toctou_verify → "pass" | "abort"（K1 ④：传入 effective_risk，
-                     TOCTOU 触发与降级裁决按有效风险而非声明值）
+          [只读区] 2. toctou_verify → "pass" | "abort" | "abort_degraded"
+                     （K1 ④：传入 effective_risk，TOCTOU 触发与降级裁决按
+                     有效风险而非声明值）
           [只读区] 3. DESTRUCTIVE 时 lg_interrupt(ConfirmRequest) ← 触发 GraphInterrupt
           [写区]   4. Command(resume=ConfirmResponse) 恢复后执行写操作
 
         非 DESTRUCTIVE 且 TOCTOU pass → 直接执行写操作（无 interrupt）。
-        TOCTOU abort → 返回 control_error，不执行写操作。
+        TOCTOU abort / abort_degraded → 返回 control_error，不执行写操作；
+        abort_degraded 的 control_error 带机读令牌 [desk:toctou_degraded]。
 
         Args:
             action: 待执行的动作规格。
@@ -141,11 +143,22 @@ class DesktopControlAgent:
             snapshot_before=snapshot_before,
             effective_risk=effective_risk,
         )
-        if toctou_verdict == "abort":
+        if toctou_verdict != "pass":
             logger.warning(
-                "DesktopControlAgent.execute: TOCTOU abort action_id=%r",
+                "DesktopControlAgent.execute: TOCTOU %s action_id=%r",
+                toctou_verdict,
                 action.action_id,
             )
+            if toctou_verdict == "abort_degraded":
+                # 三态化收口：验证降级 fail-closed ≠ 界面真变了——control_error
+                # 带机读令牌 [desk:toctou_degraded]（位置无关，消费侧 re.search 提取），
+                # 下游（stall 指纹/Supervisor prompt/外部 host）可区分两种拒绝。
+                return {
+                    "control_error": (
+                        "TOCTOU abort: 验证链路降级，DESTRUCTIVE fail-closed 拒绝执行 "
+                        f"[desk:toctou_degraded] (action_id={action.action_id})"
+                    ),
+                }
             return {
                 "control_error": (
                     f"TOCTOU abort: 界面在执行前发生变化 (action_id={action.action_id})"
@@ -487,5 +500,5 @@ async def control_node(state: Any) -> dict[str, Any]:
 
 # ── 辅助类型别名（供测试用） ──────────────────────────────────────────────────
 
-ControlVerdict = Literal["pass", "abort"]
-"""TOCTOU 验证结果类型别名。"""
+ControlVerdict = Literal["pass", "abort", "abort_degraded"]
+"""TOCTOU 验证结果类型别名（三态：pass / 界面已变 abort / 验证降级 abort_degraded）。"""
