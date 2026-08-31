@@ -525,8 +525,9 @@ class TestToctouVerify:
 class TestToctouDegradedFailClosed:
     """K1 ③：验证链路降级（截图无路径 / phash 失败）时的分级裁决。
 
-    DESTRUCTIVE：四种降级失败态均须 abort（fail-closed），error 日志含机读
-    令牌 [desk:toctou_degraded]（位置无关，按消费侧口径用 re.search 提取）。
+    DESTRUCTIVE：四种降级失败态均须 abort_degraded（fail-closed，三态化后与
+    「界面真变了」的 abort 区分），error 日志含机读令牌 [desk:toctou_degraded]
+    （位置无关，按消费侧口径用 re.search 提取）。
     修复前四处均为无条件放行（fail-open）——四个 abort 用例在修复前必红。
     """
 
@@ -550,7 +551,7 @@ class TestToctouDegradedFailClosed:
                 self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
             )
 
-        assert result == "abort"
+        assert result == "abort_degraded"
         assert re.search(self._TOKEN_PATTERN, caplog.text)
 
     async def test_destructive_first_phash_failure_aborts(
@@ -568,7 +569,7 @@ class TestToctouDegradedFailClosed:
                 self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
             )
 
-        assert result == "abort"
+        assert result == "abort_degraded"
         assert re.search(self._TOKEN_PATTERN, caplog.text)
 
     async def test_destructive_second_screenshot_path_none_aborts(
@@ -591,7 +592,7 @@ class TestToctouDegradedFailClosed:
                     self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
                 )
 
-        assert result == "abort"
+        assert result == "abort_degraded"
         assert re.search(self._TOKEN_PATTERN, caplog.text)
 
     async def test_destructive_second_phash_failure_aborts(
@@ -614,7 +615,7 @@ class TestToctouDegradedFailClosed:
                     self._destructive_action(), effective_risk=ActionRisk.DESTRUCTIVE
                 )
 
-        assert result == "abort"
+        assert result == "abort_degraded"
         assert re.search(self._TOKEN_PATTERN, caplog.text)
 
     async def test_non_destructive_degraded_still_passes_without_token(

@@ -92,13 +92,14 @@ class ActionGuardProtocol(Protocol):
         action: ActionSpec,
         snapshot_before: ScreenSnapshot | None = None,
         effective_risk: ActionRisk | None = None,
-    ) -> Literal["pass", "abort"]:
+    ) -> Literal["pass", "abort", "abort_degraded"]:
         """TOCTOU 验证（Pre-execution UI State Verification）。
 
         K1 ②：触发判定按 effective_risk（classify_risk 结果）而非声明值；
-        None 时回退 action.risk_level（向后兼容）。降级语义（K1 ③）：验证链路
-        降级时 DESTRUCTIVE fail-closed 返回 "abort"（error 日志含机读令牌
-        [desk:toctou_degraded]），非 DESTRUCTIVE 保留放行。
+        None 时回退 action.risk_level（向后兼容）。降级语义（K1 ③ + 三态化）：
+        验证链路降级时 DESTRUCTIVE fail-closed 返回 "abort_degraded"（error
+        日志含机读令牌 [desk:toctou_degraded]，消费侧据此在 control_error
+        带同一令牌），非 DESTRUCTIVE 保留放行。
 
         Args:
             action: 待验证的动作规格。
@@ -106,7 +107,8 @@ class ActionGuardProtocol(Protocol):
             effective_risk: classify_risk 判定后的有效风险级别；None 回退声明值。
 
         Returns:
-            "pass"（界面稳定，可执行）或 "abort"（界面已变/验证降级且高危，拒绝执行）。
+            "pass"（界面稳定，可执行）、"abort"（界面已变，拒绝执行）或
+            "abort_degraded"（验证降级且高危，fail-closed 拒绝执行）。
         """
         ...
 

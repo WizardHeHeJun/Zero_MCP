@@ -161,7 +161,7 @@ class ActionGuard:
         action: ActionSpec,
         snapshot_before: ScreenSnapshot | None = None,
         effective_risk: ActionRisk | None = None,
-    ) -> Literal["pass", "abort"]:
+    ) -> Literal["pass", "abort", "abort_degraded"]:
         """TOCTOU 验证（Pre-execution UI State Verification）。
 
         触发条件（满足任一即执行验证）：
@@ -179,9 +179,10 @@ class ActionGuard:
              整图 hash 被应用自身动效持续误报，无静止基线）；坐标经各图
              capture_origin 换算，兼容全屏截图与 PrintWindow 窗口图混用。
 
-        降级语义（K1 ③，一期二态 fail-closed）：验证链路降级（截图无路径 /
-        phash 失败）时按有效风险分级——DESTRUCTIVE 返回 "abort"（验证不可得时
-        拒绝执行，error 日志含机读令牌 [desk:toctou_degraded]），非 DESTRUCTIVE
+        降级语义（K1 ③ + 二期三态化）：验证链路降级（截图无路径 / phash 失败）
+        时按有效风险分级——DESTRUCTIVE 返回 "abort_degraded"（验证不可得时
+        fail-closed 拒绝执行，与「界面真变了」的 "abort" 区分，消费侧据此在
+        control_error 带机读令牌 [desk:toctou_degraded]），非 DESTRUCTIVE
         保留放行（logger.warning）。
 
         注意：本方法只做只读操作（两次截图 + hash 比对），适合放在 interrupt 前只读区。
@@ -193,7 +194,8 @@ class ActionGuard:
                 action.risk_level 声明值（向后兼容旧调用方）。
 
         Returns:
-            "pass"（界面稳定，可执行）或 "abort"（界面已变/验证降级且高危，拒绝执行）。
+            "pass"（界面稳定，可执行）、"abort"（界面已变，拒绝执行）或
+            "abort_degraded"（验证降级且 DESTRUCTIVE，fail-closed 拒绝执行）。
         """
         # K1 ②：触发判定用有效风险（classify_risk 结果），None 回退声明值保兼容
         risk_for_gate = effective_risk if effective_risk is not None else action.risk_level
@@ -286,12 +288,14 @@ class ActionGuard:
         action: ActionSpec,
         risk_for_gate: ActionRisk,
         detail: str,
-    ) -> Literal["pass", "abort"]:
+    ) -> Literal["pass", "abort_degraded"]:
         """TOCTOU 验证链路降级（截图无路径 / phash 失败）时的分级裁决（K1 ③）。
 
-        一期二态 fail-closed，不引入三态：
-          - DESTRUCTIVE：验证不可得即拒绝执行（abort），logger.error 文案含机读
-            令牌 [desk:toctou_degraded]（位置无关，消费侧用 re.search 提取）。
+        二期三态化（收口 K1 ③ 遗留）：降级拒绝返回 "abort_degraded" 而非 "abort"，
+        让消费侧（DesktopControlAgent）能区分「界面真变了」与「验证不可得」，
+        在 control_error 带机读令牌：
+          - DESTRUCTIVE：验证不可得即拒绝执行（abort_degraded），logger.error
+            文案含机读令牌 [desk:toctou_degraded]（位置无关，消费侧用 re.search 提取）。
           - 非 DESTRUCTIVE：保留旧行为放行（pass），logger.warning。
 
         Args:
@@ -300,7 +304,7 @@ class ActionGuard:
             detail: 降级原因（人读散文，与机读令牌并存于同一 error 文案）。
 
         Returns:
-            "abort"（DESTRUCTIVE fail-closed）或 "pass"（非 DESTRUCTIVE 降级放行）。
+            "abort_degraded"（DESTRUCTIVE fail-closed）或 "pass"（非 DESTRUCTIVE 降级放行）。
         """
         if risk_for_gate == ActionRisk.DESTRUCTIVE:
             logger.error(
@@ -309,7 +313,7 @@ class ActionGuard:
                 detail,
                 action.action_id,
             )
-            return "abort"
+            return "abort_degraded"
         logger.warning(
             "toctou_verify: %s，非 DESTRUCTIVE 放行（降级）action=%r",
             detail,
