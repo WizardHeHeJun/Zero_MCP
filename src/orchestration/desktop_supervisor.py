@@ -25,6 +25,7 @@ import logging
 import os
 from typing import Any, Protocol
 
+from src.orchestration.llm_fallback import LLMFallbackError, call_with_single_fallback
 from src.orchestration.state import (
     STATE_STEP_KEEP,
     DesktopTaskState,
@@ -351,44 +352,28 @@ class DesktopSupervisorAgent:
             system_prompt, user_prompt = self.prompt_loader.render_supervisor(state)
 
         # 调用 LLM：主模型一次；异常且有备用 → 备用一次；再失败 → FAILED
-        # （§2.2：单次切换不递归，防主备互踢死循环）
+        # （§2.2：单次切换不递归，防主备互踢死循环——实现抽至 llm_fallback.py，
+        # 蓝图决策 F，供 ActionGeneratorAgent 复用同款语义）
         try:
-            raw_text: str = await self._call_llm(self.model, system_prompt, user_prompt)
-        except Exception as exc:
-            if self.fallback_model is None:
-                logger.warning(
-                    "DesktopSupervisorAgent.plan: LLM 调用失败（%s），无备用模型",
-                    exc,
-                )
-                return {
-                    "next_agent": "error_report",
-                    "current_instruction": f"LLM 调用失败: {exc}",
-                    "task_status": TaskStatus.FAILED,
-                }
-            logger.warning(
-                "DesktopSupervisorAgent.plan: 主模型 %r 调用失败（%s），"
-                "切备用模型 %r 重试一次",
+            raw_text: str = await call_with_single_fallback(
                 self.model,
-                exc,
                 self.fallback_model,
+                lambda model: self._call_llm(model, system_prompt, user_prompt),
             )
-            try:
-                raw_text = await self._call_llm(
-                    self.fallback_model, system_prompt, user_prompt
-                )
-            except Exception as fallback_exc:
-                logger.warning(
-                    "DesktopSupervisorAgent.plan: 备用模型 %r 也失败（%s），任务 FAILED",
-                    self.fallback_model,
-                    fallback_exc,
-                )
+        except LLMFallbackError as exc:
+            if exc.fallback_model is None:
                 return {
                     "next_agent": "error_report",
-                    "current_instruction": (
-                        f"LLM 调用失败（主备均败）: 主={exc} 备={fallback_exc}"
-                    ),
+                    "current_instruction": f"LLM 调用失败: {exc.primary_error}",
                     "task_status": TaskStatus.FAILED,
                 }
+            return {
+                "next_agent": "error_report",
+                "current_instruction": (
+                    f"LLM 调用失败（主备均败）: 主={exc.primary_error} 备={exc.fallback_error}"
+                ),
+                "task_status": TaskStatus.FAILED,
+            }
 
         return _parse_plan_response(raw_text)
 

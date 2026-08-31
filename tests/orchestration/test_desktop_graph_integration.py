@@ -45,7 +45,8 @@ from src.agents.models.screen_snapshot import (
     TextBlock,
     UIAElement,
 )
-from src.agents.screen_perception_agent import ScreenPerceptionAgent
+from src.agents.screen_perception_agent import InMemorySnapshotStore, ScreenPerceptionAgent
+from src.orchestration.action_generator import ActionGeneratorAgent
 from src.orchestration.desktop_graph import get_graph
 from src.orchestration.desktop_supervisor import DesktopSupervisorAgent
 from src.orchestration.prompt_loader import PromptLoader
@@ -172,6 +173,30 @@ def _make_mock_guard(
     return guard
 
 
+def _make_passthrough_action_generator() -> MagicMock:
+    """构造回显 state.pending_action 的桩 ActionGeneratorAgent。
+
+    ActionSpec 生成层蓝图 PR-β 任务 9 收口：route_after_supervisor 的
+    "control" 现在先经 generate_action 节点。本文件大量既有用例直接构造
+    `pending_action` 并期望 next_agent="control" 的 LLM 响应直达 control
+    执行——这些用例测的是 control/interrupt 分区协议本身，不是生成层，
+    故注入一个原样回显 pending_action 的桩，保留既有测试语义（蓝图任务 10：
+    「既有直构 pending_action 测 control 的用例保留不动」的图级版本）。
+    """
+    agent = MagicMock()
+
+    async def _generate(state: Any) -> dict[str, Any]:
+        pending = (
+            state.pending_action
+            if hasattr(state, "pending_action")
+            else state.get("pending_action")
+        )
+        return {"pending_action": pending}
+
+    agent.generate = _generate
+    return agent
+
+
 def _make_mock_memory_api() -> MagicMock:
     """构造 mock MemoryAPI，write_session_summary 为 AsyncMock。"""
     mock = MagicMock()
@@ -258,6 +283,7 @@ def _build_graph(
     return get_graph(
         supervisor_agent=supervisor_agent,
         perception_agent=perception_agent,
+        action_generator_agent=_make_passthrough_action_generator(),
         control_agent=control_agent,
         memory_api=mock_memory_api,
         checkpointer=None,  # 使用 InMemorySaver 默认值
@@ -1170,6 +1196,7 @@ class TestLowDeclaredDestructiveEscalation:
         graph = get_graph(
             supervisor_agent=supervisor_agent,
             perception_agent=perception_agent,
+            action_generator_agent=_make_passthrough_action_generator(),
             control_agent=control_agent,
             memory_api=mock_memory_api,
             checkpointer=None,
@@ -1225,3 +1252,199 @@ class TestLowDeclaredDestructiveEscalation:
 
         mock_client.close_window.assert_called_once_with(window_handle=24680)
         assert result2.get("task_status") == TaskStatus.DONE
+
+
+# ── 测试 7：ActionGeneratorAgent 端到端图链路（蓝图 PR-β 任务 9/10）────────────
+
+
+def _make_action_llm_tool_use(name: str, input_: dict[str, Any]) -> MagicMock:
+    """构造真 ActionGeneratorAgent 消费的 mock tool_use 响应（真实生成层链路，
+    与 Supervisor 的 JSON 文本响应机制不同——生成层走 tools + tool_choice）。
+    """
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = name
+    block.input = input_
+    response = MagicMock()
+    response.content = [block]
+    return response
+
+
+def _make_action_llm(response: MagicMock) -> MagicMock:
+    llm = MagicMock()
+    llm.messages = MagicMock()
+    llm.messages.create = AsyncMock(return_value=response)
+    return llm
+
+
+class TestActionGeneratorGraphIntegration:
+    """真 ActionGeneratorAgent（非 passthrough 桩）经完整图链路的端到端测试。
+
+    supervisor → generate_action → control 成功链，与
+    supervisor → generate_action（失败）→ stall_detect 失败链，均 mock 两个独立
+    LLM 客户端（Supervisor 的 JSON 文本响应 / ActionGenerator 的 tool_use 响应）。
+    """
+
+    async def test_success_chain_supervisor_to_generate_action_to_control(self) -> None:
+        """成功链：supervisor 判定 control → generate_action 生成 click 动作
+        （target_element_id 命中快照中的 uia 元素）→ control 执行写操作
+        → supervisor 判定 DONE → memory_flush。
+        """
+        task_id = "task-genchain-success-001"
+        store = InMemorySnapshotStore()
+        snapshot = ScreenSnapshot(
+            snapshot_id="snap-genchain-001",
+            timestamp_ms=1_700_000_000_000,
+            screen_width=1920,
+            screen_height=1080,
+            active_window_title="生成链路测试窗口",
+            uia_elements=[
+                UIAElement(
+                    element_id="uia_1_0",
+                    control_type="Button",
+                    name="确定",
+                    automation_id="btnOK",
+                    bbox=BBox(x=100, y=200, width=80, height=40),
+                    is_enabled=True,
+                    is_visible=True,
+                    value=None,
+                    source="uia",
+                )
+            ],
+            text_blocks=[],
+            visual_objects=[],
+            screenshot_path=None,
+            perception_mode="uia_ocr",
+            capability_flags={},
+            uia_hollow=False,
+        )
+        await store.save(snapshot)
+
+        mock_client = _make_mock_client()
+        mock_guard = _make_mock_guard(risk=ActionRisk.LOW_RISK, toctou_verdict="pass")
+        mock_memory_api = _make_mock_memory_api()
+
+        supervisor_llm = _make_mock_llm_client([_R_CONTROL_RUNNING, _R_PERCEIVE_DONE])
+        action_llm = _make_action_llm(
+            _make_action_llm_tool_use(
+                "click",
+                {
+                    "reasoning": "点击确定按钮",
+                    "risk_level": "low_risk",
+                    "target_element_id": "uia:0",
+                },
+            )
+        )
+
+        supervisor_agent = DesktopSupervisorAgent(
+            llm_client=supervisor_llm, prompt_loader=PromptLoader()
+        )
+        action_generator_agent = ActionGeneratorAgent(
+            llm_client=action_llm,
+            prompt_loader=PromptLoader(),
+            snapshot_store=store,
+        )
+        control_agent = DesktopControlAgent(client=mock_client, guard=mock_guard)
+
+        graph = get_graph(
+            supervisor_agent=supervisor_agent,
+            perception_agent=MagicMock(),  # 本场景不路由到 perceive
+            action_generator_agent=action_generator_agent,
+            control_agent=control_agent,
+            memory_api=mock_memory_api,
+            snapshot_store=store,
+            checkpointer=None,
+        )
+
+        with _ApiKeyContext():
+            result = await graph.ainvoke(
+                DesktopTaskState(
+                    task_id=task_id,
+                    task_description="生成链路成功测试",
+                    task_status=TaskStatus.RUNNING,
+                    snapshot_ref=snapshot.snapshot_id,
+                ),
+                config={"configurable": {"thread_id": task_id}},
+            )
+
+        assert result.get("task_status") == TaskStatus.DONE
+        # bbox=(100,200,80,40) 中心=(140,220)：服务端解析坐标，不信 LLM 自报
+        mock_client.click_element.assert_called_once()
+        _, click_kwargs = mock_client.click_element.call_args
+        assert click_kwargs["coordinates"] == (140, 220)
+
+        history = result.get("step_history") or []
+        assert any(s.agent == "generate_action" for s in history)
+        assert any(s.agent == "control" for s in history)
+
+    async def test_failure_chain_generate_action_to_stall_detect(self) -> None:
+        """失败链：generate_action 持续失败（LLM 调用异常）→ route_after_generate_action
+        → stall_detect 累加信号 B（连续同 Worker 步骤重复）→ 最终 error_report → FAILED。
+
+        判别力同既有 test_signal_b_six_same_worker_steps_reaches_failed 先例：
+        去掉 generate_action 的 step_history append，信号 B 永不触发，本测试必红。
+        """
+        task_id = "task-genchain-failure-001"
+        store = InMemorySnapshotStore()
+        snapshot = ScreenSnapshot(
+            snapshot_id="snap-genchain-002",
+            timestamp_ms=1_700_000_000_000,
+            screen_width=1920,
+            screen_height=1080,
+            active_window_title="生成链路失败测试窗口",
+            uia_elements=[],
+            text_blocks=[],
+            visual_objects=[],
+            screenshot_path=None,
+            perception_mode="uia_ocr",
+            capability_flags={},
+            uia_hollow=False,
+        )
+        await store.save(snapshot)
+
+        mock_memory_api = _make_mock_memory_api()
+        supervisor_llm = _make_mock_llm_client([_R_CONTROL_RUNNING])
+
+        action_llm = MagicMock()
+        action_llm.messages = MagicMock()
+        action_llm.messages.create = AsyncMock(side_effect=RuntimeError("生成层 LLM 异常（模拟）"))
+
+        supervisor_agent = DesktopSupervisorAgent(
+            llm_client=supervisor_llm, prompt_loader=PromptLoader()
+        )
+        action_generator_agent = ActionGeneratorAgent(
+            llm_client=action_llm,
+            prompt_loader=PromptLoader(),
+            snapshot_store=store,
+        )
+        # fallback_model 显式置空，隔离宿主环境变量，保证恰一次调用/轮
+        action_generator_agent.fallback_model = None
+
+        graph = get_graph(
+            supervisor_agent=supervisor_agent,
+            perception_agent=MagicMock(),
+            action_generator_agent=action_generator_agent,
+            control_agent=MagicMock(),  # 本场景从不路由到 control
+            memory_api=mock_memory_api,
+            snapshot_store=store,
+            checkpointer=None,
+        )
+
+        with _ApiKeyContext():
+            result = await graph.ainvoke(
+                DesktopTaskState(
+                    task_id=task_id,
+                    task_description="生成链路失败测试",
+                    task_status=TaskStatus.RUNNING,
+                    snapshot_ref=snapshot.snapshot_id,
+                ),
+                # 信号 B 需 6+ 步才开始累加，8 轮×多节点 + 收口 > 默认 25 步上限
+                config={"configurable": {"thread_id": task_id}, "recursion_limit": 80},
+            )
+
+        assert result.get("task_status") == TaskStatus.FAILED
+        history = result.get("step_history") or []
+        assert len(history) >= 6
+        assert all(s.agent == "generate_action" for s in history[-6:])
+        assert "action_generation_failed" in (result.get("control_error") or "")
+        mock_memory_api.write_session_summary.assert_called()

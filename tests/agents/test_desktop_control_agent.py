@@ -1120,6 +1120,63 @@ async def test_toctou_abort_retains_pending_action_at_node_level() -> None:
     assert "pending_action" not in increment
 
 
+# ── wait 动作 dispatch（ActionSpec 生成层蓝图 PR-β 任务 5/10）──────────────────
+
+
+async def test_dispatch_wait_sleeps_and_zero_client_calls() -> None:
+    """wait 动作只本地 asyncio.sleep，零 client RPC（蓝图决策 B）。"""
+    action = ActionSpec(
+        action_id="act-wait",
+        action_type="wait",
+        target_element_id=None,
+        coordinates=None,
+        text_payload=None,
+        risk_level=ActionRisk.READ_ONLY,
+        wait_ms=500,
+    )
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.READ_ONLY, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    with patch(
+        "src.agents.desktop_control_agent.asyncio.sleep", new_callable=AsyncMock
+    ) as mock_sleep:
+        result = await agent.execute(action)
+
+    mock_sleep.assert_awaited_once_with(0.5)
+    assert result.get("control_error") is None
+    client.click_element.assert_not_called()
+    client.type_text.assert_not_called()
+    client.send_key.assert_not_called()
+    client.close_window.assert_not_called()
+    client.screen_snapshot.assert_not_called()
+
+
+async def test_dispatch_wait_missing_wait_ms_returns_error() -> None:
+    """wait_ms=None（生成层未设置）→ control_error，无 sleep 调用。"""
+    action = ActionSpec(
+        action_id="act-wait-missing",
+        action_type="wait",
+        target_element_id=None,
+        coordinates=None,
+        text_payload=None,
+        risk_level=ActionRisk.READ_ONLY,
+        wait_ms=None,
+    )
+    client = _make_mock_client()
+    guard = _make_mock_guard(risk=ActionRisk.READ_ONLY, toctou_verdict="pass")
+    agent = DesktopControlAgent(client=client, guard=guard)
+
+    with patch(
+        "src.agents.desktop_control_agent.asyncio.sleep", new_callable=AsyncMock
+    ) as mock_sleep:
+        result = await agent.execute(action)
+
+    mock_sleep.assert_not_awaited()
+    assert result.get("control_error") is not None
+    assert "wait_ms" in result["control_error"]
+
+
 # ── pytest 配置提示（不是测试函数） ──────────────────────────────────────────
 
 # asyncio_mode=auto 已在 pyproject.toml 配置，所有 async def test_* 自动异步执行。

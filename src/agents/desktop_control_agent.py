@@ -31,6 +31,7 @@ src.orchestration.state，无反向依赖。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -222,6 +223,26 @@ class DesktopControlAgent:
             DesktopMCPConnectionError: 连接断开（由调用方捕获）。
         """
         action_type = action.action_type
+
+        if action_type == "wait":
+            # ActionSpec 生成层 K4 元动作（蓝图决策 B）：wait 只本地 asyncio.sleep，
+            # 零 client RPC——不落任何写操作、不产生 TOCTOU 落点。risk_level 已在
+            # WaitActionInput.to_action_spec() 强制 READ_ONLY（防语义倒置），此处
+            # 只管执行，不重复风险判定。
+            if action.wait_ms is None:
+                return ActionResult(
+                    action_id=action.action_id,
+                    success=False,
+                    error_message="wait 动作缺 wait_ms",
+                    ui_changed=False,
+                )
+            await asyncio.sleep(action.wait_ms / 1000)
+            return ActionResult(
+                action_id=action.action_id,
+                success=True,
+                error_message=None,
+                ui_changed=False,
+            )
 
         if action_type in ("click", "click_element"):
             return await self.client.click_element(

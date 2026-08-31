@@ -1,0 +1,45 @@
+## 当前指令
+
+{{ current_instruction }}
+
+---
+
+## 上一步结果
+
+{% if last_step_outcome == "initial" %}
+（这是任务的第一步，尚无执行历史。）
+{% elif last_step_outcome == "succeeded" %}
+上一步执行**成功**。
+{% elif last_step_outcome == "failed" %}
+上一步执行**失败**，请勿原样重试同一动作（错误原文见下方）。
+{% else %}
+（上一步结果未知，请谨慎决策。）
+{% endif %}
+
+{% if errors.perception_error %}
+**感知错误**：{{ errors.perception_error }}
+{% endif %}
+{% if errors.control_error %}
+**控制错误**：{{ errors.control_error }}
+{% endif %}
+
+---
+
+## 可用元素
+
+{% if uia_hollow %}
+> **[注意] 当前窗口 UIA 空洞**：目标窗口的 UIA 控件树为空，下表元素**只能使用
+> 坐标定位**（`coordinate: {x, y}`），不要引用 `target_element_id`——UIA 空洞
+> 窗口没有可用的元素句柄。
+{% endif %}
+
+{% if grounding_table %}
+{{ grounding_table }}
+{% else %}
+（本次感知未提取到任何可定位元素；若需点击/输入，只能使用坐标兜底或先请求
+重新感知。）
+{% endif %}
+
+---
+
+请根据以上信息，调用**恰好一个**工具完成当前指令。

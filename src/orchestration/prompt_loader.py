@@ -1,23 +1,28 @@
-"""Supervisor 提示词加载与上下文截断（Task 11B）。
+"""Supervisor / ActionGenerator 提示词加载与上下文截断（Task 11B + 蓝图 PR-β 任务 7）。
 
 PromptLoader 负责：
   1. 从 Path(__file__).parent/"prompts" 用 Jinja2 FileSystemLoader 加载模板
      （路径固定，不依赖 cwd，不走 .env）。
   2. 截断 step_history：只取最近 CONTEXT_STEP_WINDOW 步（默认 10），
      超出部分在此层丢弃（不写归档——归档由 Supervisor 节点的 StepArchive 负责）。
-  3. 截断 perception_summary：字符数超过 PERCEPTION_SUMMARY_MAX_TOKENS（默认 2000）
-     时在此截断。
+  3. 截断 perception_summary / 元素定位表：字符数超过 PERCEPTION_SUMMARY_MAX_TOKENS
+     （默认 2000）时在此截断。
      注释：当前用字符数近似 token 预算（留 20% 余量），后期可替换为
      tiktoken.encoding_for_model("cl100k_base").encode() 精确计量（R6 工程假设）。
   4. 渲染 system / user 两个提示词，返回 tuple[str, str]。
+  5. `render_action_generation`（蓝图决策 C）：把 ScreenSnapshot 的 uia_elements/
+     text_blocks/visual_objects 三类元素合并为统一紧凑 id 查找表注入 ActionGenerator
+     的 user 提示词——grounding 解析（LLM 引用 id → 服务端查 bbox）放生成层，
+     不放感知层。
 
 设计约束（agent-framework-rules / orchestration-rules）：
   - prompt 模板与代码分离（可版本化、可测）。
   - 上下文截断统一在此层，不在 Agent 节点内、不在模板内。
   - 公开接口完整类型注解。
-  - 不含 I/O，render_supervisor 为同步方法（模板渲染是 CPU 运算，无网络/磁盘等待）。
-  - 不 import 任何 src.agents.* 以外的上层模块（本文件在 orchestration 层，
-    只 import orchestration.state 和 orchestration.prompts）。
+  - 不含 I/O，render_* 均为同步方法（模板渲染是 CPU 运算，无网络/磁盘等待）。
+  - 只下调 agents.models（ScreenSnapshot/BBox 契约模型，project-root.md 已认证
+    的跨层共享契约，不算反向依赖）与 orchestration.state，不 import 任何其他
+    上层模块。
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from typing import Literal
 
 from jinja2 import Environment, FileSystemLoader
 
+from src.agents.models.screen_snapshot import BBox, ScreenSnapshot
 from src.orchestration.state import DesktopTaskState, StepRecord
 
 logger = logging.getLogger(__name__)
@@ -112,6 +118,117 @@ def _truncate_perception_summary(
         max_chars,
     )
     return summary[:max_chars]
+
+
+GroundingEntry = tuple[str, str, str, BBox]
+"""(compact_id, role_or_label, display_text, bbox) 四元组，见 `_iter_grounding_entries`。"""
+
+
+def _iter_grounding_entries(snapshot: ScreenSnapshot) -> list[GroundingEntry]:
+    """按 uia → ocr → vis 顺序遍历三类感知元素，赋序列化层紧凑 id（蓝图决策 C）。
+
+    compact_id 格式 `"{type_prefix}:{index}"`（如 `"uia:3"`），序列化层新赋、
+    与感知层 element_id/block_id/object_id 本体无关——现场核查：
+    `UIAElement.element_id` 已含 `"uia_"` 前缀、`TextBlock.block_id` 已含
+    `"ocr_"` 前缀（见 src/mcp/desktop/tools/perception.py），但两者格式不一
+    （前者含 hwnd，后者含 snapshot_id）且 `VisualObject.object_id` 尚无生成
+    约定；本函数不改感知层 id 本体（勿误改清单），改用紧凑序号 id 统一三类
+    元素的引用格式，同时比原始 id 更省 token。
+
+    Args:
+        snapshot: 完整感知快照。
+
+    Returns:
+        (compact_id, role/label, display_text, bbox) 四元组列表，按类型分组、
+        组内保持原始顺序。
+    """
+    entries: list[GroundingEntry] = []
+    for i, el in enumerate(snapshot.uia_elements):
+        entries.append((f"uia:{i}", el.control_type, el.name, el.bbox))
+    for i, tb in enumerate(snapshot.text_blocks):
+        entries.append((f"ocr:{i}", "text", tb.text, tb.bbox))
+    for i, vo in enumerate(snapshot.visual_objects):
+        entries.append((f"vis:{i}", vo.label, vo.label, vo.bbox))
+    return entries
+
+
+def _render_grounding_line(compact_id: str, role: str, text: str, bbox: BBox) -> str:
+    """渲染单个元素为紧凑 HTML 类行（Skyvern 序列化实测 -11.4% token 的口径）。
+
+    Args:
+        compact_id: `_iter_grounding_entries` 赋的紧凑 id。
+        role: 控件类型 / 标签（UIA control_type、OCR 固定 "text"、视觉 label）。
+        text: 展示文本（UIA name、OCR 文本、视觉 label）。
+        bbox: 元素边界框（物理像素）。
+
+    Returns:
+        单行字符串，如 `<el id="uia:3" role="button" text="确定" bbox="100,200,180,240"/>`。
+    """
+    safe_text = (text or "").replace('"', "'").replace("\n", " ")
+    return (
+        f'<el id="{compact_id}" role="{role}" text="{safe_text}" '
+        f'bbox="{bbox.x},{bbox.y},{bbox.width},{bbox.height}"/>'
+    )
+
+
+def _build_grounding_lines(
+    snapshot: ScreenSnapshot,
+    max_chars: int,
+) -> tuple[list[str], dict[str, BBox]]:
+    """构造截断后的渲染行与 id→bbox 查找表（同一次截断，两者严格一致）。
+
+    截断口径同 `_truncate_perception_summary`（PERCEPTION_SUMMARY_MAX_TOKENS
+    字符数近似），超限的元素**同时不进渲染文本与查找表**——保证「LLM 只能
+    引用它实际看到的 id」：查找表若含渲染文本未展示的元素，会让 id 存在性
+    核验对着 LLM 看不到的数据做判断，语义不一致。
+
+    Args:
+        snapshot: 完整感知快照。
+        max_chars: 渲染文本字符数预算。
+
+    Returns:
+        (渲染行列表, compact_id -> BBox 查找表)。
+    """
+    entries = _iter_grounding_entries(snapshot)
+    lines: list[str] = []
+    table: dict[str, BBox] = {}
+    total_chars = 0
+    dropped = 0
+    for compact_id, role, text, bbox in entries:
+        line = _render_grounding_line(compact_id, role, text, bbox)
+        if total_chars + len(line) + 1 > max_chars:
+            dropped += 1
+            continue
+        lines.append(line)
+        table[compact_id] = bbox
+        total_chars += len(line) + 1
+
+    if dropped:
+        logger.warning(
+            "_build_grounding_lines: 元素表截断，%d/%d 个元素超出 %d 字符预算，已丢弃",
+            dropped,
+            len(entries),
+            max_chars,
+        )
+    return lines, table
+
+
+def _serialize_snapshot_compact(
+    snapshot: ScreenSnapshot,
+    max_chars: int = PERCEPTION_SUMMARY_MAX_TOKENS,
+) -> str:
+    """纯函数：把三类感知元素序列化为紧凑 HTML 类文本，供 user 提示词注入（蓝图任务 7）。
+
+    Args:
+        snapshot: 完整感知快照。
+        max_chars: 渲染文本字符数预算（默认 PERCEPTION_SUMMARY_MAX_TOKENS，与
+            perception_summary 截断同构口径）。
+
+    Returns:
+        逐行 `<el .../>` 拼接的字符串；无可定位元素时返回空字符串。
+    """
+    lines, _ = _build_grounding_lines(snapshot, max_chars)
+    return "\n".join(lines)
 
 
 def derive_last_step_outcome(
@@ -266,3 +383,65 @@ class PromptLoader:
         )
 
         return system_prompt, user_prompt
+
+    def render_action_generation(
+        self,
+        state: DesktopTaskState,
+        snapshot: ScreenSnapshot,
+    ) -> tuple[str, str, dict[str, BBox]]:
+        """渲染 ActionGeneratorAgent 的 system + user 提示词 + grounding 查找表。
+
+        与 `render_supervisor` 的区别：不含任务分解/路由上下文，只含「翻译当前
+        指令为一次动作调用」所需的最小上下文——当前指令、上一步结果三态、
+        错误原文、三类感知元素合并后的紧凑 id 表。
+
+        **grounding 表与渲染文本同一次构建**（PR #29 审查 BLOCK 收口）：查找表
+        随渲染结果一并返回，消费方（ActionGeneratorAgent）不得自行重建——两次
+        独立构建若预算不一致，LLM 可引用它没看到的 id 被放行（坐标级安全缺口，
+        审查已实证）。原 `build_grounding_table` 公开入口因此删除。
+
+        Args:
+            state: 当前 DesktopTaskState（取 current_instruction / step_history /
+                perception_error / control_error / uia_hollow）。
+            snapshot: 本轮感知快照（须是 state.snapshot_ref 对应的最新快照，
+                由调用方经 SnapshotStore 加载后传入——本方法不做快照加载 I/O）。
+
+        Returns:
+            (system_prompt, user_prompt, grounding_table)：前两者为非空字符串，
+            grounding_table 是与 user_prompt 中元素表**严格一致**的
+            compact_id -> BBox 查找表。
+            模板语法错误会向上抛出 jinja2.TemplateError（由调用方决定如何降级）。
+        """
+        grounding_lines, grounding_table = _build_grounding_lines(
+            snapshot,
+            self.summary_max_chars,
+        )
+        grounding_table_text: str = "\n".join(grounding_lines)
+
+        user_vars: dict[str, object] = {
+            "current_instruction": state.current_instruction,
+            "last_step_outcome": derive_last_step_outcome(state.step_history),
+            "errors": {
+                "perception_error": state.perception_error,
+                "control_error": state.control_error,
+            },
+            "uia_hollow": state.uia_hollow,
+            "grounding_table": grounding_table_text,
+        }
+
+        system_template = self.env.get_template("action_generation_system.jinja2")
+        system_prompt: str = system_template.render()
+
+        user_template = self.env.get_template("action_generation_user.jinja2")
+        user_prompt: str = user_template.render(**user_vars)
+
+        logger.debug(
+            "PromptLoader.render_action_generation: system=%d chars, user=%d chars, "
+            "grounding_table=%d chars / %d entries",
+            len(system_prompt),
+            len(user_prompt),
+            len(grounding_table_text),
+            len(grounding_table),
+        )
+
+        return system_prompt, user_prompt, grounding_table
