@@ -84,7 +84,14 @@ class _Segment:
         return self.start_s + self.duration_s
 
     def sample(self, t_local: float) -> dict[str, float]:
-        """段内取样：帧间线性插值；越过端点夹取端点帧。"""
+        """段内取样：帧间线性插值；越过端点夹取端点帧。
+
+        ⚠ 跨仓依赖登记（Zero 2026-09-01 lipsync v2 落地件）：Zero 侧 SLEW
+        连续限速论证**依赖本方法「帧间线性、t₂ 恰好达到 v₂」的语义**（其
+        非均匀音素边界关键帧策略据此免提前量）。改插值语义（换缓动曲线/
+        过点生效/重采样）属跨仓行为变更——**改动前须知会 Zero**，不是本仓
+        可静默调整的内部细节。
+        """
         if t_local <= self.times[0]:
             return dict(self.frames[0])
         if t_local >= self.times[-1]:
