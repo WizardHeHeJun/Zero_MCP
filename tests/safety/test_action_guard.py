@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import pytest
 
-from src.agents.models.screen_snapshot import ActionRisk, ActionSpec, ScreenSnapshot
+from src.agents.models.screen_snapshot import ActionRisk, ActionSpec, BBox, ScreenSnapshot
 from src.agents.text_filter import sanitize_screen_text
 from src.mcp.desktop_mcp_client import DesktopMCPClient
 from src.orchestration.safety.action_guard import (
@@ -40,6 +40,7 @@ def _make_action(
     risk_level: ActionRisk,
     coordinates: tuple[int, int] | None = None,
     action_id: str = "act-test",
+    target_bbox: BBox | None = None,
 ) -> ActionSpec:
     """构造 ActionSpec 测试 fixture。"""
     return ActionSpec(
@@ -49,6 +50,7 @@ def _make_action(
         coordinates=coordinates,
         text_payload=None,
         risk_level=risk_level,
+        target_bbox=target_bbox,
     )
 
 
@@ -517,6 +519,154 @@ class TestToctouVerify:
                     result = await guard.toctou_verify(action, snapshot_before=snapshot_before)
 
         assert result == "pass"
+
+
+# ── TOCTOU 哈希粒度盲区方案③：target_bbox 自适应裁剪 ─────────────────────────
+# notes/2026-09-01-toctou-hash-granularity-eval.md +
+# notes/2026-09-01-toctou-adaptive-crop-calibration.md：固定 TOCTOU_CROP_HALF_PX
+# 邻域稀释目标 bbox 内小变化的因果链，在此用同一对 before/after 图像复刻——
+# 判别对：同一变化，固定裁剪测不出（pass），元素级自适应裁剪测得出（abort）。
+
+
+class TestToctouAdaptiveCrop:
+    """target_bbox 三分支：自适应裁剪生效 / 无 bbox 回退固定邻域零回归 / margin 下限兜底。"""
+
+    async def test_target_bbox_adaptive_crop_detects_diluted_change(
+        self, tmp_path: Path
+    ) -> None:
+        """有 target_bbox：小目标区域的变化在紧凑自适应裁剪下被正确检出（abort）。
+
+        背景 300×300 带纹理（模拟真实 UI 内容非均匀色块），目标 bbox 20×20
+        （140,140)-(160,160)）整体翻白，margin=20 → 自适应裁剪区 60×60。
+        """
+        size = 300
+        bg_a = np.full((size, size), 120, dtype=np.uint8)
+        bg_a[:, ::10] = 140  # 纹理条纹，避免退化为均匀色块
+        bg_b = bg_a.copy()
+        bg_b[140:160, 140:160] = 255  # 目标 bbox 内容整体翻白
+
+        path_a = str(tmp_path / "a.png")
+        path_b = str(tmp_path / "b.png")
+        cv2.imwrite(path_a, bg_a)
+        cv2.imwrite(path_b, bg_b)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard = ActionGuard(client)
+        action = _make_action(
+            "click",
+            ActionRisk.DESTRUCTIVE,
+            coordinates=(150, 150),
+            target_bbox=BBox(x=140, y=140, width=20, height=20),
+        )
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch(
+                "src.orchestration.safety.action_guard.TOCTOU_CROP_MIN_MARGIN_PX", 20
+            ):
+                with patch(
+                    "src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1
+                ):
+                    result = await guard.toctou_verify(action)
+
+        assert result == "abort"
+
+    async def test_same_change_diluted_without_target_bbox(self, tmp_path: Path) -> None:
+        """判别对：同一对图像、同一变化，无 target_bbox 回退固定 300×300 邻域
+        （旧行为）时该变化被稀释测不出（pass）——复刻标定实证的因果链。
+        """
+        size = 300
+        bg_a = np.full((size, size), 120, dtype=np.uint8)
+        bg_a[:, ::10] = 140
+        bg_b = bg_a.copy()
+        bg_b[140:160, 140:160] = 255
+
+        path_a = str(tmp_path / "a.png")
+        path_b = str(tmp_path / "b.png")
+        cv2.imwrite(path_a, bg_a)
+        cv2.imwrite(path_b, bg_b)
+
+        client = _make_mock_client()
+        client.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard = ActionGuard(client)
+        # 无 target_bbox：旧固定邻域口径，中心 (150,150)，半径 150 → 覆盖整张 300×300 图
+        action = _make_action(
+            "click",
+            ActionRisk.DESTRUCTIVE,
+            coordinates=(150, 150),
+            target_bbox=None,
+        )
+
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch("src.orchestration.safety.action_guard.TOCTOU_CROP_HALF_PX", 150):
+                with patch(
+                    "src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1
+                ):
+                    result = await guard.toctou_verify(action)
+
+        assert result == "pass"
+
+    async def test_target_bbox_margin_floor_catches_change_just_outside_bbox(
+        self, tmp_path: Path
+    ) -> None:
+        """margin 下限兜底：变化落在「紧贴 bbox 之外、margin 环内」时，margin>0
+        才能捕捉（abort）；margin=0（bbox 精确无冗余）会漏检（pass）——
+        证明 TOCTOU_CROP_MIN_MARGIN_PX 确实参与裁剪运算，非摆设。
+        """
+        size = 300
+        bg_a = np.full((size, size), 120, dtype=np.uint8)
+        bg_a[:, ::10] = 140
+        bg_b = bg_a.copy()
+        # 变化紧贴 bbox (140,140)-(160,160) 右下角之外 10px，margin=20 环内
+        bg_b[160:170, 160:170] = 255
+
+        path_a = str(tmp_path / "a.png")
+        path_b = str(tmp_path / "b.png")
+        cv2.imwrite(path_a, bg_a)
+        cv2.imwrite(path_b, bg_b)
+
+        bbox = BBox(x=140, y=140, width=20, height=20)
+
+        # margin=20：变化落在 (120,120)-(180,180) 裁剪区内 → 检出
+        client_with_margin = _make_mock_client()
+        client_with_margin.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard_with_margin = ActionGuard(client_with_margin)
+        action = _make_action(
+            "click", ActionRisk.DESTRUCTIVE, coordinates=(150, 150), target_bbox=bbox
+        )
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch(
+                "src.orchestration.safety.action_guard.TOCTOU_CROP_MIN_MARGIN_PX", 20
+            ):
+                with patch(
+                    "src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1
+                ):
+                    result_with_margin = await guard_with_margin.toctou_verify(action)
+        assert result_with_margin == "abort"
+
+        # margin=0：裁剪区精确等于 bbox (140,140)-(160,160)，变化落在区外 → 漏检
+        client_no_margin = _make_mock_client()
+        client_no_margin.screen_snapshot.side_effect = [
+            _make_snapshot(path_a),
+            _make_snapshot(path_b),
+        ]
+        guard_no_margin = ActionGuard(client_no_margin)
+        with patch("src.orchestration.safety.action_guard.asyncio.sleep", new_callable=AsyncMock):
+            with patch("src.orchestration.safety.action_guard.TOCTOU_CROP_MIN_MARGIN_PX", 0):
+                with patch(
+                    "src.orchestration.safety.action_guard.TOCTOU_HASH_THRESHOLD", 0.1
+                ):
+                    result_no_margin = await guard_no_margin.toctou_verify(action)
+        assert result_no_margin == "pass"
 
 
 # ── K1 ③：TOCTOU 验证降级时 DESTRUCTIVE fail-closed ──────────────────────────

@@ -12,6 +12,9 @@
   7. 5 个工具定义形状：strict:true 且 input_schema 无 minimum/maximum
      （复用 PR-α 的扫描器思路）。
   8. make_generate_action_node 节点签名 (state) -> dict。
+  9. target_bbox 透传（TOCTOU 方案③）：target_element_id 命中时 ActionSpec.
+     target_bbox 等于查表 bbox；LLM 只给 coordinate 兜底通道时 target_bbox
+     保持 None（不信自报边界）。
 """
 
 from __future__ import annotations
@@ -300,6 +303,8 @@ async def test_generate_click_with_target_element_id_success(
     assert spec.action_type == "click"
     # bbox=(100,200,80,40) → 中心 (140, 220)
     assert spec.coordinates == (140, 220)
+    # TOCTOU 方案③：target_element_id 命中时同步注入 target_bbox
+    assert spec.target_bbox == BBox(x=100, y=200, width=80, height=40)
 
 
 async def test_generate_type_with_coordinate_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,6 +329,8 @@ async def test_generate_type_with_coordinate_success(monkeypatch: pytest.MonkeyP
     assert spec.action_type == "type"
     assert spec.text_payload == "hello"
     assert spec.coordinates == (5, 6)
+    # TOCTOU 方案③：LLM 自报 coordinate 的兜底通道不信自报边界，target_bbox 保持 None
+    assert spec.target_bbox is None
 
 
 # ── 3. id 不存在 → 失败令牌 ────────────────────────────────────────────────────

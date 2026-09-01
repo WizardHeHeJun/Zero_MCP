@@ -35,10 +35,36 @@ logger = logging.getLogger(__name__)
 #   邻域裁剪比对；无坐标的动作（如 close_window）退回整图口径。
 #   TOCTOU_CROP_HALF_PX=150（300×300 邻域）为工程假设：覆盖常见按钮/菜单目标，
 #   小于动画区到目标的典型距离；动效恰在目标上时 abort 是正确行为（目标不稳定）。
+#
+# TOCTOU 哈希粒度盲区方案③已重标（notes/2026-09-01-toctou-hash-granularity-eval.md
+# + notes/2026-09-01-toctou-adaptive-crop-calibration.md）：固定 300×300 邻域
+# 对「目标 bbox 内小文字/图标变化」信号稀释——标定实证收紧到控件自身零冗余
+# bbox 才勉强检出（1/64 位翻转，仍不过阈值）。`action.target_bbox` 非 None 时
+# `_crop_for` 改按 bbox 外扩 TOCTOU_CROP_MIN_MARGIN_PX 裁剪（元素级自适应），
+# 不再用固定半径；`target_bbox` 为 None（LLM 自报坐标/无 grounding 命中）时
+# 回退固定 TOCTOU_CROP_HALF_PX 邻域（旧行为，零回归）。
+# TOCTOU_CROP_MIN_MARGIN_PX=20 为真机标定实证值（非猜测）：输入框类目标 3
+# 个有效试次（合并两轮运行）里，margin=20 在 8×8/12×12/16×16 三档 hash 分辨
+# 率下均 clean detection（change_mean≈0.18~0.20，近两倍阈值余量、noise_mean
+# 恒<0.02）；margin=50 已贴阈值（8×8/12×12 检出但余量仅 0.004~0.025，16×16
+# 直接翻到漏检：change_mean 0.083<0.1）；margin=100 三档全漏检（change_mean
+# 0.06~0.07<0.1）——margin 越大越稀释目标内变化，与 300×300 固定邻域盲区
+# 同一因果链，佐证「裁剪半径过大同样稀释目标内小变化」（见
+# ai-docs/pitfalls.md 衍生条目）。详见标定纪要。
+#
+# 威胁模型分工裁定（评估纪要 §A，本次未改动）：
+#   (i) 目标 bbox 内内容篡改（按钮标签被偷换、坐标不变）—— 属 TOCTOU 既定
+#       威胁模型（notification hijacking 隐蔽变体），本次方案③即为修正此类
+#       盲区而做。
+#   (ii) 目标之外的界面变化（如相对点击目标而言的时钟区域）—— 从来不归
+#       TOCTOU，裁剪到局部邻域正是 Task 12 的设计意图（整图无静止基线）。
+#       元素级自适应裁剪后 (ii) 类的裁剪区域更小、覆盖面更窄，属既定口径
+#       决策的自然延伸，**不是**缺陷——TOCTOU 不承诺检测目标以外的界面变化。
 
 TOCTOU_WAIT_MS: int = int(os.environ.get("TOCTOU_WAIT_MS", "200"))
 TOCTOU_HASH_THRESHOLD: float = float(os.environ.get("TOCTOU_HASH_THRESHOLD", "0.1"))
 TOCTOU_CROP_HALF_PX: int = int(os.environ.get("TOCTOU_CROP_HALF_PX", "150"))
+TOCTOU_CROP_MIN_MARGIN_PX: int = int(os.environ.get("TOCTOU_CROP_MIN_MARGIN_PX", "20"))
 
 # ── 三级白名单（action_type → 最大允许 ActionRisk） ───────────────────────────
 # 不在白名单中的 action_type 一律升级为 DESTRUCTIVE。
@@ -181,9 +207,12 @@ class ActionGuard:
           2. 等待 TOCTOU_WAIT_MS 毫秒。
           3. 再调一次 screen_snapshot 取第二张截图。
           4. 比对两次 phash，delta > TOCTOU_HASH_THRESHOLD 则 abort（界面已变）。
-             坐标动作按 TOCTOU_CROP_HALF_PX 邻域**局部裁剪**比对（Task 12 实测：
-             整图 hash 被应用自身动效持续误报，无静止基线）；坐标经各图
-             capture_origin 换算，兼容全屏截图与 PrintWindow 窗口图混用。
+             坐标动作按局部邻域**局部裁剪**比对（Task 12 实测：整图 hash 被
+             应用自身动效持续误报，无静止基线）；坐标经各图 capture_origin
+             换算，兼容全屏截图与 PrintWindow 窗口图混用。裁剪区域优先取
+             `action.target_bbox`（TOCTOU 哈希粒度盲区方案③，元素级自适应，
+             外扩 TOCTOU_CROP_MIN_MARGIN_PX），无 bbox 时退回固定
+             TOCTOU_CROP_HALF_PX 邻域（旧行为）。
 
         降级语义（K1 ③ + 二期三态化）：验证链路降级（截图无路径 / phash 失败）
         时按有效风险分级——DESTRUCTIVE 返回 "abort_degraded"（验证不可得时
@@ -224,7 +253,22 @@ class ActionGuard:
         # crop 按各自图像的 capture_origin 把屏幕绝对坐标换算为图像坐标——
         # 两张图可能一张全屏(origin=(0,0))一张 PrintWindow 窗口图，但比对的
         # 屏幕区域一致。
+        #
+        # TOCTOU 哈希粒度盲区方案③（notes/2026-09-01-toctou-hash-granularity-eval.md
+        # + notes/2026-09-01-toctou-adaptive-crop-calibration.md）：固定
+        # TOCTOU_CROP_HALF_PX 邻域会把目标 bbox 内的小文字/图标变化稀释到低于
+        # TOCTOU_HASH_THRESHOLD（标定实证：零冗余裁剪到目标自身 bbox 才勉强
+        # 检出 1/64 位翻转）。`action.target_bbox` 非 None 时改按 bbox 外扩
+        # TOCTOU_CROP_MIN_MARGIN_PX 裁剪（元素级自适应）；None 时（LLM 自报
+        # coordinate 兜底通道 / 无坐标动作）退回旧固定邻域口径，逐字节零回归。
         def _crop_for(origin: tuple[int, int]) -> tuple[int, int, int, int] | None:
+            if action.target_bbox is not None:
+                bbox = action.target_bbox
+                left = bbox.x - origin[0] - TOCTOU_CROP_MIN_MARGIN_PX
+                top = bbox.y - origin[1] - TOCTOU_CROP_MIN_MARGIN_PX
+                right = bbox.x + bbox.width - origin[0] + TOCTOU_CROP_MIN_MARGIN_PX
+                bottom = bbox.y + bbox.height - origin[1] + TOCTOU_CROP_MIN_MARGIN_PX
+                return (left, top, right, bottom)
             if action.coordinates is None:
                 return None  # 无坐标动作（如 close_window）退回整图口径
             cx, cy = action.coordinates[0] - origin[0], action.coordinates[1] - origin[1]

@@ -22,7 +22,10 @@ grounding 解析（蓝图决策 C）：LLM 只能引用 prompt 中列出的紧�
 构建**返回的查找表查 bbox 中心覆写坐标——不信 LLM 自报坐标防像素幻觉；
 `uia_hollow` 场景 LLM 只给 `coordinate` 时沿用（OCR 兜底通道，不覆写）。
 查找表不得在消费侧重建（PR #29 审查 BLOCK：重建预算与渲染预算脱钩时，
-LLM 可引用它没看到的 id 被放行）。
+LLM 可引用它没看到的 id 被放行）。命中 `target_element_id` 时同时把该 bbox
+写入 `ActionSpec.target_bbox`（TOCTOU 哈希粒度盲区方案③，
+notes/2026-09-01-toctou-hash-granularity-eval.md），供 `ActionGuard` 自适应
+裁剪 TOCTOU 比对区；`coordinate` 兜底通道无 bbox，`target_bbox` 保持 None。
 
 失败处理（蓝图决策 D）：单条丢弃 + 结构化记录进下一轮 planner，不建 JSON
 自修复循环。失败复用 `control_error` 字段 + 机读令牌
@@ -267,12 +270,20 @@ class ActionGeneratorAgent:
 
         # id 存在性核验 + 服务端坐标解析（蓝图决策 C：不信 LLM 自报坐标）。
         # 查找表来自 render 的同一次构建——与 LLM 实际看到的元素集合严格一致
-        grounding_error = self._resolve_grounding(parsed, grounding_table)
+        grounding_error, resolved_bbox = self._resolve_grounding(parsed, grounding_table)
         if grounding_error is not None:
             return self._fail(state, grounding_error)
 
         action_id = str(uuid.uuid4())
         spec: ActionSpec = parsed.to_action_spec(action_id)
+        # TOCTOU 方案③（notes/2026-09-01-toctou-hash-granularity-eval.md 文件级
+        # tasks 2）：target_element_id 解析出的 bbox 在此注入 ActionSpec，供
+        # ActionGuard 自适应裁剪。子模型 schema 故意不带 bbox 字段（不信 LLM
+        # 自报边界）——只有服务端按 grounding_table 查到的真实 bbox 才写入；
+        # LLM 只给 coordinate（uia_hollow 兜底通道）时 resolved_bbox 为 None，
+        # spec.target_bbox 保持默认 None，toctou_verify 回退固定邻域裁剪。
+        if resolved_bbox is not None:
+            spec = spec.model_copy(update={"target_bbox": resolved_bbox})
 
         logger.info(
             "ActionGeneratorAgent.generate: task_id=%r action_type=%r action_id=%r",
@@ -294,12 +305,17 @@ class ActionGeneratorAgent:
         self,
         parsed: ActionGenerationBase,
         grounding_table: dict[str, BBox],
-    ) -> str | None:
+    ) -> tuple[str | None, BBox | None]:
         """核验 target_element_id 存在性，并用 bbox 中心覆写坐标（蓝图决策 C）。
 
         只对 `ClickActionInput` / `TypeActionInput` 生效（唯二含
         target_element_id/coordinate 定位字段的子模型）；其余子模型（key/
         window_close/wait）无定位字段，原样放行。
+
+        TOCTOU 方案③（notes/2026-09-01-toctou-hash-granularity-eval.md 文件级
+        tasks 2）：除坐标覆写外，一并把解析到的真实 bbox 回传给调用方——由
+        `generate()` 在组装完 `ActionSpec` 后注入 `target_bbox`（不在子模型
+        schema 里加 bbox 字段：LLM 不该产出 bbox，不信自报原则同坐标）。
 
         Args:
             parsed: 已通过 pydantic 校验的生成子模型实例（就地修改 .coordinate）。
@@ -308,29 +324,32 @@ class ActionGeneratorAgent:
                 重建——重建预算与渲染预算脱钩时，LLM 可引用它没看到的 id）。
 
         Returns:
-            None=通过（或不适用）；否则为失败原因文本。
+            (error, resolved_bbox)：error=None 表示通过（或不适用），否则为
+            失败原因文本；resolved_bbox 仅在按 target_element_id 命中真实
+            bbox 时非 None（LLM 自报 coordinate 的兜底通道恒为 None）。
         """
         if not isinstance(parsed, (ClickActionInput, TypeActionInput)):
-            return None
+            return None, None
 
         if parsed.target_element_id is not None:
             bbox = grounding_table.get(parsed.target_element_id)
             if bbox is None:
                 return (
                     f"target_element_id={parsed.target_element_id!r} "
-                    "不在本次可用元素表中（LLM 引用了未列出的 id）"
+                    "不在本次可用元素表中（LLM 引用了未列出的 id）",
+                    None,
                 )
             center_x = bbox.x + bbox.width // 2
             center_y = bbox.y + bbox.height // 2
             parsed.coordinate = GroundingCoordinate(x=center_x, y=center_y)
-            return None
+            return None, bbox
 
         if parsed.coordinate is None:
             # model_validator 已在 pydantic 校验阶段挡掉此情形，此处兜底不可达
-            return "click/type 动作缺 target_element_id 与 coordinate"
+            return "click/type 动作缺 target_element_id 与 coordinate", None
 
-        # LLM 只给 coordinate（uia_hollow 兜底通道）：沿用，不覆写
-        return None
+        # LLM 只给 coordinate（uia_hollow 兜底通道）：沿用，不覆写，无 bbox
+        return None, None
 
     def _fail(self, state: DesktopTaskState, reason: str) -> dict[str, Any]:
         """构造失败增量（蓝图决策 D：单条丢弃 + 结构化记录进下一轮 planner）。
