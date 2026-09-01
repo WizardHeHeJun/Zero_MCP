@@ -24,6 +24,16 @@ ActionSpec 生成层拍板①增量（notes/2026-08-31-actionspec-generation-blu
 
 - `ActionSpec.wait_ms`：等待动作（`action_type == "wait"`）的等待毫秒数，
   None=非 wait 动作。可选字段、默认 None，旧 payload 反序列化零回归。
+
+TOCTOU 哈希粒度盲区方案③增量（notes/2026-09-01-toctou-hash-granularity-eval.md
+文件级 tasks 1；标定依据 notes/2026-09-01-toctou-adaptive-crop-calibration.md）：
+
+- `ActionSpec.target_bbox`：坐标点击/输入的目标物理边界（来自 OCR/UIA 元素
+  解析，即 `action_generator._resolve_grounding` 命中 `target_element_id` 时
+  查到的 bbox），供 `ActionGuard.toctou_verify` 按目标自身尺寸自适应裁剪
+  TOCTOU 比对区，修正固定邻域裁剪稀释目标内小变化（如控件文字被偷换）的盲区。
+  None=回退固定 `TOCTOU_CROP_HALF_PX` 邻域裁剪（旧行为，零回归）——LLM 只给
+  `coordinate` 自报坐标（uia_hollow 兜底通道）时同样为 None，不信自报边界。
 """
 
 from enum import StrEnum
@@ -163,6 +173,10 @@ class ActionSpec(BaseModel):
     # ActionSpec 生成层拍板①：等待动作的等待毫秒数，仅 action_type=="wait" 时
     # 使用；None=非 wait 动作。可选字段防对 text_payload 的双重语义污染。
     wait_ms: int | None = None
+    # TOCTOU 哈希粒度盲区方案③：目标物理边界（来自 OCR/UIA 元素解析），供
+    # ActionGuard.toctou_verify 自适应裁剪；None=回退固定邻域（零回归）。
+    # 语义与来源见类 docstring「TOCTOU 哈希粒度盲区方案③增量」。
+    target_bbox: BBox | None = None
 
 
 class ActionResult(BaseModel):
