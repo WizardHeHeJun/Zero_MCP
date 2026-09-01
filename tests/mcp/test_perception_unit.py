@@ -892,52 +892,71 @@ async def test_screen_snapshot_ocr_unavailable_degradation(
     assert snapshot.screenshot_path == "C:/fake/shot.png"
 
 
-# ── _collect_uia_tree_sync root 获取防御（2026-09-01 实机标定遗留②） ──────────
+# ── UIA 采集失败防御（2026-09-01 实机标定遗留②，PR #34 审查后调用方级落地）────
 
 
-class TestCollectUiaTreeRootGuard:
-    """ControlFromHandle/GetRootControl 抛异常（实测 COMError）时返回空列表，
-    不炸整个感知调用——OCR 通道兜底（同 hollow 探测 except 先例）。"""
+def _raise_com(*args: Any, **kwargs: Any) -> Any:
+    raise OSError("COMError: (-2147220991, '事件无法调用任何订户')")
 
-    def test_control_from_handle_raises_returns_empty(
+
+class TestUiaCollectFailedDegradation:
+    """_collect_uia_tree_sync 抛异常（实测 COMError）时：do_screen_snapshot 记
+    机读标记 uia_collect_failed 不炸调用；uia_only 模式强制升级 OCR 兜底
+    （否则产出「UIA 空+无截图+无 OCR+无标记」的静默全空快照）；
+    do_get_uia_tree 返回空列表（已知局限：与真空树不可区分）。"""
+
+    async def test_snapshot_marks_degradation_and_survives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import uiautomation as auto
+        caps = _make_caps(ocr=True, mss_available=True)
+        _patch_healthy_pipeline(monkeypatch)
+        monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", _raise_com)
 
-        def boom(hwnd: int) -> Any:
-            raise OSError("COMError: (-2147220991, '事件无法调用任何订户')")
+        snapshot = await perception_mod.do_screen_snapshot(
+            mode="uia_ocr", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+        )
 
-        monkeypatch.setattr(auto, "ControlFromHandle", boom)
-        result = perception_mod._collect_uia_tree_sync(0x12345, 5)
-        assert result == []
+        assert "uia_collect_failed" in snapshot.degradations
+        assert snapshot.uia_elements == []
 
-    def test_get_root_control_raises_returns_empty(
+    async def test_uia_only_mode_upgrades_to_ocr_fallback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import uiautomation as auto
+        """uia_only + 采集失败 → 强制升级 uia_ocr（OCR 真被调、截图真落盘），
+        修复前该场景是静默全空快照（审查 WARN② 场景固化）。"""
+        caps = _make_caps(ocr=True, mss_available=True)
+        seen_ocr = _patch_healthy_pipeline(monkeypatch)
+        monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", _raise_com)
 
-        def boom_root() -> Any:
-            raise OSError("COMError: root")
+        snapshot = await perception_mod.do_screen_snapshot(
+            mode="uia_only", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+        )
 
-        monkeypatch.setattr(auto, "GetRootControl", boom_root)
-        result = perception_mod._collect_uia_tree_sync(None, 5)
+        assert "uia_collect_failed" in snapshot.degradations
+        assert snapshot.screenshot_path is not None, "升级后应有截图产物"
+        assert len(seen_ocr) == 1, "升级后 OCR 应被调用恰一次"
+
+    async def test_uia_only_healthy_does_not_upgrade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """正对照：uia_only 健康路径不升级、不触 OCR、无标记（防误吞）。"""
+        caps = _make_caps(ocr=True, mss_available=True)
+        seen_ocr = _patch_healthy_pipeline(monkeypatch)
+
+        snapshot = await perception_mod.do_screen_snapshot(
+            mode="uia_only", capture_screenshot=False, caps=caps, screenshot_tmp_dir=""
+        )
+
+        assert "uia_collect_failed" not in snapshot.degradations
+        assert seen_ocr == []
+
+    async def test_get_uia_tree_returns_empty_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        caps = _make_caps(ocr=True, mss_available=True)
+        monkeypatch.setattr(perception_mod, "_collect_uia_tree_sync", _raise_com)
+
+        result = await perception_mod.do_get_uia_tree(
+            window_handle=0x12345, max_depth=5, caps=caps
+        )
         assert result == []
-
-    def test_healthy_path_unaffected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """正对照：root 正常时照常遍历（防御分支不误吞健康路径）。"""
-        import uiautomation as auto
-
-        fake_rect = MagicMock(left=0, top=0, right=10, bottom=10)
-        fake_root = MagicMock()
-        fake_root.BoundingRectangle = fake_rect
-        fake_root.ControlTypeName = "WindowControl"
-        fake_root.Name = "测试窗"
-        fake_root.AutomationId = "w1"
-        fake_root.IsEnabled = True
-        fake_root.IsOffscreen = False
-        fake_root.GetChildren.return_value = []
-
-        monkeypatch.setattr(auto, "ControlFromHandle", lambda hwnd: fake_root)
-        result = perception_mod._collect_uia_tree_sync(0x1, 5)
-        assert len(result) == 1
-        assert result[0]["control_type"] == "WindowControl"

@@ -155,27 +155,20 @@ def _collect_uia_tree_sync(
     """
     import uiautomation as auto  # 延迟 import：DPI 已在模块级设好
 
-    # root 获取整段防御（2026-09-01 实机标定实测：句柄瞬时失效/COM 未就绪时
-    # ControlFromHandle 抛 COMError，此前裸奔会炸整个感知调用）。失败即返回
-    # 空列表——消费侧空 uia_elements 与「UIA 空洞」同族，OCR 主通道天然兜底
-    # （同 _probe_window_uia_hollow_sync 的 except → hollow=True 先例）。
+    # ⚠ root 获取（ControlFromHandle/GetRootControl）会在句柄瞬时失效/COM 未就绪
+    # 时抛 COMError（2026-09-01 实机标定实测）——本函数**有意不捕获**，防御在
+    # 两个调用方各自落地：do_screen_snapshot 记 degradations["uia_collect_failed"]
+    # 并按需升级 OCR 兜底；do_get_uia_tree 捕获后返回空列表。在此捕获会丢失
+    # 降级信号通道（本函数只返回 list），PR #34 审查 WARN 即此。
     root: _AnyCtrl
-    try:
-        if hwnd is not None:
-            root = auto.ControlFromHandle(hwnd)
-        else:
-            root = auto.GetRootControl()
-            # 取前台窗口，避免遍历整个桌面树
-            fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if fg_hwnd:
-                root = auto.ControlFromHandle(fg_hwnd)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "UIA root 获取失败（hwnd=%s）：%s，返回空元素列表（OCR 通道兜底）",
-            f"{hwnd:#x}" if hwnd is not None else "前台",
-            exc,
-        )
-        return []
+    if hwnd is not None:
+        root = auto.ControlFromHandle(hwnd)
+    else:
+        root = auto.GetRootControl()
+        # 取前台窗口，避免遍历整个桌面树
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if fg_hwnd:
+            root = auto.ControlFromHandle(fg_hwnd)
 
     elements: list[dict[str, Any]] = []
     # DFS 栈：(control, depth)
@@ -662,11 +655,29 @@ async def do_screen_snapshot(
         effective_mode = "uia_ocr"
 
     # ── UIA 树遍历（阻塞，走 to_thread） ──────────────────────────────────────
-    raw_uia: list[dict[str, Any]] = await asyncio.to_thread(
-        _collect_uia_tree_sync,
-        active_hwnd,
-        5,  # max_depth 固定 5，与 server 默认对齐
-    )
+    # COMError 防御（2026-09-01 实机标定实测：句柄瞬时失效可抛，裸奔会炸整个
+    # 感知调用）：失败记机读标记 uia_collect_failed（同模块「失败→degradations」
+    # 既定纪律），且 uia_only 模式强制升级 uia_ocr——否则该模式下会产出
+    # 「UIA 空 + 无截图 + 无 OCR + 无标记」的静默全空快照（PR #34 审查 WARN②，
+    # 升级同 uia_hollow 先例）。
+    raw_uia: list[dict[str, Any]]
+    try:
+        raw_uia = await asyncio.to_thread(
+            _collect_uia_tree_sync,
+            active_hwnd,
+            5,  # max_depth 固定 5，与 server 默认对齐
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "UIA 采集失败（hwnd=%s）：%s → degradations[uia_collect_failed]",
+            f"{active_hwnd:#x}" if active_hwnd else "前台",
+            exc,
+        )
+        raw_uia = []
+        degradations.append("uia_collect_failed")
+        if effective_mode == "uia_only":
+            logger.warning("uia_only 模式下 UIA 采集失败，强制升级 uia_ocr 兜底")
+            effective_mode = "uia_ocr"
     uia_elements = _uia_elements_to_models(raw_uia, active_hwnd)
     logger.debug(
         "UIA 遍历完成：hwnd=%s elements=%d hollow=%s",
@@ -829,11 +840,23 @@ async def do_get_uia_tree(
     Returns:
         UIAElement 列表。
     """
-    raw_elements: list[dict[str, Any]] = await asyncio.to_thread(
-        _collect_uia_tree_sync,
-        window_handle,
-        max_depth,
-    )
+    # COMError 防御（同 do_screen_snapshot 处说明）：本工具无 degradations 旁路
+    # 信道，失败返回空列表 + warning——「真没有子元素」与「采集失败」在返回值层
+    # 不可区分，为已知局限（PR #34 审查 WARN③，是否加 partial/error 字段留
+    # eng-team 评估，勿静默扩契约）。
+    try:
+        raw_elements: list[dict[str, Any]] = await asyncio.to_thread(
+            _collect_uia_tree_sync,
+            window_handle,
+            max_depth,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "do_get_uia_tree UIA 采集失败（hwnd=%s）：%s，返回空列表（已知局限：与真空树不可区分）",
+            f"{window_handle:#x}" if window_handle else "前台",
+            exc,
+        )
+        return []
     return _uia_elements_to_models(raw_elements, window_handle)
 
 
