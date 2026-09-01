@@ -103,6 +103,11 @@ def _write_probe_project(root: Path) -> None:
 def _run_probe(root: Path, *, strict: bool) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_REPO_ROOT)  # 供探针 conftest import tests.mcp.conftest
+    # 双侧钉 UTF-8（2026-09-01 实测缺陷）：Windows 下 text=True 不带 encoding 会按
+    # 系统 GBK 解码子进程输出——子 pytest 输出一旦出现 GBK 解不了的 UTF-8 字节
+    # （随 Zero HEAD 前进、skip 理由含中文/特殊字符时触发）即 UnicodeDecodeError
+    # 假红。PYTHONIOENCODING 钉子进程自身 stdout，encoding 钉父进程解码。
+    env["PYTHONIOENCODING"] = "utf-8"
     if strict:
         env[STRICT_ENV] = "1"
     else:
@@ -110,7 +115,8 @@ def _run_probe(root: Path, *, strict: bool) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "pytest", str(root), "-q", "-p", "no:cacheprovider"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=180,
     )
