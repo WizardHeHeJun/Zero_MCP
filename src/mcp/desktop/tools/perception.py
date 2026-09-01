@@ -155,15 +155,27 @@ def _collect_uia_tree_sync(
     """
     import uiautomation as auto  # 延迟 import：DPI 已在模块级设好
 
+    # root 获取整段防御（2026-09-01 实机标定实测：句柄瞬时失效/COM 未就绪时
+    # ControlFromHandle 抛 COMError，此前裸奔会炸整个感知调用）。失败即返回
+    # 空列表——消费侧空 uia_elements 与「UIA 空洞」同族，OCR 主通道天然兜底
+    # （同 _probe_window_uia_hollow_sync 的 except → hollow=True 先例）。
     root: _AnyCtrl
-    if hwnd is not None:
-        root = auto.ControlFromHandle(hwnd)
-    else:
-        root = auto.GetRootControl()
-        # 取前台窗口，避免遍历整个桌面树
-        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if fg_hwnd:
-            root = auto.ControlFromHandle(fg_hwnd)
+    try:
+        if hwnd is not None:
+            root = auto.ControlFromHandle(hwnd)
+        else:
+            root = auto.GetRootControl()
+            # 取前台窗口，避免遍历整个桌面树
+            fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if fg_hwnd:
+                root = auto.ControlFromHandle(fg_hwnd)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "UIA root 获取失败（hwnd=%s）：%s，返回空元素列表（OCR 通道兜底）",
+            f"{hwnd:#x}" if hwnd is not None else "前台",
+            exc,
+        )
+        return []
 
     elements: list[dict[str, Any]] = []
     # DFS 栈：(control, depth)

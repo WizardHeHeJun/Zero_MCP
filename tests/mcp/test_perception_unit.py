@@ -890,3 +890,54 @@ async def test_screen_snapshot_ocr_unavailable_degradation(
     assert "ocr_unavailable" in snapshot.degradations
     assert seen_ocr == []
     assert snapshot.screenshot_path == "C:/fake/shot.png"
+
+
+# ── _collect_uia_tree_sync root 获取防御（2026-09-01 实机标定遗留②） ──────────
+
+
+class TestCollectUiaTreeRootGuard:
+    """ControlFromHandle/GetRootControl 抛异常（实测 COMError）时返回空列表，
+    不炸整个感知调用——OCR 通道兜底（同 hollow 探测 except 先例）。"""
+
+    def test_control_from_handle_raises_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uiautomation as auto
+
+        def boom(hwnd: int) -> Any:
+            raise OSError("COMError: (-2147220991, '事件无法调用任何订户')")
+
+        monkeypatch.setattr(auto, "ControlFromHandle", boom)
+        result = perception_mod._collect_uia_tree_sync(0x12345, 5)
+        assert result == []
+
+    def test_get_root_control_raises_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uiautomation as auto
+
+        def boom_root() -> Any:
+            raise OSError("COMError: root")
+
+        monkeypatch.setattr(auto, "GetRootControl", boom_root)
+        result = perception_mod._collect_uia_tree_sync(None, 5)
+        assert result == []
+
+    def test_healthy_path_unaffected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """正对照：root 正常时照常遍历（防御分支不误吞健康路径）。"""
+        import uiautomation as auto
+
+        fake_rect = MagicMock(left=0, top=0, right=10, bottom=10)
+        fake_root = MagicMock()
+        fake_root.BoundingRectangle = fake_rect
+        fake_root.ControlTypeName = "WindowControl"
+        fake_root.Name = "测试窗"
+        fake_root.AutomationId = "w1"
+        fake_root.IsEnabled = True
+        fake_root.IsOffscreen = False
+        fake_root.GetChildren.return_value = []
+
+        monkeypatch.setattr(auto, "ControlFromHandle", lambda hwnd: fake_root)
+        result = perception_mod._collect_uia_tree_sync(0x1, 5)
+        assert len(result) == 1
+        assert result[0]["control_type"] == "WindowControl"
