@@ -89,7 +89,10 @@ class ScreenSnapshot(BaseModel):
     - ``mss_unavailable``：mss 截图后端不可用；
     - ``ocr_error``：OCR 执行抛错，text_blocks 不完整；
     - ``ocr_unavailable``：OCR 引擎不可用，text_blocks 为空；
-    - ``ocr_crop_invalid``：OCR 裁剪区域无效（越界/零面积），该区域跳过。
+    - ``ocr_crop_invalid``：OCR 裁剪区域无效（越界/零面积），该区域跳过；
+    - ``uia_collect_failed``：UIA 树采集失败（句柄瞬时失效/COM 异常，2026-09-01
+      实机标定实测），uia_elements 为空非「真无元素」；uia_only 模式下已强制
+      升级 uia_ocr 兜底。
     """
 
     snapshot_id: str  # 唯一 ID 进 state；对象本体存 Postgres/磁盘
